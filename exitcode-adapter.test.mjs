@@ -27,7 +27,7 @@ const criteria = [
   { id: "C2", requirement: "Existing behavior is preserved", type: "regression", check: { command: "test -f feature.txt" } },
 ];
 
-function harness(t, content = "todo\n") {
+function harness(t, content = "todo\n", initialTools = ["read", "write", "bash"], unavailableTools = []) {
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "exitcode-adapter-test-"));
   t.after(() => fs.rmSync(cwd, { recursive: true, force: true }));
   fs.writeFileSync(path.join(cwd, "feature.txt"), content);
@@ -37,14 +37,14 @@ function harness(t, content = "todo\n") {
   const entries = [];
   const messages = [];
   const notifications = [];
-  let active = ["read", "write", "bash"];
+  let active = [...initialTools];
   let idle = true;
   const pi = {
     registerTool: (tool) => tools.set(tool.name, tool),
     registerCommand: (name, command) => commands.set(name, command),
     on: (name, handler) => events.set(name, handler),
     getActiveTools: () => active,
-    setActiveTools: (names) => { active = names; },
+    setActiveTools: (names) => { active = [...new Set(names)].filter((name) => !unavailableTools.includes(name)); },
     appendEntry: (customType, data) => entries.push({ type: "custom", customType, data }),
     sendUserMessage: (content) => messages.push({ content, triggerTurn: true }),
     sendMessage: (message, options) => messages.push({ ...message, ...options }),
@@ -58,6 +58,17 @@ function harness(t, content = "todo\n") {
   return {
     cwd, ctx, tools, events, messages, notifications, entries,
     setIdle: (value) => { idle = value; },
+    getActiveTools: pi.getActiveTools,
+    setActiveTools: pi.setActiveTools,
+    reload: () => {
+      events.get("session_shutdown")({ reason: "reload" }, ctx);
+      install(pi);
+      return events.get("session_start")({ reason: "reload" }, ctx);
+    },
+    restart: () => {
+      install(pi);
+      return events.get("session_start")({ reason: "startup" }, ctx);
+    },
     reply: (text) => {
       messages.push({ role: "user", content: text });
       return events.get("input")({ text, source: "interactive" }, ctx);
@@ -310,4 +321,187 @@ test("adapter: continuation reports unresolved state and the supervisor's next a
     assert.doesNotMatch(content, /Only a fresh|ALL PASS|stalled/);
   }
   assert.equal(await h.events.get("agent_before_settle")({}, h.ctx), undefined);
+});
+
+const discoveryTools = ["grep", "find", "ls"];
+
+function assertDiscoveryTools(h, expected) {
+  for (const name of discoveryTools) assert.equal(h.getActiveTools().includes(name), expected, name);
+}
+
+test("adapter: discovery tools are temporary and do not weaken the unsealed guards", async (t) => {
+  const original = ["bash", "read", "write", "codemode"];
+  const h = harness(t, "todo\n", original);
+  await h.command("help");
+  assert.deepEqual(h.getActiveTools(), original);
+  await h.command("Add the feature");
+  assertDiscoveryTools(h, true);
+  const entryCount = h.entries.length;
+  h.events.get("before_agent_start")({ systemPromptOptions: { sections: {} } }, h.ctx);
+  assert.equal(h.entries.length, entryCount); // An unchanged phase needs no new ownership entry.
+  assertDiscoveryTools(h, true);
+  for (const name of original) assert.ok(h.getActiveTools().includes(name));
+  for (const toolName of discoveryTools) {
+    assert.equal(h.events.get("tool_call")({ toolName, input: {} }, h.ctx), undefined);
+  }
+  for (const [toolName, input] of [["bash", { command: "true" }], ["write", { path: "feature.txt" }]]) {
+    assert.equal(h.events.get("tool_call")({ toolName, input }, h.ctx).block, true);
+  }
+  await h.tool("exitcode_draft", { goal: "g", criteria });
+  assertDiscoveryTools(h, true);
+  assert.equal(await h.events.get("agent_before_settle")({}, h.ctx), undefined);
+  await h.command("approve");
+  assertDiscoveryTools(h, false);
+  assert.deepEqual(h.getActiveTools().filter((name) => !name.startsWith("exitcode_")), original);
+  assert.equal(h.events.get("tool_call")({ toolName: "bash", input: { command: "true" } }, h.ctx), undefined);
+  await h.command("exit");
+  assert.deepEqual(h.getActiveTools(), original);
+});
+
+test("adapter: discovery cleanup preserves pre-enabled tools and unrelated loadout changes", async (t) => {
+  const original = ["read", "bash", "write", "grep"];
+  const h = harness(t, "todo\n", original);
+  await draft(h);
+  h.setActiveTools([...h.getActiveTools().filter((name) => name !== "write"), "custom_tool"]);
+  await h.command("approve");
+  assert.deepEqual(h.getActiveTools().filter((name) => !name.startsWith("exitcode_")),
+    ["read", "bash", "grep", "custom_tool"]);
+  await h.command("exit");
+  assert.deepEqual(h.getActiveTools(), ["read", "bash", "grep", "custom_tool"]);
+});
+
+test("adapter: conversational sealing also restores the execution loadout", async (t) => {
+  const h = harness(t);
+  const original = h.getActiveTools();
+  await draft(h);
+  assertDiscoveryTools(h, true);
+  await h.reply("Go ahead.");
+  await h.tool("exitcode_seal", { node: "G1", userApproval: "Go ahead." });
+  assertDiscoveryTools(h, false);
+  await h.command("exit");
+  assert.deepEqual(h.getActiveTools(), original);
+});
+
+test("adapter: failed E0 and root revisions retain discovery tools until sealing", async (t) => {
+  const h = harness(t);
+  await h.command("Add the feature");
+  const broken = structuredClone(criteria);
+  broken[0].controls.reject[0].setup = "printf 'done\\n' > feature.txt";
+  await h.tool("exitcode_draft", { goal: "g", criteria: broken });
+  await h.command("approve");
+  assertDiscoveryTools(h, true);
+  await h.tool("exitcode_draft", { goal: "g", criteria, revise: "G1" });
+  assertDiscoveryTools(h, true);
+  assert.equal(h.getActiveTools().length, new Set(h.getActiveTools()).size);
+  await h.command("approve");
+  assertDiscoveryTools(h, false);
+});
+
+test("adapter: cancellation and resume restore discovery from the current leaf state", async (t) => {
+  const h = harness(t);
+  const original = h.getActiveTools();
+  await draft(h);
+  await h.command("exit");
+  assert.deepEqual(h.getActiveTools(), original);
+  await h.command("resume");
+  assertDiscoveryTools(h, true);
+  await h.command("approve");
+  await h.command("exit");
+  assert.deepEqual(h.getActiveTools(), original);
+  await h.command("resume");
+  assertDiscoveryTools(h, false);
+});
+
+test("adapter: reload and transcript resume preserve temporary-tool ownership", async (t) => {
+  const original = ["read", "write", "bash", "grep"];
+  const h = harness(t, "todo\n", original);
+  await draft(h);
+  await h.reload();
+  assertDiscoveryTools(h, true);
+  await h.restart(); // Active tools restored from a transcript must not become user-owned.
+  assertDiscoveryTools(h, true);
+  await h.command("approve");
+  assert.deepEqual(h.getActiveTools().filter((name) => !name.startsWith("exitcode_")), original);
+  await h.reload();
+  assert.deepEqual(h.getActiveTools().filter((name) => !name.startsWith("exitcode_")), original);
+  await h.command("exit");
+  assert.deepEqual(h.getActiveTools(), original);
+});
+
+test("adapter: unavailable or explicitly excluded discovery tools are not claimed", async (t) => {
+  const original = ["read", "write", "bash"];
+  const h = harness(t, "todo\n", original, ["find", "ls"]);
+  await draft(h);
+  assert.equal(h.getActiveTools().includes("grep"), true);
+  assert.equal(h.getActiveTools().includes("find"), false);
+  assert.equal(h.getActiveTools().includes("ls"), false);
+  assert.deepEqual(h.entries.at(-1).data.discoveryToolsAdded, ["grep"]);
+  await h.command("approve");
+  await h.command("exit");
+  assert.deepEqual(h.getActiveTools(), original);
+});
+
+test("adapter: PASS, BLOCKED, and no-contract exit all clean up discovery tools", async (t) => {
+  for (const outcome of ["PASS", "BLOCKED", "NO_CONTRACT"]) {
+    await t.test(outcome, async (t) => {
+      const h = harness(t, outcome === "PASS" ? "done\n" : "todo\n");
+      const original = h.getActiveTools();
+      if (outcome === "NO_CONTRACT") {
+        await h.command("Add the feature");
+        assertDiscoveryTools(h, true);
+        await h.events.get("agent_before_settle")({}, h.ctx);
+      } else {
+        await draft(h);
+        assertDiscoveryTools(h, true);
+        if (outcome === "PASS") await h.command("approve");
+        else await h.tool("exitcode_block", { node: "G1", reason: "Missing requirement" });
+      }
+      assert.deepEqual(h.getActiveTools(), original);
+    });
+  }
+});
+
+test("adapter: child drafts borrow discovery tools and return them on seal or block", async (t) => {
+  for (const outcome of ["seal", "block", "failed E0"]) {
+    await t.test(outcome, async (t) => {
+      const h = harness(t);
+      await draft(h);
+      await h.command("approve");
+      const executionTools = h.getActiveTools();
+      const childCriteria = [{
+        id: "D1", requirement: "The prerequisite is done",
+        check: { command: "grep -qx ready helper.txt" },
+        controls: {
+          accept: { setup: "printf 'ready\\n' > helper.txt" },
+          reject: [{ setup: "printf 'todo\\n' > helper.txt" }],
+        },
+      }];
+      if (outcome === "failed E0") childCriteria[0].controls.reject[0].setup = "printf 'ready\\n' > helper.txt";
+      const result = await h.tool("exitcode_child", {
+        parent: "G1", target: "C1", goal: "Build the prerequisite", criteria: childCriteria,
+        reason: "C1 needs the helper", prerequisite: true, prerequisiteArtifact: "helper.txt",
+      });
+      assert.equal(result.isError, undefined);
+      assertDiscoveryTools(h, true);
+      assert.equal(h.events.get("tool_call")({ toolName: "bash", input: { command: "true" } }, h.ctx).block, true);
+      if (outcome === "block") {
+        await h.tool("exitcode_block", { node: "G1.1", reason: "Missing prerequisite" });
+      } else {
+        const sealed = await h.tool("exitcode_seal", { node: "G1.1" });
+        assert.equal(sealed.isError, outcome === "failed E0" ? true : undefined);
+        if (outcome === "failed E0") {
+          assert.equal(sealed.isError, true);
+          assertDiscoveryTools(h, true);
+          await h.tool("exitcode_child", {
+            parent: "G1", target: "C1", goal: "Build the prerequisite", criteria: [{ ...childCriteria[0],
+              controls: { ...childCriteria[0].controls, reject: [{ setup: "printf 'todo\\n' > helper.txt" }] } }],
+            reason: "C1 needs the helper", prerequisite: true, prerequisiteArtifact: "helper.txt", revise: "G1.1",
+          });
+          assertDiscoveryTools(h, true);
+          await h.tool("exitcode_seal", { node: "G1.1" });
+        }
+      }
+      assert.deepEqual(h.getActiveTools(), executionTools);
+    });
+  }
 });

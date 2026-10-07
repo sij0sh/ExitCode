@@ -79,6 +79,7 @@ type Runtime = {
   rootId: string | undefined;
   pendingGoal: string | undefined;
   nudges: number;
+  discoveryToolsAdded: string[];
 };
 
 type ToolDef = {
@@ -120,7 +121,8 @@ function cascadeLines(cascade: { events?: string[]; terminal?: { root: string; s
 }
 
 export default function (pi: ExtensionAPI) {
-  const rt: Runtime = { pi, modeOn: false, rootId: undefined, pendingGoal: undefined, nudges: 0 };
+  const rt: Runtime = { pi, modeOn: false, rootId: undefined, pendingGoal: undefined, nudges: 0, discoveryToolsAdded: [] };
+  const DISCOVERY_TOOL_NAMES = ["grep", "find", "ls"];
   const TOOL_NAMES = [
     "exitcode_status",
     "exitcode_draft",
@@ -146,12 +148,50 @@ export default function (pi: ExtensionAPI) {
     }
   };
 
-  const enterMode = (pendingGoal?: string) => {
+  const persistMode = () => {
+    pi.appendEntry(core.MODE_ENTRY_TYPE, {
+      on: rt.modeOn, rootId: rt.rootId, discoveryToolsAdded: rt.discoveryToolsAdded,
+    });
+  };
+
+  const restoreDiscoveryTools = () => {
+    if (rt.discoveryToolsAdded.length === 0) return;
+    pi.setActiveTools(pi.getActiveTools().filter((name) => !rt.discoveryToolsAdded.includes(name)));
+    rt.discoveryToolsAdded = [];
+  };
+
+  const syncDiscoveryTools = (ctx: ExtensionContext) => {
+    if (!rt.modeOn) return;
+    const snap = core.statusSnapshot(core.makeIo(ctx.cwd));
+    const leafId = snap.stack?.at(-1);
+    const leafStatus = leafId ? (snap.nodes as any)?.[leafId]?.status : undefined;
+    // Use the current leaf, not the root: child drafts also need discovery.
+    const discovering = !snap.active || leafStatus === "DRAFT";
+    if (!discovering) {
+      if (rt.discoveryToolsAdded.length === 0) return;
+      restoreDiscoveryTools();
+      persistMode();
+      return;
+    }
+    const active = pi.getActiveTools();
+    const missing = DISCOVERY_TOOL_NAMES.filter((name) => !active.includes(name));
+    if (missing.length === 0) return;
+    pi.setActiveTools([...active, ...missing]);
+    // Pi ignores unavailable/excluded tools. Own only names actually enabled.
+    const enabled = pi.getActiveTools();
+    const added = missing.filter((name) => enabled.includes(name) && !rt.discoveryToolsAdded.includes(name));
+    if (added.length === 0) return;
+    rt.discoveryToolsAdded = [...rt.discoveryToolsAdded, ...added];
+    persistMode();
+  };
+
+  const enterMode = (ctx: ExtensionContext, pendingGoal?: string) => {
     rt.modeOn = true;
     rt.nudges = 0;
     if (pendingGoal !== undefined) rt.pendingGoal = pendingGoal;
-    pi.appendEntry(core.MODE_ENTRY_TYPE, { on: true, rootId: rt.rootId });
+    persistMode();
     applyExposure();
+    syncDiscoveryTools(ctx);
   };
 
   const exitMode = (reason: string) => {
@@ -159,7 +199,8 @@ export default function (pi: ExtensionAPI) {
     rt.rootId = undefined;
     rt.pendingGoal = undefined;
     rt.nudges = 0;
-    pi.appendEntry(core.MODE_ENTRY_TYPE, { on: false });
+    restoreDiscoveryTools();
+    persistMode();
     applyExposure();
     return reason;
   };
@@ -180,13 +221,14 @@ export default function (pi: ExtensionAPI) {
   const sealContract = async (nodeId: string, ctx: ExtensionContext, userApproval?: string) => {
     const io = core.makeIo(ctx.cwd);
     const result = await core.sealNode(io, nodeId, { userApproval });
+    maybeAutoExit(result.cascade ?? result, ctx);
+    syncDiscoveryTools(ctx);
     if (!result.ok && !result.events) {
       const lines = [`seal rejected:`, errLines(result)];
       if (typeof result.sealAttemptsLeft === "number") lines.push(`seal proposals left: ${result.sealAttemptsLeft}`);
       if (result.next) lines.push(`next: ${result.next}`);
       return textResult(lines.join("\n"), result, true);
     }
-    maybeAutoExit(result.cascade ?? result, ctx);
     const lines = result.sealed
       ? [`sealed ${result.sealed}. baseline: ${result.baseline}`]
       : [...(result.events ?? [])];
@@ -249,7 +291,8 @@ export default function (pi: ExtensionAPI) {
         if (!result.ok) return textResult(`draft rejected:\n${errLines(result)}`, result, true);
         rt.rootId = result.rootId;
         rt.pendingGoal = undefined;
-        pi.appendEntry(core.MODE_ENTRY_TYPE, { on: true, rootId: rt.rootId });
+        persistMode();
+        syncDiscoveryTools(ctx);
         return textResult(
           withWarnings([`draft ${result.id} accepted.`, core.rootReviewText(result.draft), `next: ${result.next}`], result.warnings).join("\n"),
           result,
@@ -294,6 +337,7 @@ export default function (pi: ExtensionAPI) {
         const result = await core.evaluateNode(io, params.node ?? null);
         if (!result.ok) return textResult(`evaluate rejected:\n${errLines(result)}`, result, true);
         maybeAutoExit(result.cascade ?? result, ctx);
+        syncDiscoveryTools(ctx);
         const lines = [`${result.node} ${result.status}: ${result.vector}`];
         if (result.stale) lines.push("warning: the tree changed since this terminal result was recorded; the PASS is stale.");
         if (result.regressedRestored) lines.push(`regressed [${result.regressedRestored.join(", ")}]; restored last accepted candidate (attempt consumed).`);
@@ -343,6 +387,7 @@ export default function (pi: ExtensionAPI) {
           revise: params.revise,
         });
         if (!result.ok) return textResult(`child rejected:\n${errLines(result)}`, result, true);
+        syncDiscoveryTools(ctx);
         return textResult(
           withWarnings([`child draft ${result.id} accepted (targets ${params.parent}.${params.target}).`, `next: ${result.next}`], result.warnings).join("\n"),
           result,
@@ -375,6 +420,7 @@ export default function (pi: ExtensionAPI) {
         const result = await core.blockNode(io, target, { reason: params.reason, code: params.code ?? "NO_PATH" });
         if (!result.ok) return textResult(`block rejected:\n${errLines(result)}`, result, true);
         maybeAutoExit(result, ctx);
+        syncDiscoveryTools(ctx);
         const lines = [...(result.events ?? [])];
         if (result.terminal) lines.push(`terminal: root ${result.terminal.root} ${result.terminal.status}`);
         return textResult(lines.join("\n"), result);
@@ -397,7 +443,18 @@ export default function (pi: ExtensionAPI) {
     rt.rootId = mode.rootId;
     rt.nudges = 0;
     rt.pendingGoal = undefined;
+    const entry = branch.findLast((entry) => entry.type === "custom" && entry.customType === core.MODE_ENTRY_TYPE);
+    const added = (entry as { data?: { discoveryToolsAdded?: unknown } } | undefined)?.data?.discoveryToolsAdded;
+    rt.discoveryToolsAdded = Array.isArray(added) ? added.filter((name) => DISCOVERY_TOOL_NAMES.includes(name)) : [];
+    if (!rt.modeOn) restoreDiscoveryTools();
     applyExposure();
+    syncDiscoveryTools(ctx);
+  });
+
+  // Keep ownership in the branch entry, but remove temporary tools from the
+  // retiring runtime so reload does not mistake them for user-selected tools.
+  pi.on("session_shutdown", () => {
+    restoreDiscoveryTools();
   });
 
   pi.on("input", () => {
@@ -409,6 +466,7 @@ export default function (pi: ExtensionAPI) {
       delete event.systemPromptOptions.sections["exitcode"];
       return;
     }
+    syncDiscoveryTools(ctx);
     const io = core.makeIo(ctx.cwd);
     const lines = [core.PROTOCOL_PROMPT, ""];
     if (rt.pendingGoal) {
@@ -462,6 +520,7 @@ export default function (pi: ExtensionAPI) {
     if (snap.expired) {
       const result = await core.blockNode(io, leafId, { reason: "shared deadline exceeded", code: "BUDGET_EXHAUSTED" });
       maybeAutoExit(result, ctx);
+      syncDiscoveryTools(ctx);
       return {
         entries: [{ type: "custom_message" as const, customType: "exitcode-nudge", content: (result.events ?? []).join("\n"), display: true }],
         continue: !result.terminal,
@@ -558,8 +617,8 @@ export default function (pi: ExtensionAPI) {
           ctx.ui.notify("Nothing to resume: no active or pending-review root on disk. Start one with /exitcode <goal>.", "warning");
           return;
         }
-        enterMode();
         rt.rootId = snap.root;
+        enterMode(ctx);
         ctx.ui.notify(`Re-entered exitcode mode for root ${snap.root}. ${snap.next}${snap.review ? `\n\n${snap.review}` : ""}`, "info");
         return;
       }
@@ -572,7 +631,7 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify(`Root ${snap.root} is still ACTIVE on disk. /exitcode resume to re-enter it.`, "warning");
         return;
       }
-      enterMode(text);
+      enterMode(ctx, text);
       ctx.ui.notify(`Entered exitcode mode. Read-only discovery and contract review for: ${text}`, "info");
       if (ctx.isIdle()) {
         pi.sendUserMessage(text);
