@@ -92,8 +92,9 @@ Inside Pi:
 /exitcode Add password reset via emailed tokens
 ```
 
-The agent inspects the project and presents the goal, requirements, assumptions, exclusions,
-and verification approach before implementation.
+The agent inspects the project and presents the original request, goal, requirements,
+assumptions, exclusions, verification approach, effective policy, and remaining time.
+Extension housekeeping and commit reminders do not replace your objective.
 Accept in plain English, such as "looks good, go ahead", or use `/exitcode approve`.
 You can also ask questions or request changes.
 A reply requesting changes does not approve the draft.
@@ -129,7 +130,8 @@ The sealed task checks then judge the implementation.
 These are different responsibilities, not an endless recursion of evaluators.
 
 - **Review before implementation.** Approval binds to the exact root draft, including commands
-  and expectations.
+  and expectations, plus the effective policy, creation time, and shared deadline.
+  The approval digest is separate from the sealed evaluator-bundle digest.
   Root sealing rejects missing or mismatched approval before E0 runs.
   Every accepted root revision clears approval and requires a new review.
 - **Show that checks can detect defects.** E0 requires each behavioral check to pass on a
@@ -177,7 +179,22 @@ Legacy control `command` fields must become `setup` fields in a revised draft.
 | `deadlineMinutes` | 60 minutes from root draft creation, including review time |
 | `evalTimeoutSeconds` | 120 seconds per check unless the check overrides it |
 
-Policy overrides can be proposed at root creation and are then fixed for the run.
+Policy overrides can be proposed at root creation.
+An initial root draft can correct its policy before first approval or evaluator work.
+Omitted policy fields retain their effective values.
+Every accepted root revision requires a complete fresh review.
+The policy locks permanently at first approval, including during E0 recovery.
+Children inherit that policy and cannot amend it.
+Rejected policy revisions leave the existing draft, approval, and limits unchanged.
+
+The shared deadline still starts at root creation and includes human review time.
+A policy correction recomputes the deadline from that original timestamp.
+Revisions, reloads, resume, and child work never reset elapsed time or counters.
+An expired, never-approved draft can receive a larger policy only while still eligible.
+ExitCode rejects an expired approval before recording approval or running E0.
+Status reports the effective limits and an actionable correction or cancellation path.
+Legacy roots without policy-lock history keep fixed policies.
+Legacy unsealed drafts require a new full review and approval; sealed contracts remain usable.
 Each node gets at most two E0 proposals before becoming BLOCKED.
 Unchanged-candidate evaluations and boundary parent reruns do not consume implementation attempts.
 Early decomposition requires a declared prerequisite with an observable artifact.
@@ -202,10 +219,11 @@ This is a lean v1 workflow supervisor, not a sandbox or a guarantee of autonomou
   larger than 8 MiB.
 - **Approval still trusts the agent.** For plain-English acceptance, the agent quotes your reply
   when sealing.
-  The supervisor validates the approved draft's digest, not the meaning or origin of the quote.
+  The supervisor validates the draft and effective limits, not the meaning or origin of the quote.
   This is not a user-only authorization boundary.
-- **Focus still requires judgment.** Finite fixtures cannot prove the contract captures all of
-  your intent.
+- **Focus still requires judgment.** The original request is retained and shown in review.
+  ExitCode does not prove that a proposed goal is semantically equivalent to your request.
+  Finite fixtures cannot prove the contract captures all of your intent.
   Useful child selection remains model-dependent.
   Recursion uses one session, not isolated child contexts or parallel workers.
   Scaling benefits are intended, not measured throughput or token savings.

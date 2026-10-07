@@ -33,7 +33,7 @@ export const NodeState = Object.freeze({
   BLOCKED: "BLOCKED",
 });
 
-/** Starting policy recorded once per root; children inherit. */
+/** Root policy locks at first approval; children inherit. */
 export const DEFAULT_POLICY = Object.freeze({
   localRepairs: 2,
   maxDepth: 3,
@@ -83,7 +83,9 @@ export const PROTOCOL_PROMPT = [
   "FIX SUCCESS: Inspect the goal, architecture, tests, and likely regressions before implementation.",
   "Resolve known product ambiguity with the user and propose observable acceptance criteria with executable checks.",
   "Present the complete root contract for review and wait for explicit user approval.",
-  "Any root draft revision requires fresh approval.",
+  "Any root draft revision requires fresh approval. Review the effective policy and remaining time too.",
+  "Policy can change only before the first approval or evaluator work; revisions never reset elapsed time or counters.",
+  "Keep the user's original objective above extension housekeeping and commit reminders. Never replace it with a commit-only goal.",
   `Before sealing, inspect only with ${DISCOVERY_TOOL_NAMES.join(", ")}. Submit contracts through ExitCode tools; all other agent tools are blocked.`,
   "The supervisor validates the evaluator before sealing the contract.",
   "The sealed contract is fixed and cannot be weakened.",
@@ -1023,16 +1025,48 @@ async function restoreAndRefresh(io, root, restoreNodeId, predicate) {
   return { ok: true, checkpoint: restored.checkpoint, digest, fresh, warning: snap.ok ? null : snap.warning };
 }
 
-function mergePolicy(overrides) {
-  if (overrides === undefined || overrides === null) return { ok: true, policy: { ...DEFAULT_POLICY } };
+function mergePolicy(overrides, base = DEFAULT_POLICY) {
+  if (overrides === undefined) return { ok: true, policy: { ...base } };
   if (!isRecord(overrides)) return { ok: false, error: "policy must be an object" };
-  const policy = { ...DEFAULT_POLICY };
+  const policy = { ...base };
   for (const [key, value] of Object.entries(overrides)) {
-    if (!(key in DEFAULT_POLICY)) return { ok: false, error: `unknown policy key ${key}` };
-    if (typeof value !== "number" || !(value > 0)) return { ok: false, error: `policy.${key} must be a positive number` };
+    if (!Object.hasOwn(DEFAULT_POLICY, key)) return { ok: false, error: `unknown policy key ${key}` };
+    if (!Number.isFinite(value) || !(value > 0)) return { ok: false, error: `policy.${key} must be a positive finite number` };
     policy[key] = value;
   }
   return { ok: true, policy };
+}
+
+/** Legacy roots without an explicit unlocked marker keep their fixed policy. */
+function policyEditable(root, node) {
+  return root.policyLocked === false && root.status === NodeState.ACTIVE &&
+    node?.status === NodeState.DRAFT && !node.parentId && !root.approval &&
+    root.consumedAttempts === 0 && node.attempts === 0 && node.sealAttempts === 0 &&
+    !node.lastResult && !node.lastCandidateDigest &&
+    node.checkpoints?.length === 0 && node.children?.length === 0 &&
+    root.stack?.length === 1 && root.stack[0] === node.id;
+}
+
+/** Bind separately stored effective limits and the original clock to review. */
+function rootReviewDigest(root, draft) {
+  return sha256Hex(stableStringify({ draft, policy: root.policy,
+    createdAt: root.createdAt, deadlineAt: root.deadlineAt }));
+}
+
+function policyStatus(root, node, nowMs) {
+  return {
+    policy: { ...root.policy },
+    policyEditable: policyEditable(root, node),
+    createdAt: root.createdAt,
+    deadlineAt: new Date(root.deadlineAt).toISOString(),
+    remainingMs: Math.max(0, root.deadlineAt - nowMs),
+    expired: isExpired(root, nowMs),
+  };
+}
+
+function expiredDraftResult(root, node, draft, nowMs) {
+  return { ok: false, errors: ["shared deadline exceeded during drafting; approval and E0 are unavailable"],
+    ...policyStatus(root, node, nowMs), next: nextAction(root, node, draft, nowMs) };
 }
 
 function markTerminal(io, index, root, status, outcome) {
@@ -1067,6 +1101,7 @@ export function draftNode(io, args) {
   const withIds = assignCriterionIds(criteria);
 
   if (args.parentId) {
+    if (args.policy !== undefined) return { ok: false, errors: ["children inherit the root policy and cannot override it"] };
     const root = index.activeRootId ? loadRoot(io, index.activeRootId) : null;
     if (!root || root.status !== NodeState.ACTIVE) return { ok: false, errors: ["no active root; start one with /exitcode <goal>"] };
     const parentState = loadNodeState(io, args.parentId);
@@ -1153,6 +1188,9 @@ export function draftNode(io, args) {
   }
   const merged = mergePolicy(args.policy);
   if (!merged.ok) return { ok: false, errors: [merged.error] };
+  if (!Number.isFinite(new Date(deadlineAtMs(nowMs, merged.policy)).getTime())) {
+    return { ok: false, errors: ["policy.deadlineMinutes exceeds the supported deadline range"] };
+  }
   const id = `G${index.rootCounter + 1}`;
   const draft = {
     version: 1,
@@ -1177,13 +1215,14 @@ export function draftNode(io, args) {
     version: 1,
     id,
     policy: merged.policy,
+    policyLocked: false,
     createdAt,
     deadlineAt: deadlineAtMs(createdAt, merged.policy),
     consumedAttempts: 0,
-    reviewDigest: sha256Hex(stableStringify(draft)),
     stack: [id],
     status: NodeState.ACTIVE,
   };
+  root.reviewDigest = rootReviewDigest(root, draft);
   saveRoot(io, root);
   writeJsonAtomic(draftFile(io.cwd, id), { draft });
   saveNodeState(io, {
@@ -1201,7 +1240,9 @@ export function draftNode(io, args) {
     checkpoints: [],
     children: [],
   });
-  return { ok: true, id, rootId: id, draft, warnings: [], next: `present the root contract and wait for the user to accept or request revisions (or /exitcode exit)` };
+  const node = loadNodeState(io, id);
+  return { ok: true, id, rootId: id, draft, warnings: [], ...policyStatus(root, node, nowMs),
+    review: rootReviewText(draft, root, nowMs), next: nextAction(root, node, draft, nowMs) };
 }
 
 /** Overwrite an existing DRAFT (revision does not consume a seal proposal). */
@@ -1216,6 +1257,34 @@ function reviseDraft(io, index, args) {
   const withIds = assignCriterionIds(args.criteria);
   const previous = readJson(draftFile(io.cwd, node.id))?.draft;
   const warnings = [];
+  const nowMs = io.nowMs();
+  const editable = policyEditable(root, node);
+  let effectivePolicy = root.policy;
+  let effectiveDeadline = root.deadlineAt;
+  if (args.policy !== undefined) {
+    if (node.parentId) return { ok: false, errors: ["children inherit the root policy and cannot override it"] };
+    const merged = mergePolicy(args.policy, root.policy);
+    if (!merged.ok) return { ok: false, errors: [merged.error] };
+    if (stableStringify(merged.policy) !== stableStringify(root.policy)) {
+      if (!editable) {
+        return { ok: false, errors: ["root policy is locked after first approval or evaluator work; legacy roots also keep fixed policies"],
+          ...policyStatus(root, node, nowMs),
+          next: "keep the effective policy, or the user must cancel with /exitcode exit and start a fresh root with fresh review" };
+      }
+      effectivePolicy = merged.policy;
+      effectiveDeadline = deadlineAtMs(root.createdAt, effectivePolicy);
+      if (!Number.isFinite(new Date(effectiveDeadline).getTime())) {
+        return { ok: false, errors: ["policy.deadlineMinutes exceeds the supported deadline range"] };
+      }
+    }
+  }
+  if (isExpired({ deadlineAt: effectiveDeadline }, nowMs)) {
+    const result = expiredDraftResult(root, node, previous, nowMs);
+    if (effectiveDeadline !== root.deadlineAt) {
+      result.errors = ["proposed policy deadline has already elapsed from original root creation; revision was not stored"];
+    }
+    return result;
+  }
   let draft;
   let validation;
   if (node.parentId) {
@@ -1245,12 +1314,11 @@ function reviseDraft(io, index, args) {
     node.goalDigest = fingerprintGoal(args.goal);
     saveNodeState(io, node);
   } else {
-    if (args.policy !== undefined) warnings.push("policy is fixed at root creation; ignoring policy on revise");
     draft = {
       version: 1,
       id: node.id,
       goal: args.goal.trim(),
-      originalRequest: nonEmptyString(args.originalRequest) ? args.originalRequest.trim() : (previous?.originalRequest ?? args.goal.trim()),
+      originalRequest: previous?.originalRequest ?? (nonEmptyString(args.originalRequest) ? args.originalRequest.trim() : args.goal.trim()),
       parent: null,
       criteria: withIds,
     };
@@ -1258,16 +1326,22 @@ function reviseDraft(io, index, args) {
       const value = args[key] !== undefined ? args[key] : previous?.[key];
       if (value !== undefined) draft[key] = value;
     }
-    validation = validateStructure(draft, { policy: root.policy });
+    validation = validateStructure(draft, { policy: effectivePolicy });
   }
   if (!validation.ok) return { ok: false, errors: validation.errors };
   writeJsonAtomic(draftFile(io.cwd, node.id), { draft });
   if (!node.parentId) {
+    root.policy = effectivePolicy;
+    root.deadlineAt = effectiveDeadline;
+    root.policyLocked = !editable;
     delete root.approval;
-    root.reviewDigest = sha256Hex(stableStringify(draft));
+    root.reviewDigest = rootReviewDigest(root, draft);
     saveRoot(io, root);
   }
-  return { ok: true, id: node.id, rootId: root.id, revised: true, draft, warnings, next: nextAction(root, node, draft) };
+  return { ok: true, id: node.id, rootId: root.id, revised: true, draft, warnings,
+    ...policyStatus(root, node, nowMs),
+    ...(!node.parentId ? { review: rootReviewText(draft, root, nowMs) } : {}),
+    next: nextAction(root, node, draft, nowMs) };
 }
 
 function resultFromBaseline(bundle) {
@@ -1284,8 +1358,8 @@ function resultFromBaseline(bundle) {
 // --- root user approval --------------------------------------------------
 
 function approvalMatches(root, draft) {
-  return Boolean(draft && root.approval?.approvedBy === "user" &&
-    root.approval.digest === sha256Hex(stableStringify(draft)));
+  return Boolean(draft && root?.policyLocked === true && root.approval?.approvedBy === "user" &&
+    root.reviewDigest === rootReviewDigest(root, draft) && root.approval.digest === root.reviewDigest);
 }
 
 /** Record user approval, directly or from a reply interpreted by the agent. */
@@ -1301,20 +1375,25 @@ export function approveRoot(io, { userReply } = {}) {
   }
   const draft = readJson(draftFile(io.cwd, root.id))?.draft;
   if (!draft) return { ok: false, errors: [`draft for ${root.id} is missing`] };
-  if (root.reviewDigest !== sha256Hex(stableStringify(draft))) {
-    return { ok: false, errors: ["root draft changed since review; revise with exitcode_draft and present the entire contract again"] };
+  if (root.reviewDigest !== rootReviewDigest(root, draft)) {
+    return { ok: false, errors: ["root draft or effective policy changed since review; revise with exitcode_draft and present the entire contract again"] };
   }
   const validation = validateStructure(draft, { policy: root.policy });
   if (!validation.ok) return validation;
-  root.approval = { digest: root.reviewDigest, at: new Date(io.nowMs()).toISOString(), approvedBy: "user",
+  const nowMs = io.nowMs();
+  if (isExpired(root, nowMs)) return expiredDraftResult(root, node, draft, nowMs);
+  root.policyLocked = true;
+  root.approval = { digest: root.reviewDigest, at: new Date(nowMs).toISOString(), approvedBy: "user",
     ...(userReply !== undefined ? { userReply: userReply.trim() } : {}) };
   saveRoot(io, root);
   return { ok: true, id: root.id, approval: root.approval };
 }
 
 /** Human acceptance layer; executable checks stay in the same draft. */
-export function rootReviewText(draft) {
-  const lines = ["Root verification contract ready.", "", "Goal", draft.goal, "", "I will consider this complete when:"];
+export function rootReviewText(draft, root, nowMs = Date.now()) {
+  const expired = isExpired(root, nowMs);
+  const lines = [expired ? "Root verification contract unavailable: shared deadline expired." : "Root verification contract ready.",
+    "", "Original user request", draft.originalRequest, "", "Goal", draft.goal, "", "I will consider this complete when:"];
   for (const criterion of draft.criteria) lines.push(`${criterion.id}: ${criterion.requirement}`);
   for (const key of ["assumptions", "exclusions"]) {
     lines.push("", key === "assumptions" ? "Assumptions" : "Exclusions");
@@ -1322,9 +1401,19 @@ export function rootReviewText(draft) {
   }
   lines.push("", "Verification", draft.verification ??
     "Each criterion has an executable check. Behavioral checks must pass valid fixtures, reject invalid fixtures, and reject an empty target. Regression checks must continue to pass.",
-    "", "Reply in plain English to accept (for example 'looks good, go ahead') or request changes. Cancel with /exitcode exit.",
+    "", "Effective root policy",
+    ...Object.entries(root.policy).map(([key, value]) => `${key}: ${value}`),
+    `Shared deadline: ${new Date(root.deadlineAt).toISOString()} (from root creation, including review time).`,
+    `Remaining time: ${Math.max(0, (root.deadlineAt - nowMs) / 60000).toFixed(2)} minutes${expired ? " (EXPIRED)" : ""}.`,
+    root.policyLocked === false
+      ? "Policy may change only while this is an initial, never-approved draft with no evaluator work."
+      : "Policy is locked for this run.",
+    "Policy locks at first approval or evaluator work. Revisions never reset elapsed time or counters.");
+  lines.push("", ...(expired
+    ? ["Do not approve an expired contract. Amend an eligible initial policy and review again, or cancel with /exitcode exit and start a fresh root."]
+    : ["Reply in plain English to accept (for example 'looks good, go ahead') or request changes. Cancel with /exitcode exit."]),
     "The agent interprets your reply; /exitcode approve is an optional shortcut.",
-    "Approval freezes this exact root draft, including its verification checks. Any revision requires fresh approval.",
+    "Approval freezes this exact root draft, effective policy, and shared deadline. Any revision requires fresh approval.",
     "After approval, ExitCode runs E0 and works autonomously until the root passes or reaches a blocker.",
     "Children need no separate approval and cannot weaken the approved root criteria.");
   return lines.join("\n");
@@ -1349,8 +1438,10 @@ export async function sealNode(io, nodeId, { userApproval } = {}) {
     const approval = approveRoot(io, { userReply: userApproval });
     if (!approval.ok) return approval;
     root.approval = approval.approval;
+    root.policyLocked = true;
   }
   if (!node.parentId && !approvalMatches(root, draft)) {
+    if (isExpired(root, io.nowMs())) return expiredDraftResult(root, node, draft, io.nowMs());
     return {
       ok: false,
       errors: [root.approval ? "root contract changed since user approval" : "root contract requires explicit user approval"],
@@ -1403,7 +1494,8 @@ export async function sealNode(io, nodeId, { userApproval } = {}) {
   if (!node.parentId) {
     const currentRoot = loadRoot(io, root.id);
     const currentDraft = readJson(draftFile(io.cwd, nodeId))?.draft;
-    if (currentRoot?.status !== NodeState.ACTIVE || loadNodeState(io, nodeId)?.status !== NodeState.DRAFT ||
+    if (currentRoot?.status !== NodeState.ACTIVE || currentRoot.reviewDigest !== root.reviewDigest ||
+        loadNodeState(io, nodeId)?.status !== NodeState.DRAFT ||
         !approvalMatches(currentRoot, draft) || !approvalMatches(currentRoot, currentDraft)) {
       return { ok: false, errors: ["root contract or approval changed during E0; review and approve again"],
         next: "revise with exitcode_draft and wait for the user to accept or request revisions" };
@@ -1432,7 +1524,7 @@ export async function sealNode(io, nodeId, { userApproval } = {}) {
     const cascade = await closePassCascade(io, index, root, nodeId);
     return { ok: true, sealed: nodeId, alreadySatisfied: true, baseline: formatVector(gate.bundle.baseline.outcomes), warnings, cascade };
   }
-  return { ok: true, sealed: nodeId, baseline: formatVector(gate.bundle.baseline.outcomes), warnings, next: nextAction(root, node) };
+  return { ok: true, sealed: nodeId, baseline: formatVector(gate.bundle.baseline.outcomes), warnings, next: nextAction(root, node, null, io.nowMs()) };
 }
 
 // --- evaluate ------------------------------------------------------------
@@ -1520,7 +1612,7 @@ export async function evaluateNode(io, nodeId = null) {
         regressedRestored: regressed,
         diagnostics: evaluationDiagnostics(fresh),
         warnings: fixed.warning ? [fixed.warning] : [],
-        next: nextAction(root, current),
+        next: nextAction(root, current, null, io.nowMs()),
       };
     }
   }
@@ -1553,7 +1645,7 @@ export async function evaluateNode(io, nodeId = null) {
         ancestorRegression: { ancestor: ancestorId, criteria: regressed, restored: true },
         diagnostics: evaluationDiagnostics(fresh),
         warnings: fixed.warning ? [fixed.warning] : [],
-        next: nextAction(root, current),
+        next: nextAction(root, current, null, io.nowMs()),
       };
     }
     ancestorState.lastResult = ancestorResult;
@@ -1578,7 +1670,7 @@ export async function evaluateNode(io, nodeId = null) {
     diagnostics: evaluationDiagnostics(result),
     consumedAttempt: changed,
     warnings,
-    next: nextAction(root, node),
+    next: nextAction(root, node, null, io.nowMs()),
   };
 }
 
@@ -1727,9 +1819,14 @@ export async function blockNode(io, nodeId, { reason, code = "NO_PATH" }) {
 
 // --- status ----------------------------------------------------------------
 
-export function nextAction(root, node, draft = null) {
+export function nextAction(root, node, draft = null, nowMs = Date.now()) {
   if (!node) return "no active node";
   if (node.status === NodeState.DRAFT) {
+    if (isExpired(root, nowMs)) {
+      return policyEditable(root, node)
+        ? `shared deadline exceeded; revise ${node.id} with a larger finite policy and present the entire contract again, or the user can cancel with /exitcode exit`
+        : "shared deadline exceeded; the user must cancel with /exitcode exit and start a fresh root with fresh review";
+    }
     if (!node.parentId && !approvalMatches(root, draft)) return "present the root contract and wait for the user to accept or request revisions (or /exitcode exit)";
     return `seal ${node.id} with exitcode_seal`;
   }
@@ -1773,12 +1870,11 @@ export function statusSnapshot(io) {
     nodes,
     consumedAttempts: root.consumedAttempts,
     maxTotalAttempts: root.policy.maxTotalAttempts,
-    deadlineAt: new Date(root.deadlineAt).toISOString(),
-    expired: isExpired(root, io.nowMs()),
+    ...policyStatus(root, rootNode, io.nowMs()),
     approval: root.approval ?? null,
     awaitingApproval,
-    review: rootDraft ? rootReviewText(rootDraft) : null,
-    next: leaf ? nextAction(root, leaf, leaf.id === root.id ? rootDraft : null) : "none",
+    review: rootDraft ? rootReviewText(rootDraft, root, io.nowMs()) : null,
+    next: leaf ? nextAction(root, leaf, leaf.id === root.id ? rootDraft : null, io.nowMs()) : "none",
   };
 }
 
@@ -1791,6 +1887,8 @@ export function statusText(io) {
     if (node.goal) lines.push(`    goal: ${node.goal.slice(0, 160)}`);
   }
   lines.push(`  budget: ${snap.consumedAttempts}/${snap.maxTotalAttempts} attempts, deadline ${snap.deadlineAt}${snap.expired ? " (EXPIRED)" : ""}`);
+  lines.push(`  effective policy: ${JSON.stringify(snap.policy)}`);
+  lines.push(`  remaining: ${(snap.remainingMs / 60000).toFixed(2)} minutes; policy ${snap.policyEditable ? "editable before first approval" : "locked"}`);
   lines.push(`  next: ${snap.next}`);
   if (snap.review) lines.push("", snap.review);
   return lines.join("\n");

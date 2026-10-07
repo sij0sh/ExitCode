@@ -60,7 +60,7 @@ const PolicySchema = Type.Object({
   localRepairs: Type.Optional(Type.Number({ description: "Local repair attempts before ordinary child decomposition is permitted (default 2)" })),
   maxDepth: Type.Optional(Type.Number({ description: "Recursion depth below the root (default 3)" })),
   maxTotalAttempts: Type.Optional(Type.Number({ description: "Implementation attempts across the tree (default 12)" })),
-  deadlineMinutes: Type.Optional(Type.Number({ description: "Shared deadline in minutes (default 60)" })),
+  deadlineMinutes: Type.Optional(Type.Number({ description: "Shared minutes from original root creation, including review (default 60); revisions never restart the clock" })),
   evalTimeoutSeconds: Type.Optional(Type.Number({ description: "Default per-check timeout (default 120)" })),
 });
 
@@ -102,8 +102,13 @@ function textResult(text: string, details: unknown, isError = false) {
   return { content: [{ type: "text" as const, text }], details, ...(isError ? { isError: true } : {}) };
 }
 
-function errLines(result: { errors?: string[] }): string {
-  return (result.errors ?? ["unknown error"]).map((e) => `- ${e}`).join("\n");
+function errLines(result: { errors?: string[]; policy?: unknown; deadlineAt?: string; next?: string }): string {
+  const lines = (result.errors ?? ["unknown error"]).map((e) => `- ${e}`);
+  if (result.policy) {
+    lines.push(`Effective policy: ${JSON.stringify(result.policy)}`, `Shared deadline: ${result.deadlineAt}`);
+  }
+  if (result.next) lines.push(`next: ${result.next}`);
+  return lines.join("\n");
 }
 
 function withWarnings(lines: string[], warnings?: string[]): string[] {
@@ -253,7 +258,6 @@ export default function (pi: ExtensionAPI) {
     if (!result.ok && !result.events) {
       const lines = [`seal rejected:`, errLines(result)];
       if (typeof result.sealAttemptsLeft === "number") lines.push(`seal proposals left: ${result.sealAttemptsLeft}`);
-      if (result.next) lines.push(`next: ${result.next}`);
       return textResult(lines.join("\n"), result, true);
     }
     const lines = result.sealed
@@ -289,11 +293,13 @@ export default function (pi: ExtensionAPI) {
         "Propose or revise a root contract with goal, observable criteria, executable checks, assumptions, exclusions, and verification approach. " +
         "Each behavioral criterion needs setup commands for known-valid and known-invalid fixtures in temporary candidate copies. " +
         "The same check must PASS the valid fixture and FAIL every invalid fixture, not ERROR. Do not change the real candidate while validating the evaluator. " +
+        "Policy corrections are allowed only before first approval or evaluator work; omitted fields retain their effective values. " +
+        "Never replace the user's objective with extension housekeeping or a commit reminder. " +
         "Validates structure only. Present the returned root review and STOP for user review before sealing or implementation.",
       promptSnippet: "exitcode_draft: propose the root contract (goal + criteria + checks + controls)",
       parameters: Type.Object({
         goal: Type.String({ description: "Goal statement" }),
-        originalRequest: Type.Optional(Type.String({ description: "Retained user request (defaults to goal)" })),
+        originalRequest: Type.Optional(Type.String({ description: "Fallback request only; the /exitcode goal and existing root request take priority" })),
         criteria: Type.Array(CriterionSchema),
         policy: Type.Optional(PolicySchema),
         assumptions: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { description: "Resolved product assumptions to show in user review" })),
@@ -310,7 +316,7 @@ export default function (pi: ExtensionAPI) {
         }
         const result = core.draftNode(io, {
           goal: params.goal,
-          originalRequest: params.originalRequest ?? rt.pendingGoal,
+          originalRequest: rt.pendingGoal ?? params.originalRequest,
           criteria: params.criteria,
           policy: params.policy,
           assumptions: params.assumptions,
@@ -324,7 +330,7 @@ export default function (pi: ExtensionAPI) {
         persistMode();
         syncDiscoveryTools(ctx);
         return textResult(
-          withWarnings([`draft ${result.id} accepted.`, core.rootReviewText(result.draft), `next: ${result.next}`], result.warnings).join("\n"),
+          withWarnings([`draft ${result.id} accepted.`, result.review, `next: ${result.next}`], result.warnings).join("\n"),
           result,
         );
       },

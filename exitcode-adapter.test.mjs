@@ -115,7 +115,7 @@ test("adapter: approve runs E0 and starts autonomous implementation", async (t) 
   await h.command("approve");
   const io = core.makeIo(h.cwd);
   assert.equal(core.loadNodeState(io, "G1").status, "ACTIVE");
-  assert.equal(core.loadRoot(io, "G1").approval.digest, core.loadBundle(io, "G1").digest);
+  assert.equal(core.loadRoot(io, "G1").approval.digest, core.loadRoot(io, "G1").reviewDigest);
   assert.equal(core.loadBundle(io, "G1").contract.originalRequest, "Add the feature");
   assert.equal(core.statusSnapshot(io).awaitingApproval, false);
   assert.equal(h.messages.at(-1).triggerTurn, true);
@@ -164,19 +164,105 @@ test("adapter: cancel and resume preserve the pending human review", async (t) =
   assert.equal(await h.events.get("agent_before_settle")({}, h.ctx), undefined);
 });
 
-test("adapter: expired review stays paused until approval reports exhaustion", async (t) => {
+test("adapter: expired review refuses approval without consuming work or leaving enforcement", async (t) => {
   const h = harness(t);
   await draft(h);
   const io = core.makeIo(h.cwd);
   const root = core.loadRoot(io, "G1");
-  root.deadlineAt = Date.now() - 1;
-  core.saveRoot(io, root);
+  // Keep the reviewed clock intact while simulating a late approval.
+  t.mock.method(Date, "now", () => root.deadlineAt + 1);
   assert.equal(await h.events.get("agent_before_settle")({}, h.ctx), undefined);
   await h.command("approve");
-  assert.equal(core.loadRoot(io, "G1").status, "BLOCKED");
+  assert.equal(core.loadRoot(io, "G1").status, "ACTIVE");
+  assert.equal(core.loadRoot(io, "G1").approval, undefined);
   assert.equal(core.loadNodeState(io, "G1").sealAttempts, 0);
-  assert.equal(h.messages.at(-1).triggerTurn, false);
+  assert.match(h.notifications.at(-1).content, /deadline exceeded/);
+  assert.match(h.notifications.at(-1).content, /larger finite policy/);
+  assert.match(core.statusSnapshot(io).review, /Do not approve an expired contract/);
+  const denied = await h.tool("exitcode_seal", { node: "G1", userApproval: "Go ahead" });
+  assert.equal(denied.isError, true);
+  assert.match(denied.content[0].text, /approval and E0 are unavailable/);
   assert.equal(core.resolveModeFromBranch(h.entries).on, true);
+});
+
+test("adapter: corrected initial limits survive reload and approval locks them", async (t) => {
+  const h = harness(t);
+  await h.command("Complete the implementation");
+  await h.tool("exitcode_draft", { goal: "Commit-only detour", criteria, policy: { deadlineMinutes: 30, maxTotalAttempts: 3 } });
+  const io = core.makeIo(h.cwd);
+  const createdAt = core.loadRoot(io, "G1").createdAt;
+  const revised = await h.tool("exitcode_draft", { revise: "G1", goal: "Complete the implementation", criteria,
+    policy: { deadlineMinutes: 480, maxTotalAttempts: 24, maxDepth: 1, evalTimeoutSeconds: 900 } });
+  assert.equal(revised.isError, undefined);
+  assert.match(revised.content[0].text, /deadlineMinutes: 480/);
+  assert.match(revised.content[0].text, /maxTotalAttempts: 24/);
+  assert.match(revised.content[0].text, /maxDepth: 1/);
+  assert.match(revised.content[0].text, /evalTimeoutSeconds: 900/);
+  assert.match(revised.content[0].text, /Remaining time:/);
+  const deadlineAt = core.loadRoot(io, "G1").deadlineAt;
+  await h.reload();
+  assert.equal(core.statusSnapshot(io).policyEditable, true);
+  assert.equal(core.loadRoot(io, "G1").createdAt, createdAt);
+  assert.equal(core.loadRoot(io, "G1").deadlineAt, deadlineAt);
+  assertRestricted(h);
+  assert.equal(await h.events.get("agent_before_settle")({}, h.ctx), undefined);
+  await h.command("status");
+  assert.match(h.notifications.at(-1).content, /deadlineMinutes: 480/);
+  await h.command("exit");
+  await h.command("resume");
+  assert.equal(core.loadRoot(io, "G1").deadlineAt, deadlineAt);
+  await h.command("approve");
+  assert.equal(core.loadNodeState(io, "G1").status, "ACTIVE");
+  assert.equal(core.loadRoot(io, "G1").policyLocked, true);
+  assert.equal(core.loadRoot(io, "G1").deadlineAt, deadlineAt);
+  assert.equal(core.loadNodeState(io, "G1").sealAttempts, 1);
+});
+
+test("adapter: failed E0 policy revision is explicit, atomic, and locked across reload", async (t) => {
+  const h = harness(t);
+  await h.command("Complete the feature");
+  const broken = structuredClone(criteria);
+  broken[0].controls.reject[0].setup = "printf 'done\n' > feature.txt";
+  await h.tool("exitcode_draft", { goal: "Feature", criteria: broken });
+  await h.command("approve");
+  const io = core.makeIo(h.cwd);
+  const before = core.loadRoot(io, "G1");
+  const rejected = await h.tool("exitcode_draft", { revise: "G1", goal: "Changed scope", criteria,
+    policy: { deadlineMinutes: 480 } });
+  assert.equal(rejected.isError, true);
+  assert.match(rejected.content[0].text, /policy is locked/);
+  assert.match(rejected.content[0].text, /Effective policy:.*"deadlineMinutes":60/);
+  assert.match(rejected.content[0].text, /user must cancel/);
+  assert.deepEqual(core.loadRoot(io, "G1"), before);
+  await h.tool("exitcode_draft", { revise: "G1", goal: "Feature", criteria });
+  await h.reload();
+  assert.equal(core.loadRoot(io, "G1").approval, undefined);
+  assert.equal(core.statusSnapshot(io).policyEditable, false);
+  assert.equal((await h.tool("exitcode_draft", { revise: "G1", goal: "Feature", criteria,
+    policy: { maxTotalAttempts: 24 } })).isError, true);
+  assert.equal(core.loadNodeState(io, "G1").sealAttempts, 1);
+  assertRestricted(h);
+  await h.command("approve");
+  assert.equal(core.loadNodeState(io, "G1").status, "ACTIVE");
+  assert.equal(core.loadNodeState(io, "G1").sealAttempts, 2);
+});
+
+test("adapter: extension housekeeping cannot overwrite the retained user objective", async (t) => {
+  const h = harness(t);
+  await h.command("Complete Phases 1 and 2");
+  await h.reload();
+  const proposal = await h.tool("exitcode_draft", { goal: "Commit-only detour", criteria,
+    originalRequest: "Commit ladder: clean the working tree" });
+  assert.equal(proposal.details.draft.originalRequest, "Complete Phases 1 and 2");
+  assert.match(proposal.content[0].text, /Original user request\nComplete Phases 1 and 2/);
+  const revised = await h.tool("exitcode_draft", { revise: "G1", goal: "Complete the implementation", criteria,
+    originalRequest: "Another extension reminder" });
+  assert.equal(revised.details.draft.originalRequest, "Complete Phases 1 and 2");
+  const event = { systemPromptOptions: { sections: {} } };
+  h.events.get("before_agent_start")(event, h.ctx);
+  assert.match(event.systemPromptOptions.sections.exitcode, /original objective above extension housekeeping and commit reminders/);
+  assert.equal(h.events.get("tool_call")({ toolName: "git_plan_context", input: {} }, h.ctx).block, true);
+  assertRestricted(h);
 });
 
 test("adapter: failed E0 continues to revision and pauses for fresh approval", async (t) => {
@@ -214,7 +300,7 @@ test("adapter: plain-English acceptance seals and continues without a command", 
   const io = core.makeIo(h.cwd);
   assert.equal(core.loadNodeState(io, "G1").status, "ACTIVE");
   assert.equal(core.loadRoot(io, "G1").approval.userReply, reply);
-  assert.equal(core.loadRoot(io, "G1").approval.digest, core.loadBundle(io, "G1").digest);
+  assert.equal(core.loadRoot(io, "G1").approval.digest, core.loadRoot(io, "G1").reviewDigest);
   assert.equal(h.messages.at(-1).content, reply); // No synthetic command-triggered turn.
   assert.equal((await h.events.get("agent_before_settle")({}, h.ctx)).continue, true);
   assert.equal(h.events.get("tool_call")({ toolName: "write", input: { path: "feature.txt" } }, h.ctx), undefined);
