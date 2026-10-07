@@ -155,7 +155,15 @@ These are different responsibilities, not an endless recursion of evaluators.
 Behavioral fixtures use `controls.accept.setup` and `controls.reject[].setup` to prepare
 independent candidate copies before `check.command` runs.
 Setup success is not the evaluator verdict.
-Copies exclude `.git`, `node_modules`, `.exitcode`, and symlinks and have a 64 MiB content cap.
+Copies exclude `.git`, `node_modules`, `.exitcode`, and symlinks.
+Fixtures and checkpoints share an 8 GiB logical-content cap.
+ExitCode checks the total before copying and reports the byte and file counts if it is too large.
+It does not honor `.gitignore`; build outputs and retained evidence remain included.
+Copies use independent copy-on-write files when supported and ordinary copies otherwise.
+Fixtures prefer the project filesystem but stay outside its Git ancestry.
+A permissions boundary falls back to the system temporary directory.
+Large ordinary copies and multiple checkpoints can still require substantial disk space.
+Fixture setup runs after copying, so deleting files in setup cannot fix a cap rejection.
 Provide required dependencies without writable links back to the real candidate.
 Legacy control `command` fields must become `setup` fields in a revised draft.
 

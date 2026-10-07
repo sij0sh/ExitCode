@@ -51,8 +51,8 @@ export const MAX_SETTLE_NUDGES = 3;
 /** Rolling checkpoints kept per node. */
 export const MAX_CHECKPOINTS_PER_NODE = 3;
 
-/** Snapshot size cap (bytes of file content). */
-export const SNAPSHOT_MAX_BYTES = 64 * 1024 * 1024;
+/** Snapshot size cap (logical bytes of file content, including build artifacts). */
+export const SNAPSHOT_MAX_BYTES = 8 * 1024 * 1024 * 1024;
 
 /** Files larger than this are digested by size + head/tail sample. */
 export const LARGE_FILE_BYTES = 8 * 1024 * 1024;
@@ -597,24 +597,36 @@ export function envIdentity(cwd) {
 // ---------------------------------------------------------------------------
 
 export function snapshotTree(cwd, destDir, { maxBytes = SNAPSHOT_MAX_BYTES, writeManifest = true } = {}) {
-  fs.mkdirSync(destDir, { recursive: true });
-  const files = [];
-  let totalBytes = 0;
-  for (const { rel, full } of walkFiles(cwd)) {
-    const stat = fs.statSync(full);
-    totalBytes += stat.size;
+  try {
+    // Check logical size before copying any content, including on non-reflink filesystems.
+    const entries = [];
+    let totalBytes = 0;
+    for (const { rel, full } of walkFiles(cwd)) {
+      const size = fs.statSync(full).size;
+      totalBytes += size;
+      entries.push({ rel, full, size });
+    }
     if (totalBytes > maxBytes) {
       fs.rmSync(destDir, { recursive: true, force: true });
-      return { ok: false, reason: `working tree exceeds snapshot cap (${maxBytes} bytes)` };
+      return { ok: false, reason: `working tree exceeds snapshot cap (${maxBytes} bytes): ${totalBytes} bytes across ${entries.length} files; fixture setup cannot reduce the pre-copy size` };
     }
-    const dest = path.join(destDir, rel);
-    fs.mkdirSync(path.dirname(dest), { recursive: true });
-    fs.copyFileSync(full, dest);
-    files.push({ path: rel, bytes: stat.size, sha: hashFile(full, stat.size) });
+    fs.mkdirSync(destDir, { recursive: true });
+    const files = [];
+    for (const { rel, full, size } of entries) {
+      const dest = path.join(destDir, rel);
+      fs.mkdirSync(path.dirname(dest), { recursive: true });
+      // Reflinks are independent files; Node falls back to a normal copy when unsupported.
+      fs.copyFileSync(full, dest, fs.constants.COPYFILE_FICLONE);
+      if (fs.statSync(dest).size !== size) throw new Error(`file size changed while snapshotting ${rel}`);
+      files.push({ path: rel, bytes: size, sha: hashFile(dest, size) });
+    }
+    const manifest = { version: 1, at: new Date().toISOString(), totalBytes, files };
+    if (writeManifest) fs.writeFileSync(path.join(destDir, "manifest.json"), JSON.stringify(manifest, null, 2) + "\n");
+    return { ok: true, manifest };
+  } catch (error) {
+    fs.rmSync(destDir, { recursive: true, force: true });
+    return { ok: false, reason: `snapshot failed (${error?.code ?? "IO_ERROR"}): ${error?.message ?? String(error)}` };
   }
-  const manifest = { version: 1, at: new Date().toISOString(), totalBytes, files };
-  if (writeManifest) fs.writeFileSync(path.join(destDir, "manifest.json"), JSON.stringify(manifest, null, 2) + "\n");
-  return { ok: true, manifest };
 }
 
 /** Restore cwd to a snapshot: rewrite manifest files, delete files added later. */
@@ -631,7 +643,7 @@ export function restoreTree(cwd, snapDir, manifest) {
   for (const file of wanted.values()) {
     const dest = path.join(cwd, file.path);
     fs.mkdirSync(path.dirname(dest), { recursive: true });
-    fs.copyFileSync(path.join(snapDir, file.path), dest);
+    fs.copyFileSync(path.join(snapDir, file.path), dest, fs.constants.COPYFILE_FICLONE);
     restored.push(file.path);
   }
   pruneEmptyDirs(cwd);
@@ -658,7 +670,19 @@ function pruneEmptyDirs(dir) {
 async function runControlProbe(criterion, setup, deps) {
   let fixture;
   try {
-    fixture = fs.mkdtempSync(path.join(os.tmpdir(), "exitcode-control-"));
+    // Prefer the candidate filesystem for reflinks, but stay outside Git ancestry
+    // so fixture commands cannot discover the real candidate's repository.
+    let parent = path.dirname(path.resolve(deps.cwd));
+    for (let dir = path.resolve(deps.cwd); ; dir = path.dirname(dir)) {
+      if (fs.existsSync(path.join(dir, ".git"))) parent = path.dirname(dir);
+      if (dir === path.dirname(dir)) break;
+    }
+    try {
+      fixture = fs.mkdtempSync(path.join(parent, "exitcode-control-"));
+    } catch (error) {
+      if (!["EACCES", "EPERM", "EROFS"].includes(error?.code)) throw error;
+      fixture = fs.mkdtempSync(path.join(os.tmpdir(), "exitcode-control-"));
+    }
     // Reuse candidate snapshot rules, but keep metadata out of the fixture.
     const copy = snapshotTree(deps.cwd, fixture, { writeManifest: false });
     if (!copy.ok) return { error: copy.reason };

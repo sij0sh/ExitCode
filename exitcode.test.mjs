@@ -411,6 +411,75 @@ test("runGate: snapshot cap failures stop probes without touching the candidate"
   assert.equal(digestTree(dir), deps.candidateDigest);
 });
 
+test("seal: fixtures and checkpoints accept trees above the old 64 MiB cap", async (t) => {
+  const dir = tempProject({ "feature.txt": "todo\n", "Cargo.toml": "[package]\n", "Cargo.lock": "locked\n",
+    "target/build.bin": "", ".agents/artifacts/evidence.bin": "evidence", "fixtures/valid.txt": "valid\n" });
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const large = path.join(dir, "target/build.bin");
+  const bytes = 65 * 1024 * 1024;
+  fs.truncateSync(large, bytes);
+  const before = digestTree(dir);
+  const exec = fileExec(dir, { checks: standardChecks });
+  const fixtures = [];
+  const { io } = testIo(dir, async (command, opts) => {
+    if (command.startsWith("accept:") || command.startsWith("reject:")) {
+      fixtures.push(opts.cwd);
+      assert.equal(fs.statSync(path.join(opts.cwd, "target/build.bin")).size, bytes);
+      assert.notEqual(fs.statSync(path.join(opts.cwd, "target/build.bin")).ino, fs.statSync(large).ino);
+      assert.equal(fs.readFileSync(path.join(opts.cwd, "Cargo.lock"), "utf8"), "locked\n");
+      assert.equal(fs.readFileSync(path.join(opts.cwd, ".agents/artifacts/evidence.bin"), "utf8"), "evidence");
+      assert.equal(fs.readFileSync(path.join(opts.cwd, "fixtures/valid.txt"), "utf8"), "valid\n");
+      assert.equal(fs.existsSync(path.join(opts.cwd, ".exitcode")), false);
+      fs.truncateSync(path.join(opts.cwd, "target/build.bin"), 1);
+      assert.equal(fs.statSync(large).size, bytes, "fixture writes must not affect the candidate");
+    }
+    return exec(command, opts);
+  });
+  const drafted = draftNode(io, { goal: "Large candidate", criteria: ROOT_CRITERIA });
+  assert.equal(drafted.ok, true);
+  assert.equal(approveRoot(io).ok, true);
+  const sealed = await sealNode(io, drafted.id);
+  assert.equal(sealed.ok, true, JSON.stringify(sealed));
+  assert.deepEqual(sealed.warnings, []);
+  assert.equal(digestTree(dir), before);
+  assert.equal(new Set(fixtures).size, 2);
+  assert.equal(fixtures.every((fixture) => !fs.existsSync(fixture)), true);
+  const node = loadNodeState(io, drafted.id);
+  assert.equal(node.checkpoints.length, 1);
+  const checkpoint = node.checkpoints[0].dir;
+  const manifest = JSON.parse(fs.readFileSync(path.join(checkpoint, "manifest.json"), "utf8"));
+  assert.ok(manifest.totalBytes > 64 * 1024 * 1024);
+  assert.ok(manifest.totalBytes <= SNAPSHOT_MAX_BYTES);
+  fs.truncateSync(large, 7);
+  fs.writeFileSync(path.join(dir, "feature.txt"), "changed\n");
+  const restored = restoreTree(dir, checkpoint, manifest);
+  assert.equal(restored.ok, true);
+  assert.equal(digestTree(dir), before);
+  fs.truncateSync(large, 9);
+  assert.equal(fs.statSync(path.join(checkpoint, "target/build.bin")).size, bytes,
+    "restored writes must not affect the checkpoint");
+});
+
+test("runGate: fixture copies cannot discover an enclosing candidate Git repository", async (t) => {
+  const outer = tempProject({ ".git/HEAD": "ref: refs/heads/main\n",
+    "nested/.git": "gitdir: ../.git\n", "nested/project/feature.txt": "todo\n" });
+  t.after(() => fs.rmSync(outer, { recursive: true, force: true }));
+  const dir = path.join(outer, "nested/project");
+  const exec = fileExec(dir, { checks: standardChecks });
+  const fixtures = [];
+  const draft = rootDraft();
+  const gate = await runGate(draft, validateStructure(draft), gateDeps(dir, async (command, opts) => {
+    if (command.startsWith("accept:") || command.startsWith("reject:")) {
+      fixtures.push(opts.cwd);
+      assert.ok(path.relative(outer, opts.cwd).startsWith(`..${path.sep}`));
+      assert.equal(fs.statSync(opts.cwd).dev, fs.statSync(dir).dev);
+    }
+    return exec(command, opts);
+  }));
+  assert.equal(gate.ok, true, gate.errors.join("; "));
+  assert.equal(fixtures.every((fixture) => !fs.existsSync(fixture)), true);
+});
+
 test("runGate: setup success is independent of the check's expectation", async () => {
   const dir = tempProject();
   const exec = fileExec(dir, { checks: standardChecks });
@@ -1207,6 +1276,36 @@ test("snapshot/restore roundtrips the tree and deletes later files", () => {
   assert.equal(fs.readFileSync(path.join(dir, "a.txt"), "utf8"), "a");
   assert.equal(fs.readFileSync(path.join(dir, "sub", "b.txt"), "utf8"), "b");
   assert.equal(fs.existsSync(path.join(dir, "new.txt")), false);
+});
+
+test("snapshot: explicit caps count all content, accept the boundary, and clean up rejection", (t) => {
+  const dir = tempProject({ "a.txt": "abc", "sub/b.txt": "def" });
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const snapDir = path.join(dir, ".exitcode/tmp/snapshot");
+  const snap = snapshotTree(dir, snapDir, { maxBytes: 6 });
+  assert.equal(snap.ok, true);
+  assert.equal(snap.manifest.totalBytes, 6);
+  const before = digestTree(dir);
+  const rejected = snapshotTree(dir, snapDir, { maxBytes: 5 });
+  assert.equal(rejected.ok, false);
+  assert.match(rejected.reason, /snapshot cap \(5 bytes\): 6 bytes across 2 files/);
+  assert.match(rejected.reason, /fixture setup cannot reduce the pre-copy size/);
+  assert.equal(fs.existsSync(snapDir), false);
+  assert.equal(digestTree(dir), before);
+});
+
+test("snapshot: copy failures return diagnostics and remove partial content", (t) => {
+  const dir = tempProject({ "a.txt": "a", "sub/b.txt": "b" });
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const before = digestTree(dir);
+  const snapDir = path.join(dir, ".exitcode/tmp/snapshot");
+  fs.mkdirSync(snapDir, { recursive: true });
+  fs.writeFileSync(path.join(snapDir, "sub"), "blocks directory creation");
+  const result = snapshotTree(dir, snapDir);
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /snapshot failed \(EEXIST\)/);
+  assert.equal(fs.existsSync(snapDir), false);
+  assert.equal(digestTree(dir), before);
 });
 
 test("digestTree: ignores supervisor and dependency dirs, tracks content", () => {
