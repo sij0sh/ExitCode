@@ -9,6 +9,7 @@ import {
   MAX_DRAFT_PROPOSALS,
   MODE_ENTRY_TYPE,
   NodeState,
+  PROTOCOL_PROMPT,
   SNAPSHOT_MAX_BYTES,
   allPass,
   assignCriterionIds,
@@ -1251,6 +1252,19 @@ test("checkpoints: rolling cap keeps pre-child checkpoints of live children", as
 // Guards, mode, status
 // ---------------------------------------------------------------------------
 
+test("protocol: separates the approved goal, recursive repair, and proof of success", () => {
+  for (const text of ["FIX SUCCESS", "PURSUE SUCCESS", "PROVE SUCCESS", "wait for explicit user approval",
+    "Any root draft revision requires fresh approval", "sealed contract is fixed and cannot be weakened",
+    "Implement the approved goal", "Use the sealed criteria to measure", "preserve previously passing behavior",
+    "Decompose only when the supervisor permits it", "temporary reduction of its parent problem",
+    "needs no user approval", "cannot change ancestor contracts", "Evaluate after meaningful changes",
+    "fresh supervisor evaluation with all criteria passing", "follow the supervisor's returned parent result and next action",
+    "report the concrete blocker"]) {
+    assert.ok(PROTOCOL_PROMPT.includes(text), text);
+  }
+  assert.doesNotMatch(PROTOCOL_PROMPT, /stalled|toward the sealed criteria|controls\.accept|userApproval/);
+});
+
 test("guardToolCall: invisible when mode is off", () => {
   const dir = tempProject();
   assert.equal(guardToolCall({ modeOn: false, leafStatus: null, cwd: dir, toolName: "write", input: { path: "a" } }), null);
@@ -1262,10 +1276,15 @@ test("guardToolCall: drafting blocks source writes and shell", () => {
   const blocked = guardToolCall({ modeOn: true, leafStatus: "DRAFT", cwd: dir, toolName: "write", input: { path: "src/a.ts" } });
   assert.equal(blocked.block, true);
   assert.ok(blocked.reason.includes("until the contract is sealed"));
+  assert.match(blocked.reason, /state DRAFT/);
+  assert.match(blocked.reason, /exitcode_status/);
+  assert.doesNotMatch(blocked.reason, /root user approval/);
   const draftArea = guardToolCall({ modeOn: true, leafStatus: "DRAFT", cwd: dir, toolName: "write", input: { path: ".exitcode/drafts/x.json" } });
   assert.equal(draftArea, null);
   const shell = guardToolCall({ modeOn: true, leafStatus: "DRAFT", cwd: dir, toolName: "bash", input: { command: "ls" } });
   assert.equal(shell.block, true);
+  assert.match(shell.reason, /until the contract is sealed and ACTIVE/);
+  assert.match(shell.reason, /Inspect with read/);
   const read = guardToolCall({ modeOn: true, leafStatus: "DRAFT", cwd: dir, toolName: "read", input: { path: "src/a.ts" } });
   assert.equal(read, null);
   const own = guardToolCall({ modeOn: true, leafStatus: "DRAFT", cwd: dir, toolName: "exitcode_status", input: {} });
@@ -1276,6 +1295,8 @@ test("guardToolCall: active contracts protect sealed artifacts only", () => {
   const dir = tempProject();
   const sealed = guardToolCall({ modeOn: true, leafStatus: "ACTIVE", cwd: dir, toolName: "edit", input: { path: ".exitcode/contracts/G1.sealed.json" } });
   assert.equal(sealed.block, true);
+  assert.match(sealed.reason, /supervisor-owned artifacts/);
+  assert.match(sealed.reason, /read-only/);
   const traversal = guardToolCall({ modeOn: true, leafStatus: "ACTIVE", cwd: dir, toolName: "write", input: { path: "proj/../.exitcode/evil" } });
   assert.equal(traversal.block, true);
   const project = guardToolCall({ modeOn: true, leafStatus: "ACTIVE", cwd: dir, toolName: "edit", input: { path: "src/a.ts" } });
@@ -1284,6 +1305,8 @@ test("guardToolCall: active contracts protect sealed artifacts only", () => {
   assert.equal(shell, null);
   const sealedShell = guardToolCall({ modeOn: true, leafStatus: "ACTIVE", cwd: dir, toolName: "bash", input: { command: "cat .exitcode/index.json" } });
   assert.equal(sealedShell.block, true);
+  assert.match(sealedShell.reason, /mentioning \.exitcode are blocked/);
+  assert.match(sealedShell.reason, /exitcode_status/);
 });
 
 test("resolveModeFromBranch: last mode entry wins; other entries ignored", () => {
@@ -1320,6 +1343,29 @@ test("status and nextAction track the loop position", async () => {
   await evaluateNode(io, null);
   snap = statusSnapshot(io);
   assert.ok(snap.next.includes("exitcode_child"));
+});
+
+test("nextAction: gives state-specific transitions without subjective decomposition triggers", () => {
+  const root = { policy: DEFAULT_POLICY, consumedAttempts: 2 };
+  const child = { id: "G1.1", parentId: "G1", status: NodeState.DRAFT };
+  assert.match(nextAction(root, child), /seal G1\.1 with exitcode_seal/);
+  assert.doesNotMatch(nextAction(root, child), /approval|review/);
+  assert.equal(nextAction(root, null), "no active node");
+  for (const status of [NodeState.PASS, NodeState.BLOCKED]) {
+    assert.equal(nextAction(root, { ...child, status }), `G1.1 is ${status}`);
+  }
+  const active = { ...child, status: NodeState.ACTIVE, attempts: 0,
+    lastResult: { outcomes: [{ criterionId: "C1", status: "FAIL" }, { criterionId: "C2", status: "PASS" }] } };
+  const repair = nextAction(root, active);
+  assert.match(repair, /repair G1\.1 to achieve its goal/);
+  assert.match(repair, /use failures \[C1\] as feedback, then exitcode_evaluate/);
+  assert.doesNotMatch(repair, /exitcode_child|C2/);
+  const reduce = nextAction(root, { ...active, attempts: DEFAULT_POLICY.localRepairs });
+  assert.match(reduce, /exitcode_evaluate G1\.1/);
+  assert.match(reduce, /smaller goal offers a clearer path/);
+  assert.match(reduce, /exitcode_child targeting one of \[C1\]/);
+  assert.match(reduce, /subject to supervisor gates/);
+  assert.doesNotMatch(reduce, /stalled|C2/);
 });
 
 test("budgetsOk and BLOCK_CODES cover the policy surface", () => {

@@ -265,11 +265,49 @@ test("adapter: review instructions distinguish acceptance, changes, and unclear 
   const event = { systemPromptOptions: { sections: {} } };
   h.events.get("before_agent_start")(event, h.ctx);
   const prompt = event.systemPromptOptions.sections.exitcode;
-  for (const text of ["STOP for user review", "userApproval quoting that reply", "requests changes is not approval",
-    "If intent is unclear, ask the user", "Never infer approval from silence", "Every root revision requires fresh approval"]) {
-    assert.ok(prompt.includes(text), text);
+  assert.match(prompt, /wait for explicit user approval/);
+  assert.match(h.tools.get("exitcode_draft").description, /STOP for user review/);
+  const seal = h.tools.get("exitcode_seal").description;
+  for (const text of ["acceptance, requested changes, or a question", "userApproval quoting the reply",
+    "reply requesting changes is not approval, even with assent", "Ask when unclear", "Never infer approval",
+    "root revision after E0 failure needs fresh approval", "Children need no userApproval"]) {
+    assert.ok(seal.includes(text), text);
   }
+  assert.doesNotMatch(core.PROTOCOL_PROMPT, /userApproval/);
   await h.reply("What does the second criterion mean?");
   assert.equal(core.loadRoot(core.makeIo(h.cwd), "G1").approval, undefined);
+  assert.equal(await h.events.get("agent_before_settle")({}, h.ctx), undefined);
+});
+
+test("adapter: tool descriptions carry evaluator and decomposition requirements", (t) => {
+  const h = harness(t);
+  const draft = h.tools.get("exitcode_draft").description;
+  for (const text of ["known-valid and known-invalid fixtures", "temporary candidate copies",
+    "same check must PASS", "FAIL every invalid fixture, not ERROR", "Do not change the real candidate"]) {
+    assert.ok(draft.includes(text), text);
+  }
+  const child = h.tools.get("exitcode_child").description;
+  for (const text of ["exactly one failed parent criterion", "configured local repair attempts",
+    "early prerequisite", "observable prerequisiteArtifact", "child's own checks", "without user approval"]) {
+    assert.ok(child.includes(text), text);
+  }
+  assert.match(h.tools.get("exitcode_evaluate").description, /reruns the parent when a child passes/);
+  assert.match(h.tools.get("exitcode_evaluate").description, /Follow the returned parent result and next action/);
+  assert.doesNotMatch(h.tools.get("exitcode_status").namespace.instructions, /userApproval|ALL PASS/);
+});
+
+test("adapter: continuation reports unresolved state and the supervisor's next action", async (t) => {
+  const h = harness(t);
+  await draft(h);
+  await h.command("approve");
+  const snap = core.statusSnapshot(core.makeIo(h.cwd));
+  for (let i = 0; i < core.MAX_SETTLE_NUDGES; i++) {
+    const nudge = await h.events.get("agent_before_settle")({}, h.ctx);
+    assert.equal(nudge.continue, true);
+    const content = nudge.entries[0].content;
+    assert.match(content, /G1 remains ACTIVE :: C1=FAIL C2=PASS/);
+    assert.ok(content.endsWith(`next: ${snap.next}`));
+    assert.doesNotMatch(content, /Only a fresh|ALL PASS|stalled/);
+  }
   assert.equal(await h.events.get("agent_before_settle")({}, h.ctx), undefined);
 });

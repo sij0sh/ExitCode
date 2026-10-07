@@ -57,7 +57,7 @@ const CriterionSchema = Type.Object({
 });
 
 const PolicySchema = Type.Object({
-  localRepairs: Type.Optional(Type.Number({ description: "Attempts before a child is expected (default 2)" })),
+  localRepairs: Type.Optional(Type.Number({ description: "Local repair attempts before ordinary child decomposition is permitted (default 2)" })),
   maxDepth: Type.Optional(Type.Number({ description: "Recursion depth below the root (default 3)" })),
   maxTotalAttempts: Type.Optional(Type.Number({ description: "Implementation attempts across the tree (default 12)" })),
   deadlineMinutes: Type.Optional(Type.Number({ description: "Shared deadline in minutes (default 60)" })),
@@ -66,12 +66,11 @@ const PolicySchema = Type.Object({
 
 const EXITCODE_NAMESPACE = {
   name: "exitcode",
-  description: "Contract-first recursive execution: sealed acceptance contracts, bounded repair, one smaller child at a time.",
+  description: "Tools for contract review, implementation feedback, and recursive verification.",
   instructions:
-    "Call exitcode_status to see the active contract, result vectors, and budgets. " +
-    "Propose root contracts with exitcode_draft and wait for the user to accept or request revisions in plain English. On acceptance, call exitcode_seal with userApproval quoting the reply; seal children without it. Verify work with exitcode_evaluate, " +
-    "decompose with exitcode_child, and report dead ends with exitcode_block. " +
-    "Only exitcode_evaluate reporting ALL PASS closes a goal.",
+    "Use exitcode_status for the active contract, results, budgets, and next action. " +
+    "Use exitcode_draft for root review, exitcode_seal for evaluator validation, exitcode_evaluate for fresh results, " +
+    "exitcode_child for a narrower subproblem, and exitcode_block for a concrete blocker.",
 };
 
 type Runtime = {
@@ -218,8 +217,10 @@ export default function (pi: ExtensionAPI) {
       name: "exitcode_draft",
       label: "Exitcode Draft",
       description:
-        "Propose a root acceptance contract: goal plus observable criteria with executable checks and setup commands for valid/invalid candidate fixtures. " +
-        "Validates structure only; present the entire contract and stop for the user to accept or request revisions in plain English before E0 and implementation.",
+        "Propose or revise a root contract with goal, observable criteria, executable checks, assumptions, exclusions, and verification approach. " +
+        "Each behavioral criterion needs setup commands for known-valid and known-invalid fixtures in temporary candidate copies. " +
+        "The same check must PASS the valid fixture and FAIL every invalid fixture, not ERROR. Do not change the real candidate while validating the evaluator. " +
+        "Validates structure only. Present the returned root review and STOP for user review before sealing or implementation.",
       promptSnippet: "exitcode_draft: propose the root contract (goal + criteria + checks + controls)",
       parameters: Type.Object({
         goal: Type.String({ description: "Goal statement" }),
@@ -259,9 +260,11 @@ export default function (pi: ExtensionAPI) {
       name: "exitcode_seal",
       label: "Exitcode Seal",
       description:
-        "Run the fixed evaluator gate (structure, discrimination, wiring, baseline) and seal the contract. " +
-        "For the root, interpret the user's reply after review. On acceptance, supply userApproval with the quoted reply to record approval and run E0. " +
-        "Requests for changes require a revised draft and fresh review, not approval. Ask when unclear. Children need no userApproval. Coding tools unlock only after sealing. At most two proposals per node.",
+        "Run E0: validate structure, test discrimination and empty-target rejection, record the baseline, then seal. " +
+        "For an unapproved root, interpret the user's reply to the current review: acceptance, requested changes, or a question. " +
+        "On acceptance (for example 'looks good, go ahead'), supply userApproval quoting the reply. /exitcode approve is an optional shortcut. " +
+        "A reply requesting changes is not approval, even with assent. Revise and present the complete contract again. Ask when unclear. Never infer approval. " +
+        "Any root revision after E0 failure needs fresh approval. Children need no userApproval. Coding tools unlock after sealing.",
       promptSnippet: "exitcode_seal: validate the evaluator, seal the contract, record the baseline",
       parameters: Type.Object({
         node: Type.String({ description: "Draft node id (e.g. G1, G1.1)" }),
@@ -279,7 +282,7 @@ export default function (pi: ExtensionAPI) {
       description:
         "Fresh supervisor evaluation of the current candidate. Consumes one shared attempt when the tree changed. " +
         "Checks ancestor regressions (restoring on regress), and reruns the parent when a child passes. " +
-        "Only ALL PASS here closes a goal.",
+        "Follow the returned parent result and next action. Only ALL PASS here closes a goal.",
       promptSnippet: "exitcode_evaluate: run the sealed checks fresh; ALL PASS closes the goal",
       parameters: Type.Object({
         node: Type.Optional(Type.String({ description: "Node id (defaults to the active leaf)" })),
@@ -308,8 +311,10 @@ export default function (pi: ExtensionAPI) {
       name: "exitcode_child",
       label: "Exitcode Child",
       description:
-        "Propose one smaller child tied to exactly one failing parent criterion. The child follows the same protocol " +
-        "(draft, seal, evaluate) without user approval and cannot modify its parent. One active child at a time.",
+        "Propose or revise a narrower child targeting exactly one failed parent criterion. Explain how it advances that requirement. " +
+        "Use after the configured local repair attempts, or for an early prerequisite with an observable prerequisiteArtifact. " +
+        "Supply the child's own checks and valid/invalid fixture setups as for a root. Seal and evaluate it without user approval. " +
+        "The supervisor enforces child gates and reevaluates the parent after child PASS.",
       promptSnippet: "exitcode_child: propose one narrower child tied to a failing parent criterion",
       parameters: Type.Object({
         parent: Type.String({ description: "Parent node id (e.g. G1)" }),
@@ -318,7 +323,7 @@ export default function (pi: ExtensionAPI) {
         originalRequest: Type.Optional(Type.String({ description: "Retained request (defaults to the parent's)" })),
         criteria: Type.Array(CriterionSchema),
         reason: Type.String({ description: "How this child advances the parent target" }),
-        prerequisite: Type.Optional(Type.Boolean({ description: "True when this is early prerequisite work" })),
+        prerequisite: Type.Optional(Type.Boolean({ description: "True to request decomposition before the local repair threshold; requires prerequisiteArtifact" })),
         prerequisiteArtifact: Type.Optional(Type.String({ description: "Observable artifact the prerequisite produces" })),
         revise: Type.Optional(Type.String({ description: "Existing DRAFT child id to revise (e.g. G1.1)" })),
       }),
@@ -452,7 +457,7 @@ export default function (pi: ExtensionAPI) {
       exitMode(`leaf ${leafStatus}`);
       return undefined;
     }
-    // The human checkpoint is a real pause, not a stalled autonomous loop.
+    // The human checkpoint is a review pause, not autonomous work.
     if (snap.awaitingApproval) return undefined;
     if (snap.expired) {
       const result = await core.blockNode(io, leafId, { reason: "shared deadline exceeded", code: "BUDGET_EXHAUSTED" });
@@ -470,7 +475,7 @@ export default function (pi: ExtensionAPI) {
         {
           type: "custom_message" as const,
           customType: "exitcode-nudge",
-          content: `exitcode: ${leafId} ${leafStatus} :: ${leaf?.vector ?? "unevaluated"}. Only a fresh exitcode_evaluate ALL PASS can close a goal. ${snap.next}`,
+          content: `exitcode: ${leafId} remains ${leafStatus} :: ${leaf?.vector ?? "unevaluated"}. next: ${snap.next}`,
           display: true,
         },
       ],

@@ -72,25 +72,22 @@ export const BLOCK_CODES = Object.freeze([
 
 /** Short protocol instructions supplied to Pi while exitcode mode is on. */
 export const PROTOCOL_PROMPT = [
-  "EXITCODE MODE — contract-first execution.",
-  "Inspect the goal, architecture, tests, and likely regressions in a read-only discovery phase.",
-  "Resolve known product ambiguities with the user before finalizing observable acceptance criteria.",
-  "Draft checks and controls.accept.setup/controls.reject[].setup commands that prepare valid/invalid candidate fixtures.",
-  "The same check must PASS on the valid fixture and FAIL on each invalid fixture without changing the real candidate.",
-  "For the root, present the entire acceptance specification, assumptions, exclusions, and verification approach, then STOP for user review.",
-  "Interpret the user's reply to the presented root contract: acceptance, requested changes, or a question.",
-  "On acceptance (for example 'looks good, go ahead'), call exitcode_seal with userApproval quoting that reply. /exitcode approve is an optional shortcut.",
-  "A reply that requests changes is not approval, even if it also says 'looks good'. Revise and present the entire contract again.",
-  "If intent is unclear, ask the user. Never infer approval from silence, the initial goal, or your own messages.",
-  "Users may request revisions naturally or cancel with /exitcode exit. Every root revision requires fresh approval.",
-  "After approval, the supervisor runs E0 and seals automatically before source writes become available.",
-  "Implement toward the sealed criteria and use evaluator diagnostics for repair.",
-  "After local attempts stall, or when a concrete prerequisite needs a smaller unit,",
-  "propose one narrower child tied to a failing parent criterion.",
-  "Children use the same evaluation protocol without user approval; they may only advance approved parent criteria. Preserve all ancestor contracts.",
-  "Report a specific missing requirement when blocked.",
-  "Completion belongs to the supervisor's fresh evaluation of the current candidate:",
-  "never declare success yourself; only exitcode_evaluate reporting ALL PASS closes a goal.",
+  "EXITCODE MODE - FIX SUCCESS / PURSUE SUCCESS / PROVE SUCCESS.",
+  "FIX SUCCESS: Inspect the goal, architecture, tests, and likely regressions before implementation.",
+  "Resolve known product ambiguity with the user and propose observable acceptance criteria with executable checks.",
+  "Present the complete root contract for review and wait for explicit user approval.",
+  "Any root draft revision requires fresh approval.",
+  "The supervisor validates the evaluator before sealing the contract.",
+  "The sealed contract is fixed and cannot be weakened.",
+  "PURSUE SUCCESS: Implement the approved goal. Use the sealed criteria to measure whether it has been achieved.",
+  "Use evaluator failures as repair feedback and preserve previously passing behavior.",
+  "Prefer direct repair. Decompose only when the supervisor permits it and a smaller goal offers a clearer path to a failed parent criterion.",
+  "A child is a temporary reduction of its parent problem, not a new objective.",
+  "It targets one failed parent criterion, needs no user approval, and cannot change ancestor contracts.",
+  "PROVE SUCCESS: Evaluate after meaningful changes.",
+  "Only a fresh supervisor evaluation with all criteria passing completes a goal.",
+  "A passing child does not complete its parent; follow the supervisor's returned parent result and next action.",
+  "If no viable autonomous path remains, report the concrete blocker.",
 ].join(" ");
 
 // ---------------------------------------------------------------------------
@@ -831,13 +828,13 @@ export function guardToolCall({ modeOn, leafStatus, cwd, toolName, input }) {
       if (isPathUnder(target, path.join(storeRoot, "drafts"))) return null;
       return {
         block: true,
-        reason: `exitcode: source writes are blocked until the contract is sealed and ACTIVE (state ${leafStatus ?? "NO_CONTRACT"}). Draft criteria with exitcode_draft and wait for root user approval before sealing.`,
+        reason: `exitcode: source writes are blocked until the contract is sealed and ACTIVE (state ${leafStatus ?? "NO_CONTRACT"}). Use exitcode_status for the required next action.`,
       };
     }
     if (toolName === "bash" || toolName === "powershell") {
       return {
         block: true,
-        reason: "exitcode: shell use is blocked while drafting. Inspect with read/grep/find/ls; the supervisor runs evaluator probes during exitcode_seal.",
+        reason: "exitcode: shell use is blocked until the contract is sealed and ACTIVE. Inspect with read/grep/find/ls. The supervisor runs evaluator probes during sealing.",
       };
     }
     return null;
@@ -846,14 +843,14 @@ export function guardToolCall({ modeOn, leafStatus, cwd, toolName, input }) {
   if (toolName === "write" || toolName === "edit") {
     const target = resolveWithin(cwd, String(input?.path ?? ""));
     if (isPathUnder(target, storeRoot)) {
-      return { block: true, reason: "exitcode: sealed artifacts under .exitcode/ are read-only to coding tools." };
+      return { block: true, reason: "exitcode: supervisor-owned artifacts under .exitcode/ are read-only to coding tools. Use exitcode_* tools to update supervisor state." };
     }
     return null;
   }
   if (toolName === "bash" || toolName === "powershell") {
     const command = String(input?.command ?? "");
     if (command.includes(EXITCODE_DIR)) {
-      return { block: true, reason: "exitcode: shell commands must not touch sealed artifacts under .exitcode/." };
+      return { block: true, reason: "exitcode: shell commands mentioning .exitcode are blocked to protect supervisor-owned artifacts. Use exitcode_status to inspect contract state." };
     }
   }
   return null;
@@ -1717,9 +1714,9 @@ export function nextAction(root, node, draft = null) {
   const repairs = root.policy.localRepairs ?? DEFAULT_POLICY.localRepairs;
   const attempts = `attempts ${root.consumedAttempts ?? 0}/${root.policy.maxTotalAttempts}`;
   if ((node.attempts ?? 0) < repairs) {
-    return `repair ${node.id} toward [${failing.join(", ") || "none"}], then exitcode_evaluate (${attempts})`;
+    return `repair ${node.id} to achieve its goal; use failures [${failing.join(", ") || "none"}] as feedback, then exitcode_evaluate (${attempts})`;
   }
-  return `exitcode_evaluate ${node.id}; if stalled, exitcode_child targeting one of [${failing.join(", ") || "none"}] (${attempts})`;
+  return `exitcode_evaluate ${node.id}; if a smaller goal offers a clearer path, propose exitcode_child targeting one of [${failing.join(", ") || "none"}], subject to supervisor gates (${attempts})`;
 }
 
 export function statusSnapshot(io) {
