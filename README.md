@@ -12,7 +12,7 @@ This implements the blueprint in `.agents/artifacts/specs.md`, distilled from
 
 ## Use
 
-The root goal is user-invoked and requires explicit user approval.
+The root goal is user-invoked and requires user approval after review.
 Children use the same evaluation protocol without separate user approval.
 
 ```
@@ -28,7 +28,7 @@ prompt, and it blocks no tool calls.
 | --- | --- | --- |
 | Discover | agent + user | inspect the project without implementation and resolve known product ambiguities |
 | Draft | agent | `exitcode_draft` proposes goal + observable criteria with executable checks and valid/invalid fixture setups |
-| Review | user | approve the root contract with `/exitcode approve`, request revisions naturally, or cancel with `/exitcode exit` |
+| Review | user | accept the root contract or request revisions in plain English, or cancel with `/exitcode exit` |
 | Seal | supervisor | `exitcode_seal` runs the fixed gate (structure, discrimination, wiring, baseline) and freezes the bundle |
 | Implement | agent | source writes unlock; repair toward the sealed criteria |
 | Evaluate | supervisor | `exitcode_evaluate` runs every check fresh; ALL PASS closes the goal |
@@ -38,7 +38,7 @@ prompt, and it blocks no tool calls.
 Supporting commands:
 
 ```
-/exitcode approve  approve the exact root draft, run E0, and start autonomous work
+/exitcode approve  optional shortcut to approve the root draft and start work
 /exitcode status   show the active contract, result vectors, budgets, next step
 /exitcode resume   re-enter mode for the on-disk root, including pending review
 /exitcode exit     leave mode (contracts on disk are preserved)
@@ -57,10 +57,16 @@ The review includes the goal, every requirement, assumptions, exclusions, and ve
 Executable checks and fixture setups remain part of the same draft, but are not dumped into the review.
 Use `/exitcode status` to see the review again.
 
-Use `/exitcode approve` after reviewing the criteria.
+Reply in plain English after reviewing the criteria, such as "looks good, go ahead".
+The agent interprets whether you accept, want changes, or have a question.
+A reply that requests changes does not approve the current draft.
+The agent asks for clarification when your intent is unclear.
+`/exitcode approve` remains an optional shortcut.
 Approval records the SHA-256 digest, timestamp, and user attribution on the root record.
 The digest covers the exact draft, including verification commands and expectations.
-Only the user command grants approval; there is no agent approval tool.
+On acceptance, the agent calls `exitcode_seal` with `userApproval` quoting your reply.
+The supervisor records that reply with the approval and runs E0.
+The agent must not infer approval from silence, the initial goal, or its own messages.
 Root sealing rejects missing or mismatched approval before running E0 or consuming a seal proposal.
 Any accepted root revision clears approval and presents the entire contract again.
 Direct draft edits require a new `exitcode_draft` revision before approval.
@@ -102,8 +108,9 @@ Or symlink/copy the directory into your Pi extensions path. `typebox` and
   attempt accounting, child boundaries (a passing child reruns but never
   closes its parent), regression restore, stale-PASS detection, seal tamper
   detection, budget/deadline enforcement, approval hashing, and guard invisibility.
-- `exitcode-adapter.test.mjs` - adapter tests for review pauses, approval commands,
-  automatic E0 and continuation, cancellation, and resume.
+- `exitcode-adapter.test.mjs` - adapter tests for review pauses, conversational
+  approval, optional approval commands, automatic E0 and continuation,
+  cancellation, and resume.
 
 ```bash
 ./scripts/verify   # syntax checks and the complete test suite
@@ -151,6 +158,9 @@ New drafts must replace legacy control `command` fields with `setup` fields.
 An extension runs inside the Pi process with your OS permissions, so it is
 not a sandbox boundary:
 
+- Conversational approval trusts the agent to interpret the user's intent.
+  The supervisor validates the approved draft's digest, not the meaning or
+  origin of the quoted reply. This is not a user-only authorization boundary.
 - There is no private checkout or container here. "Sealed" artifacts are
   protected by tool-call guards plus digest tamper detection (a modified
   bundle BLOCKs the node instead of being trusted), not by filesystem

@@ -69,7 +69,7 @@ const EXITCODE_NAMESPACE = {
   description: "Contract-first recursive execution: sealed acceptance contracts, bounded repair, one smaller child at a time.",
   instructions:
     "Call exitcode_status to see the active contract, result vectors, and budgets. " +
-    "Propose root contracts with exitcode_draft and wait for user /exitcode approve; seal children with exitcode_seal. Verify work with exitcode_evaluate, " +
+    "Propose root contracts with exitcode_draft and wait for the user to accept or request revisions in plain English. On acceptance, call exitcode_seal with userApproval quoting the reply; seal children without it. Verify work with exitcode_evaluate, " +
     "decompose with exitcode_child, and report dead ends with exitcode_block. " +
     "Only exitcode_evaluate reporting ALL PASS closes a goal.",
 };
@@ -178,9 +178,9 @@ export default function (pi: ExtensionAPI) {
     }
   };
 
-  const sealContract = async (nodeId: string, ctx: ExtensionContext) => {
+  const sealContract = async (nodeId: string, ctx: ExtensionContext, userApproval?: string) => {
     const io = core.makeIo(ctx.cwd);
-    const result = await core.sealNode(io, nodeId);
+    const result = await core.sealNode(io, nodeId, { userApproval });
     if (!result.ok && !result.events) {
       const lines = [`seal rejected:`, errLines(result)];
       if (typeof result.sealAttemptsLeft === "number") lines.push(`seal proposals left: ${result.sealAttemptsLeft}`);
@@ -219,7 +219,7 @@ export default function (pi: ExtensionAPI) {
       label: "Exitcode Draft",
       description:
         "Propose a root acceptance contract: goal plus observable criteria with executable checks and setup commands for valid/invalid candidate fixtures. " +
-        "Validates structure only; present the entire contract and stop for user /exitcode approve before E0 and implementation.",
+        "Validates structure only; present the entire contract and stop for the user to accept or request revisions in plain English before E0 and implementation.",
       promptSnippet: "exitcode_draft: propose the root contract (goal + criteria + checks + controls)",
       parameters: Type.Object({
         goal: Type.String({ description: "Goal statement" }),
@@ -260,15 +260,17 @@ export default function (pi: ExtensionAPI) {
       label: "Exitcode Seal",
       description:
         "Run the fixed evaluator gate (structure, discrimination, wiring, baseline) and seal the contract. " +
-        "Root sealing requires explicit user approval of the exact draft. Children need no user approval. Coding tools unlock only after sealing. At most two proposals per node.",
+        "For the root, interpret the user's reply after review. On acceptance, supply userApproval with the quoted reply to record approval and run E0. " +
+        "Requests for changes require a revised draft and fresh review, not approval. Ask when unclear. Children need no userApproval. Coding tools unlock only after sealing. At most two proposals per node.",
       promptSnippet: "exitcode_seal: validate the evaluator, seal the contract, record the baseline",
       parameters: Type.Object({
         node: Type.String({ description: "Draft node id (e.g. G1, G1.1)" }),
+        userApproval: Type.Optional(Type.String({ minLength: 1, description: "Quote the user's reply accepting the current root contract after review. Omit for children or an already-approved root. Never use the initial goal, silence, a change request, or an assistant message." })),
       }),
       execute: async (_id, params, _signal, _onUpdate, ctx) => {
         assertMode();
         rt.nudges = 0;
-        return sealContract(params.node, ctx);
+        return sealContract(params.node, ctx, params.userApproval);
       },
     },
     {
@@ -482,7 +484,7 @@ export default function (pi: ExtensionAPI) {
     [
       "exitcode: contract-first recursive execution.",
       "/exitcode <goal>  enter exitcode mode rooted at your goal (root only; children come from exitcode_child)",
-      "/exitcode approve approve the exact root draft, run E0, and start autonomous work",
+      "/exitcode approve optional shortcut to approve the root draft and start autonomous work",
       "/exitcode status  show the active contract, vectors, and budgets",
       "/exitcode resume  re-enter mode for the on-disk root, including pending review",
       "/exitcode exit    leave exitcode mode (work on disk is preserved)",

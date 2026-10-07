@@ -78,7 +78,10 @@ export const PROTOCOL_PROMPT = [
   "Draft checks and controls.accept.setup/controls.reject[].setup commands that prepare valid/invalid candidate fixtures.",
   "The same check must PASS on the valid fixture and FAIL on each invalid fixture without changing the real candidate.",
   "For the root, present the entire acceptance specification, assumptions, exclusions, and verification approach, then STOP for user review.",
-  "Only the user's /exitcode approve command grants approval; conversational assent or tool calls cannot approve.",
+  "Interpret the user's reply to the presented root contract: acceptance, requested changes, or a question.",
+  "On acceptance (for example 'looks good, go ahead'), call exitcode_seal with userApproval quoting that reply. /exitcode approve is an optional shortcut.",
+  "A reply that requests changes is not approval, even if it also says 'looks good'. Revise and present the entire contract again.",
+  "If intent is unclear, ask the user. Never infer approval from silence, the initial goal, or your own messages.",
   "Users may request revisions naturally or cancel with /exitcode exit. Every root revision requires fresh approval.",
   "After approval, the supervisor runs E0 and seals automatically before source writes become available.",
   "Implement toward the sealed criteria and use evaluator diagnostics for repair.",
@@ -1177,7 +1180,7 @@ export function draftNode(io, args) {
     checkpoints: [],
     children: [],
   });
-  return { ok: true, id, rootId: id, draft, warnings: [], next: `present the root contract and wait for user /exitcode approve (or revisions / /exitcode exit)` };
+  return { ok: true, id, rootId: id, draft, warnings: [], next: `present the root contract and wait for the user to accept or request revisions (or /exitcode exit)` };
 }
 
 /** Overwrite an existing DRAFT (revision does not consume a seal proposal). */
@@ -1264,8 +1267,11 @@ function approvalMatches(root, draft) {
     root.approval.digest === sha256Hex(stableStringify(draft)));
 }
 
-/** Called only by the user command, never exposed as an agent tool. */
-export function approveRoot(io) {
+/** Record user approval, directly or from a reply interpreted by the agent. */
+export function approveRoot(io, { userReply } = {}) {
+  if (userReply !== undefined && !nonEmptyString(userReply)) {
+    return { ok: false, errors: ["user approval reply must be a nonempty string"] };
+  }
   const index = loadIndex(io.cwd);
   const root = index.activeRootId ? loadRoot(io, index.activeRootId) : null;
   const node = root ? loadNodeState(io, root.id) : null;
@@ -1279,7 +1285,8 @@ export function approveRoot(io) {
   }
   const validation = validateStructure(draft, { policy: root.policy });
   if (!validation.ok) return validation;
-  root.approval = { digest: root.reviewDigest, at: new Date(io.nowMs()).toISOString(), approvedBy: "user" };
+  root.approval = { digest: root.reviewDigest, at: new Date(io.nowMs()).toISOString(), approvedBy: "user",
+    ...(userReply !== undefined ? { userReply: userReply.trim() } : {}) };
   saveRoot(io, root);
   return { ok: true, id: root.id, approval: root.approval };
 }
@@ -1294,7 +1301,8 @@ export function rootReviewText(draft) {
   }
   lines.push("", "Verification", draft.verification ??
     "Each criterion has an executable check. Behavioral checks must pass valid fixtures, reject invalid fixtures, and reject an empty target. Regression checks must continue to pass.",
-    "", "Approve with /exitcode approve, request changes in a normal message, or cancel with /exitcode exit.",
+    "", "Reply in plain English to accept (for example 'looks good, go ahead') or request changes. Cancel with /exitcode exit.",
+    "The agent interprets your reply; /exitcode approve is an optional shortcut.",
     "Approval freezes this exact root draft, including its verification checks. Any revision requires fresh approval.",
     "After approval, ExitCode runs E0 and works autonomously until the root passes or reaches a blocker.",
     "Children need no separate approval and cannot weaken the approved root criteria.");
@@ -1303,7 +1311,7 @@ export function rootReviewText(draft) {
 
 // --- seal ----------------------------------------------------------------
 
-export async function sealNode(io, nodeId) {
+export async function sealNode(io, nodeId, { userApproval } = {}) {
   ensureStoreDirs(io.cwd);
   const index = loadIndex(io.cwd);
   const root = index.activeRootId ? loadRoot(io, index.activeRootId) : null;
@@ -1315,11 +1323,17 @@ export async function sealNode(io, nodeId) {
   const stored = readJson(draftFile(io.cwd, nodeId));
   if (!stored?.draft) return { ok: false, errors: [`draft for ${nodeId} is missing`] };
   const draft = JSON.parse(stableStringify(stored.draft)); // immutable gate copy
+  if (userApproval !== undefined) {
+    if (node.parentId) return { ok: false, errors: ["children do not require user approval"] };
+    const approval = approveRoot(io, { userReply: userApproval });
+    if (!approval.ok) return approval;
+    root.approval = approval.approval;
+  }
   if (!node.parentId && !approvalMatches(root, draft)) {
     return {
       ok: false,
       errors: [root.approval ? "root contract changed since user approval" : "root contract requires explicit user approval"],
-      next: "present the root contract and wait for user /exitcode approve",
+      next: "present the root contract and wait for the user to accept or request revisions",
     };
   }
 
@@ -1371,7 +1385,7 @@ export async function sealNode(io, nodeId) {
     if (currentRoot?.status !== NodeState.ACTIVE || loadNodeState(io, nodeId)?.status !== NodeState.DRAFT ||
         !approvalMatches(currentRoot, draft) || !approvalMatches(currentRoot, currentDraft)) {
       return { ok: false, errors: ["root contract or approval changed during E0; review and approve again"],
-        next: "revise with exitcode_draft and wait for user /exitcode approve" };
+        next: "revise with exitcode_draft and wait for the user to accept or request revisions" };
     }
   }
 
@@ -1382,7 +1396,7 @@ export async function sealNode(io, nodeId) {
       return blockNode(io, nodeId, { reason: `no valid evaluator after ${MAX_DRAFT_PROPOSALS} proposals: ${gate.errors.join("; ")}`, code: "EVALUATOR_UNBUILDABLE" });
     }
     const tool = node.parentId ? "exitcode_child" : "exitcode_draft";
-    return { ok: false, errors: gate.errors, sealAttemptsLeft: left, next: `revise with ${tool} (revise:"${nodeId}") then ${node.parentId ? "exitcode_seal" : "present the entire contract and wait for user /exitcode approve"}` };
+    return { ok: false, errors: gate.errors, sealAttemptsLeft: left, next: `revise with ${tool} (revise:"${nodeId}") then ${node.parentId ? "exitcode_seal" : "present the entire contract and wait for the user to accept or request revisions"}` };
   }
 
   writeJsonAtomic(sealedFile(io.cwd, nodeId), gate.bundle);
@@ -1695,7 +1709,7 @@ export async function blockNode(io, nodeId, { reason, code = "NO_PATH" }) {
 export function nextAction(root, node, draft = null) {
   if (!node) return "no active node";
   if (node.status === NodeState.DRAFT) {
-    if (!node.parentId && !approvalMatches(root, draft)) return "present the root contract and wait for user /exitcode approve (or revisions / /exitcode exit)";
+    if (!node.parentId && !approvalMatches(root, draft)) return "present the root contract and wait for the user to accept or request revisions (or /exitcode exit)";
     return `seal ${node.id} with exitcode_seal`;
   }
   if (node.status !== NodeState.ACTIVE) return `${node.id} is ${node.status}`;

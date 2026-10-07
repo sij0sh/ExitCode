@@ -58,6 +58,10 @@ function harness(t, content = "todo\n") {
   return {
     cwd, ctx, tools, events, messages, notifications, entries,
     setIdle: (value) => { idle = value; },
+    reply: (text) => {
+      messages.push({ role: "user", content: text });
+      return events.get("input")({ text, source: "interactive" }, ctx);
+    },
     command: (args) => commands.get("exitcode").handler(args, ctx),
     tool: (name, params) => tools.get(name).execute("call", params, undefined, undefined, ctx),
   };
@@ -71,14 +75,14 @@ async function draft(h) {
   });
 }
 
-test("adapter: root review pauses and no agent tool can approve", async (t) => {
+test("adapter: root review pauses until user approval is recorded", async (t) => {
   const h = harness(t);
   const result = await draft(h);
   assert.match(result.content[0].text, /C1: The feature is done/);
   assert.match(result.content[0].text, /C2: Existing behavior is preserved/);
   assert.doesNotMatch(result.content[0].text, /grep -qx/);
   assert.equal(h.tools.size, 6);
-  assert.equal(h.tools.has("exitcode_approve"), false);
+  assert.match(h.tools.get("exitcode_seal").description, /interpret the user's reply/);
   const io = core.makeIo(h.cwd);
   assert.equal(core.loadRoot(io, "G1").approval, undefined);
   assert.equal(core.statusSnapshot(io).awaitingApproval, true);
@@ -184,4 +188,88 @@ test("adapter: failed E0 continues to revision and pauses for fresh approval", a
   await h.command("approve");
   assert.equal(core.loadNodeState(io, "G1").status, "ACTIVE");
   assert.equal(core.loadNodeState(io, "G1").sealAttempts, 2);
+});
+
+test("adapter: plain-English acceptance seals and continues without a command", async (t) => {
+  const h = harness(t);
+  await draft(h);
+  const reply = "Looks good, go ahead.";
+  await h.reply(reply);
+  // The model interprets the reply; this exercises the operation it selects.
+  const result = await h.tool("exitcode_seal", { node: "G1", userApproval: reply });
+  assert.equal(result.isError, undefined);
+  assert.match(result.content[0].text, /sealed G1/);
+  const io = core.makeIo(h.cwd);
+  assert.equal(core.loadNodeState(io, "G1").status, "ACTIVE");
+  assert.equal(core.loadRoot(io, "G1").approval.userReply, reply);
+  assert.equal(core.loadRoot(io, "G1").approval.digest, core.loadBundle(io, "G1").digest);
+  assert.equal(h.messages.at(-1).content, reply); // No synthetic command-triggered turn.
+  assert.equal((await h.events.get("agent_before_settle")({}, h.ctx)).continue, true);
+  assert.equal(h.events.get("tool_call")({ toolName: "write", input: { path: "feature.txt" } }, h.ctx), undefined);
+});
+
+test("adapter: change requests revise and pause for a fresh conversational acceptance", async (t) => {
+  const h = harness(t);
+  await draft(h);
+  const reply = "Looks good, but also require the existing interface.";
+  await h.reply(reply);
+  assert.equal(core.loadRoot(core.makeIo(h.cwd), "G1").approval, undefined);
+  const revisedCriteria = structuredClone(criteria);
+  revisedCriteria[0].requirement += " through the existing interface";
+  const revision = await h.tool("exitcode_draft", { goal: "Finish the feature", criteria: revisedCriteria, revise: "G1" });
+  assert.match(revision.content[0].text, /through the existing interface/);
+  assert.equal(await h.events.get("agent_before_settle")({}, h.ctx), undefined);
+  assert.equal((await h.tool("exitcode_seal", { node: "G1" })).isError, true);
+  const accepted = "Yes, that version works. Please proceed.";
+  await h.reply(accepted);
+  assert.equal((await h.tool("exitcode_seal", { node: "G1", userApproval: accepted })).isError, undefined);
+  assert.equal(core.loadRoot(core.makeIo(h.cwd), "G1").approval.userReply, accepted);
+});
+
+test("adapter: conversational E0 failure requires fresh approval after revision", async (t) => {
+  const h = harness(t);
+  await h.command("Add the feature");
+  const broken = structuredClone(criteria);
+  broken[0].controls.reject[0].setup = "printf 'done\\n' > feature.txt";
+  await h.tool("exitcode_draft", { goal: "g", criteria: broken });
+  const firstReply = "Proceed.";
+  await h.reply(firstReply);
+  assert.equal((await h.tool("exitcode_seal", { node: "G1", userApproval: firstReply })).isError, true);
+  const io = core.makeIo(h.cwd);
+  assert.equal(core.loadNodeState(io, "G1").sealAttempts, 1);
+  await h.tool("exitcode_draft", { goal: "g", criteria, revise: "G1" });
+  assert.equal(core.loadRoot(io, "G1").approval, undefined);
+  assert.equal(await h.events.get("agent_before_settle")({}, h.ctx), undefined);
+  assert.equal((await h.tool("exitcode_seal", { node: "G1" })).isError, true);
+  const newReply = "The revised version looks good.";
+  await h.reply(newReply);
+  assert.equal((await h.tool("exitcode_seal", { node: "G1", userApproval: newReply })).isError, undefined);
+  assert.equal(core.loadNodeState(io, "G1").sealAttempts, 2);
+  assert.equal(core.loadRoot(io, "G1").approval.userReply, newReply);
+});
+
+test("adapter: conversational acceptance of an already-satisfied root exits mode", async (t) => {
+  const h = harness(t, "done\n");
+  await draft(h);
+  await h.reply("Go ahead.");
+  const result = await h.tool("exitcode_seal", { node: "G1", userApproval: "Go ahead." });
+  assert.equal(result.details.alreadySatisfied, true);
+  assert.equal(core.loadRoot(core.makeIo(h.cwd), "G1").status, "PASS");
+  assert.equal(h.tools.get("exitcode_seal").exposure, "hidden");
+  assert.equal(await h.events.get("agent_before_settle")({}, h.ctx), undefined);
+});
+
+test("adapter: review instructions distinguish acceptance, changes, and unclear intent", async (t) => {
+  const h = harness(t);
+  await draft(h);
+  const event = { systemPromptOptions: { sections: {} } };
+  h.events.get("before_agent_start")(event, h.ctx);
+  const prompt = event.systemPromptOptions.sections.exitcode;
+  for (const text of ["STOP for user review", "userApproval quoting that reply", "requests changes is not approval",
+    "If intent is unclear, ask the user", "Never infer approval from silence", "Every root revision requires fresh approval"]) {
+    assert.ok(prompt.includes(text), text);
+  }
+  await h.reply("What does the second criterion mean?");
+  assert.equal(core.loadRoot(core.makeIo(h.cwd), "G1").approval, undefined);
+  assert.equal(await h.events.get("agent_before_settle")({}, h.ctx), undefined);
 });

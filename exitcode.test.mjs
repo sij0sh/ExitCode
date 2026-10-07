@@ -668,7 +668,7 @@ test("approval: unapproved roots never run E0 or consume seal proposals", async 
   const exec = fileExec(dir, { checks: standardChecks });
   const { io } = testIo(dir, exec);
   const draft = draftNode(io, { goal: "g", criteria: ROOT_CRITERIA });
-  assert.match(draft.next, /user \/exitcode approve/);
+  assert.match(draft.next, /user to accept or request revisions/);
   for (let n = 0; n < MAX_DRAFT_PROPOSALS + 1; n++) {
     const result = await sealNode(io, "G1");
     assert.equal(result.ok, false);
@@ -699,6 +699,36 @@ test("approval: exact draft hash and user metadata survive a fresh IO instance",
   assert.equal(approveRoot(fresh).ok, false);
 });
 
+test("approval: sealing records a conversational reply against the exact root draft", async () => {
+  const dir = tempProject();
+  const exec = fileExec(dir, { checks: standardChecks });
+  const { io } = testIo(dir, exec);
+  const draft = draftNode(io, { goal: "g", criteria: ROOT_CRITERIA });
+  const reply = "Looks good, go ahead.";
+  assert.equal((await sealNode(io, "G1", { userApproval: reply })).ok, true);
+  const approval = loadRoot(io, "G1").approval;
+  assert.equal(approval.userReply, reply);
+  assert.equal(approval.approvedBy, "user");
+  assert.equal(approval.digest, sha256Hex(stableStringify(draft.draft)));
+  assert.equal(approval.digest, loadBundle(io, "G1").digest);
+  assert.deepEqual(loadRoot(makeIo(dir), "G1").approval, approval);
+});
+
+test("approval: empty or invalid conversational replies never run E0", async () => {
+  const dir = tempProject();
+  const exec = fileExec(dir, { checks: standardChecks });
+  const { io } = testIo(dir, exec);
+  draftNode(io, { goal: "g", criteria: ROOT_CRITERIA });
+  for (const userApproval of ["", "  ", null, true, 123]) {
+    const result = await sealNode(io, "G1", { userApproval });
+    assert.equal(result.ok, false);
+    assert.match(result.errors[0], /nonempty string/);
+  }
+  assert.equal(loadRoot(io, "G1").approval, undefined);
+  assert.equal(loadNodeState(io, "G1").sealAttempts, 0);
+  assert.equal(exec.calls.length, 0);
+});
+
 test("approval: every accepted root revision invalidates approval and retains review context", async () => {
   const dir = tempProject();
   const exec = fileExec(dir, { checks: standardChecks });
@@ -713,7 +743,7 @@ test("approval: every accepted root revision invalidates approval and retains re
   const revised = draftNode(io, { goal: "g", criteria: ROOT_CRITERIA, revise: "G1" });
   assert.equal(revised.ok, true);
   assert.equal(loadRoot(io, "G1").approval, undefined);
-  assert.match(revised.next, /user \/exitcode approve/);
+  assert.match(revised.next, /user to accept or request revisions/);
   assert.deepEqual(revised.draft.assumptions, ["Existing policy"]);
   assert.match(rootReviewText(revised.draft), /No redesign/);
   assert.equal((await sealNode(io, "G1")).ok, false);
@@ -744,6 +774,7 @@ test("approval: semantic or evaluator edits on disk cannot reuse approval", asyn
     assert.match(result.errors[0], /changed since user approval/);
     assert.equal(statusSnapshot(io).awaitingApproval, true);
     assert.equal(approveRoot(io).ok, false);
+    assert.equal((await sealNode(io, "G1", { userApproval: "Go ahead." })).ok, false);
     assert.equal(exec.calls.length, 0);
     assert.equal(loadNodeState(io, "G1").sealAttempts, 0);
   }
@@ -761,8 +792,7 @@ test("approval: root revision during asynchronous E0 cannot seal stale intent", 
     return exec(command, opts);
   } });
   draftNode(io, { goal: "g", criteria: ROOT_CRITERIA });
-  assert.equal(approveRoot(io).ok, true);
-  const result = await sealNode(io, "G1");
+  const result = await sealNode(io, "G1", { userApproval: "Proceed." });
   assert.equal(result.ok, false);
   assert.match(result.errors[0], /changed during E0/);
   assert.equal(loadBundle(io, "G1"), null);
@@ -791,6 +821,8 @@ test("approval: child revisions and sealing need no separate user approval", asy
   assert.equal(revised.ok, true);
   assert.equal(statusSnapshot(io).awaitingApproval, false);
   assert.match(revised.next, /seal G1.1/);
+  assert.equal((await sealNode(io, child.id, { userApproval: "Proceed." })).ok, false);
+  assert.equal(loadNodeState(io, child.id).sealAttempts, 0);
   assert.equal((await sealNode(io, child.id)).ok, true);
   assert.deepEqual(loadRoot(io, "G1").approval, approval);
   assert.equal(loadBundle(io, "G1").digest, parentDigest);
@@ -806,6 +838,7 @@ test("approval: legacy drafts fail closed and must be revised before approval", 
   fs.writeFileSync(file, JSON.stringify(root));
   assert.equal(approveRoot(io).ok, false);
   assert.equal((await sealNode(io, "G1")).ok, false);
+  assert.equal((await sealNode(io, "G1", { userApproval: "Proceed." })).ok, false);
   assert.equal(draftNode(io, { goal: "g", criteria: ROOT_CRITERIA, revise: "G1" }).ok, true);
   assert.equal(approveRoot(io).ok, true);
 });
@@ -815,7 +848,7 @@ test("review: acceptance layer omits shell mechanics and validates optional fiel
     verification: "Test positive, negative, and regression cases." });
   const review = rootReviewText(draft);
   for (const text of [draft.goal, ...draft.criteria.map((c) => c.requirement), ...draft.assumptions,
-    ...draft.exclusions, draft.verification, "/exitcode approve", "Children need no separate approval"]) {
+    ...draft.exclusions, draft.verification, "Reply in plain English", "optional shortcut", "Children need no separate approval"]) {
     assert.ok(review.includes(text), text);
   }
   assert.ok(!review.includes("check:c1"));
@@ -1274,7 +1307,7 @@ test("status and nextAction track the loop position", async () => {
   let snap = statusSnapshot(io);
   assert.equal(snap.active, true);
   assert.equal(snap.awaitingApproval, true);
-  assert.ok(snap.next.includes("/exitcode approve"));
+  assert.ok(snap.next.includes("user to accept or request revisions"));
   assert.equal(approveRoot(io).ok, true);
   assert.equal((await sealNode(io, "G1")).ok, true);
   snap = statusSnapshot(io);
