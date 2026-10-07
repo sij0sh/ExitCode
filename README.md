@@ -195,29 +195,6 @@ This is a lean v1 workflow supervisor, not a sandbox or a guarantee of autonomou
   Recursion uses one session, not isolated child contexts or parallel workers.
   Scaling benefits are intended, not measured throughput or token savings.
 
-## Development and design
-
-```bash
-./scripts/verify
-```
-
-Runs syntax checks and the complete test suite.
-Use `npm test` for the Node tests alone.
-
-- [`exitcode-core.mjs`](./exitcode-core.mjs) owns contracts, E0, evaluations, budgets, child rules,
-  checkpoints, and atomic state records.
-- [`exitcode.ts`](./exitcode.ts) integrates the loop with Pi commands, tools, guards, and continuation.
-- [`exitcode.test.mjs`](./exitcode.test.mjs) and
-  [`exitcode-adapter.test.mjs`](./exitcode-adapter.test.mjs) cover core and adapter behavior.
-
-Read the [concept](./.agents/artifacts/concept.md) for the rationale and the
-[blueprint](./.agents/artifacts/specs.md) for the intended architecture.
-The blueprint describes stronger isolation than this extension implements.
-The [E0 notes](./.agents/artifacts/E0.md) explain fixture discrimination and its motivation.
-The [approval notes](./.agents/artifacts/user-approval.md) explain human review.
-Current source and tests are the authority for implemented behavior.
-`package.json` declares the MIT license.
-
 ---
 
 <div align="center">
