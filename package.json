@@ -1,0 +1,19 @@
+{
+  "name": "exitcode",
+  "version": "0.1.0",
+  "description": "Contract-first recursive execution for Pi: sealed acceptance contracts, bounded repair, one smaller child at a time. Enter with /exitcode.",
+  "keywords": ["pi-package"],
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test ./*.test.mjs"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "pi": {
+    "extensions": ["./exitcode.ts"]
+  }
+}
