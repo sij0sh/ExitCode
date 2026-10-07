@@ -2,7 +2,7 @@
  * exitcode — contract-first recursive execution for Pi.
  *
  * The root goal is user-invoked via /exitcode. Children are proposed by the
- * agent through exitcode_child and follow the same protocol. All exitcode
+ * agent through exitcode_child without separate user approval. All exitcode
  * tools are registered hidden and are only visible to the model while
  * exitcode mode is on; otherwise the extension is inert.
  *
@@ -69,7 +69,7 @@ const EXITCODE_NAMESPACE = {
   description: "Contract-first recursive execution: sealed acceptance contracts, bounded repair, one smaller child at a time.",
   instructions:
     "Call exitcode_status to see the active contract, result vectors, and budgets. " +
-    "Propose contracts with exitcode_draft, activate them with exitcode_seal, verify work with exitcode_evaluate, " +
+    "Propose root contracts with exitcode_draft and wait for user /exitcode approve; seal children with exitcode_seal. Verify work with exitcode_evaluate, " +
     "decompose with exitcode_child, and report dead ends with exitcode_block. " +
     "Only exitcode_evaluate reporting ALL PASS closes a goal.",
 };
@@ -178,6 +178,26 @@ export default function (pi: ExtensionAPI) {
     }
   };
 
+  const sealContract = async (nodeId: string, ctx: ExtensionContext) => {
+    const io = core.makeIo(ctx.cwd);
+    const result = await core.sealNode(io, nodeId);
+    if (!result.ok && !result.events) {
+      const lines = [`seal rejected:`, errLines(result)];
+      if (typeof result.sealAttemptsLeft === "number") lines.push(`seal proposals left: ${result.sealAttemptsLeft}`);
+      if (result.next) lines.push(`next: ${result.next}`);
+      return textResult(lines.join("\n"), result, true);
+    }
+    maybeAutoExit(result.cascade ?? result, ctx);
+    const lines = result.sealed
+      ? [`sealed ${result.sealed}. baseline: ${result.baseline}`]
+      : [...(result.events ?? [])];
+    if (result.alreadySatisfied) lines.push("baseline already satisfies every criterion: goal already met under this contract.");
+    lines.push(...cascadeLines(result.cascade));
+    if (result.next) lines.push(`next: ${result.next}`);
+    if (result.terminal) lines.push(`terminal: root ${result.terminal.root} ${result.terminal.status}`);
+    return textResult(withWarnings(lines, result.warnings).join("\n"), result);
+  };
+
   const defs: ToolDef[] = [
     {
       name: "exitcode_status",
@@ -199,13 +219,16 @@ export default function (pi: ExtensionAPI) {
       label: "Exitcode Draft",
       description:
         "Propose a root acceptance contract: goal plus observable criteria with executable checks and setup commands for valid/invalid candidate fixtures. " +
-        "Validates structure only; call exitcode_seal to run the evaluator gate and activate.",
+        "Validates structure only; present the entire contract and stop for user /exitcode approve before E0 and implementation.",
       promptSnippet: "exitcode_draft: propose the root contract (goal + criteria + checks + controls)",
       parameters: Type.Object({
         goal: Type.String({ description: "Goal statement" }),
         originalRequest: Type.Optional(Type.String({ description: "Retained user request (defaults to goal)" })),
         criteria: Type.Array(CriterionSchema),
         policy: Type.Optional(PolicySchema),
+        assumptions: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { description: "Resolved product assumptions to show in user review" })),
+        exclusions: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { description: "Out-of-scope work to show in user review" })),
+        verification: Type.Optional(Type.String({ minLength: 1, description: "Plain-language verification approach; do not dump shell mechanics" })),
         revise: Type.Optional(Type.String({ description: "Existing DRAFT root id to revise (e.g. G1)" })),
       }),
       execute: async (_id, params, _signal, _onUpdate, ctx) => {
@@ -214,9 +237,12 @@ export default function (pi: ExtensionAPI) {
         const io = core.makeIo(ctx.cwd);
         const result = core.draftNode(io, {
           goal: params.goal,
-          originalRequest: params.originalRequest,
+          originalRequest: params.originalRequest ?? rt.pendingGoal,
           criteria: params.criteria,
           policy: params.policy,
+          assumptions: params.assumptions,
+          exclusions: params.exclusions,
+          verification: params.verification,
           revise: params.revise,
         });
         if (!result.ok) return textResult(`draft rejected:\n${errLines(result)}`, result, true);
@@ -224,7 +250,7 @@ export default function (pi: ExtensionAPI) {
         rt.pendingGoal = undefined;
         pi.appendEntry(core.MODE_ENTRY_TYPE, { on: true, rootId: rt.rootId });
         return textResult(
-          withWarnings([`draft ${result.id} accepted.`, `next: ${result.next}`], result.warnings).join("\n"),
+          withWarnings([`draft ${result.id} accepted.`, core.rootReviewText(result.draft), `next: ${result.next}`], result.warnings).join("\n"),
           result,
         );
       },
@@ -234,7 +260,7 @@ export default function (pi: ExtensionAPI) {
       label: "Exitcode Seal",
       description:
         "Run the fixed evaluator gate (structure, discrimination, wiring, baseline) and seal the contract. " +
-        "Coding tools unlock only after sealing. At most two proposals per node.",
+        "Root sealing requires explicit user approval of the exact draft. Children need no user approval. Coding tools unlock only after sealing. At most two proposals per node.",
       promptSnippet: "exitcode_seal: validate the evaluator, seal the contract, record the baseline",
       parameters: Type.Object({
         node: Type.String({ description: "Draft node id (e.g. G1, G1.1)" }),
@@ -242,23 +268,7 @@ export default function (pi: ExtensionAPI) {
       execute: async (_id, params, _signal, _onUpdate, ctx) => {
         assertMode();
         rt.nudges = 0;
-        const io = core.makeIo(ctx.cwd);
-        const result = await core.sealNode(io, params.node);
-        if (!result.ok && !result.events) {
-          const lines = [`seal rejected:`, errLines(result)];
-          if (typeof result.sealAttemptsLeft === "number") lines.push(`seal proposals left: ${result.sealAttemptsLeft}`);
-          if (result.next) lines.push(`next: ${result.next}`);
-          return textResult(lines.join("\n"), result, true);
-        }
-        maybeAutoExit(result, ctx);
-        const lines = result.sealed
-          ? [`sealed ${result.sealed}. baseline: ${result.baseline}`]
-          : [...(result.events ?? [])];
-        if (result.alreadySatisfied) lines.push("baseline already satisfies every criterion: goal already met under this contract.");
-        lines.push(...cascadeLines(result.cascade));
-        if (result.next) lines.push(`next: ${result.next}`);
-        if (result.terminal) lines.push(`terminal: root ${result.terminal.root} ${result.terminal.status}`);
-        return textResult(withWarnings(lines, result.warnings).join("\n"), result);
+        return sealContract(params.node, ctx);
       },
     },
     {
@@ -297,7 +307,7 @@ export default function (pi: ExtensionAPI) {
       label: "Exitcode Child",
       description:
         "Propose one smaller child tied to exactly one failing parent criterion. The child follows the same protocol " +
-        "(draft, seal, evaluate) and cannot modify its parent. One active child at a time.",
+        "(draft, seal, evaluate) without user approval and cannot modify its parent. One active child at a time.",
       promptSnippet: "exitcode_child: propose one narrower child tied to a failing parent criterion",
       parameters: Type.Object({
         parent: Type.String({ description: "Parent node id (e.g. G1)" }),
@@ -440,6 +450,8 @@ export default function (pi: ExtensionAPI) {
       exitMode(`leaf ${leafStatus}`);
       return undefined;
     }
+    // The human checkpoint is a real pause, not a stalled autonomous loop.
+    if (snap.awaitingApproval) return undefined;
     if (snap.expired) {
       const result = await core.blockNode(io, leafId, { reason: "shared deadline exceeded", code: "BUDGET_EXHAUSTED" });
       maybeAutoExit(result, ctx);
@@ -470,8 +482,9 @@ export default function (pi: ExtensionAPI) {
     [
       "exitcode: contract-first recursive execution.",
       "/exitcode <goal>  enter exitcode mode rooted at your goal (root only; children come from exitcode_child)",
+      "/exitcode approve approve the exact root draft, run E0, and start autonomous work",
       "/exitcode status  show the active contract, vectors, and budgets",
-      "/exitcode resume  re-enter mode for the on-disk ACTIVE root",
+      "/exitcode resume  re-enter mode for the on-disk root, including pending review",
       "/exitcode exit    leave exitcode mode (work on disk is preserved)",
     ].join("\n");
 
@@ -490,6 +503,35 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify(rt.modeOn ? core.statusText(io) : `exitcode mode is off.\n${core.statusText(io)}`, "info");
         return;
       }
+      if (sub === "approve") {
+        if (text !== "approve") {
+          ctx.ui.notify("Usage: /exitcode approve", "warning");
+          return;
+        }
+        if (!rt.modeOn) {
+          ctx.ui.notify("Enter exitcode mode with /exitcode resume before approving an on-disk draft.", "warning");
+          return;
+        }
+        if (!ctx.isIdle()) {
+          ctx.ui.notify("Wait for the agent to finish presenting the root contract before approving.", "warning");
+          return;
+        }
+        const approval = core.approveRoot(io);
+        if (!approval.ok) {
+          ctx.ui.notify(`approval rejected:\n${errLines(approval)}`, "warning");
+          return;
+        }
+        rt.nudges = 0;
+        const sealed = await sealContract(approval.id, ctx);
+        const result = sealed.details as any;
+        pi.sendMessage({
+          customType: "exitcode-approval",
+          content: `User approved root ${approval.id} (digest ${approval.approval.digest}).\n${sealed.content[0].text}`,
+          display: true,
+          details: result,
+        }, { triggerTurn: rt.modeOn });
+        return;
+      }
       if (sub === "exit") {
         if (!rt.modeOn) {
           ctx.ui.notify("exitcode mode is already off.", "info");
@@ -506,12 +548,12 @@ export default function (pi: ExtensionAPI) {
         }
         const snap = core.statusSnapshot(io);
         if (!snap.active) {
-          ctx.ui.notify("Nothing to resume: no ACTIVE root on disk. Start one with /exitcode <goal>.", "warning");
+          ctx.ui.notify("Nothing to resume: no active or pending-review root on disk. Start one with /exitcode <goal>.", "warning");
           return;
         }
         enterMode();
         rt.rootId = snap.root;
-        ctx.ui.notify(`Re-entered exitcode mode for root ${snap.root}. ${snap.next}`, "info");
+        ctx.ui.notify(`Re-entered exitcode mode for root ${snap.root}. ${snap.next}${snap.review ? `\n\n${snap.review}` : ""}`, "info");
         return;
       }
       if (rt.modeOn) {
@@ -524,7 +566,7 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       enterMode(text);
-      ctx.ui.notify(`Entered exitcode mode. Drafting contract for: ${text}`, "info");
+      ctx.ui.notify(`Entered exitcode mode. Read-only discovery and contract review for: ${text}`, "info");
       if (ctx.isIdle()) {
         pi.sendUserMessage(text);
       } else {

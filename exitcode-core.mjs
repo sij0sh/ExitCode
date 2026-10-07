@@ -73,14 +73,18 @@ export const BLOCK_CODES = Object.freeze([
 /** Short protocol instructions supplied to Pi while exitcode mode is on. */
 export const PROTOCOL_PROMPT = [
   "EXITCODE MODE — contract-first execution.",
-  "Inspect the goal and project before proposing observable acceptance criteria.",
+  "Inspect the goal, architecture, tests, and likely regressions in a read-only discovery phase.",
+  "Resolve known product ambiguities with the user before finalizing observable acceptance criteria.",
   "Draft checks and controls.accept.setup/controls.reject[].setup commands that prepare valid/invalid candidate fixtures.",
   "The same check must PASS on the valid fixture and FAIL on each invalid fixture without changing the real candidate.",
-  "The supervisor must activate the contract before source writes become available.",
+  "For the root, present the entire acceptance specification, assumptions, exclusions, and verification approach, then STOP for user review.",
+  "Only the user's /exitcode approve command grants approval; conversational assent or tool calls cannot approve.",
+  "Users may request revisions naturally or cancel with /exitcode exit. Every root revision requires fresh approval.",
+  "After approval, the supervisor runs E0 and seals automatically before source writes become available.",
   "Implement toward the sealed criteria and use evaluator diagnostics for repair.",
   "After local attempts stall, or when a concrete prerequisite needs a smaller unit,",
   "propose one narrower child tied to a failing parent criterion.",
-  "Every child follows this same protocol. Preserve all ancestor contracts.",
+  "Children use the same evaluation protocol without user approval; they may only advance approved parent criteria. Preserve all ancestor contracts.",
   "Report a specific missing requirement when blocked.",
   "Completion belongs to the supervisor's fresh evaluation of the current candidate:",
   "never declare success yourself; only exitcode_evaluate reporting ALL PASS closes a goal.",
@@ -271,6 +275,15 @@ export function validateStructure(draft, opts = {}) {
   if (!nonEmptyString(draft.goal)) errors.push("goal must be a nonempty string");
   if (!nonEmptyString(draft.originalRequest)) {
     errors.push("originalRequest must retain the user's request (traceability)");
+  }
+
+  for (const key of ["assumptions", "exclusions"]) {
+    if (draft[key] !== undefined && (!Array.isArray(draft[key]) || !draft[key].every(nonEmptyString))) {
+      errors.push(`${key} must be an array of nonempty strings`);
+    }
+  }
+  if (draft.verification !== undefined && !nonEmptyString(draft.verification)) {
+    errors.push("verification must be a nonempty description of the verification approach");
   }
 
   const isChild = draft.parent !== null && draft.parent !== undefined;
@@ -815,7 +828,7 @@ export function guardToolCall({ modeOn, leafStatus, cwd, toolName, input }) {
       if (isPathUnder(target, path.join(storeRoot, "drafts"))) return null;
       return {
         block: true,
-        reason: `exitcode: source writes are blocked until the contract is sealed and ACTIVE (state ${leafStatus ?? "NO_CONTRACT"}). Draft criteria with exitcode_draft, then exitcode_seal.`,
+        reason: `exitcode: source writes are blocked until the contract is sealed and ACTIVE (state ${leafStatus ?? "NO_CONTRACT"}). Draft criteria with exitcode_draft and wait for root user approval before sealing.`,
       };
     }
     if (toolName === "bash" || toolName === "powershell") {
@@ -1124,6 +1137,9 @@ export function draftNode(io, args) {
     originalRequest: nonEmptyString(originalRequest) ? originalRequest.trim() : goal.trim(),
     parent: null,
     criteria: withIds,
+    ...(args.assumptions !== undefined ? { assumptions: args.assumptions } : {}),
+    ...(args.exclusions !== undefined ? { exclusions: args.exclusions } : {}),
+    ...(args.verification !== undefined ? { verification: args.verification } : {}),
   };
   const validation = validateStructure(draft, { policy: merged.policy });
   if (!validation.ok) return { ok: false, errors: validation.errors };
@@ -1140,6 +1156,7 @@ export function draftNode(io, args) {
     createdAt,
     deadlineAt: deadlineAtMs(createdAt, merged.policy),
     consumedAttempts: 0,
+    reviewDigest: sha256Hex(stableStringify(draft)),
     stack: [id],
     status: NodeState.ACTIVE,
   };
@@ -1160,7 +1177,7 @@ export function draftNode(io, args) {
     checkpoints: [],
     children: [],
   });
-  return { ok: true, id, rootId: id, draft, warnings: [], next: `seal ${id} with exitcode_seal` };
+  return { ok: true, id, rootId: id, draft, warnings: [], next: `present the root contract and wait for user /exitcode approve (or revisions / /exitcode exit)` };
 }
 
 /** Overwrite an existing DRAFT (revision does not consume a seal proposal). */
@@ -1213,11 +1230,20 @@ function reviseDraft(io, index, args) {
       parent: null,
       criteria: withIds,
     };
+    for (const key of ["assumptions", "exclusions", "verification"]) {
+      const value = args[key] !== undefined ? args[key] : previous?.[key];
+      if (value !== undefined) draft[key] = value;
+    }
     validation = validateStructure(draft, { policy: root.policy });
   }
   if (!validation.ok) return { ok: false, errors: validation.errors };
   writeJsonAtomic(draftFile(io.cwd, node.id), { draft });
-  return { ok: true, id: node.id, rootId: root.id, revised: true, draft, warnings, next: `seal ${node.id} with exitcode_seal` };
+  if (!node.parentId) {
+    delete root.approval;
+    root.reviewDigest = sha256Hex(stableStringify(draft));
+    saveRoot(io, root);
+  }
+  return { ok: true, id: node.id, rootId: root.id, revised: true, draft, warnings, next: nextAction(root, node, draft) };
 }
 
 function resultFromBaseline(bundle) {
@@ -1231,6 +1257,50 @@ function resultFromBaseline(bundle) {
   };
 }
 
+// --- root user approval --------------------------------------------------
+
+function approvalMatches(root, draft) {
+  return Boolean(draft && root.approval?.approvedBy === "user" &&
+    root.approval.digest === sha256Hex(stableStringify(draft)));
+}
+
+/** Called only by the user command, never exposed as an agent tool. */
+export function approveRoot(io) {
+  const index = loadIndex(io.cwd);
+  const root = index.activeRootId ? loadRoot(io, index.activeRootId) : null;
+  const node = root ? loadNodeState(io, root.id) : null;
+  if (!root || root.status !== NodeState.ACTIVE || node?.status !== NodeState.DRAFT) {
+    return { ok: false, errors: ["no DRAFT root to approve"] };
+  }
+  const draft = readJson(draftFile(io.cwd, root.id))?.draft;
+  if (!draft) return { ok: false, errors: [`draft for ${root.id} is missing`] };
+  if (root.reviewDigest !== sha256Hex(stableStringify(draft))) {
+    return { ok: false, errors: ["root draft changed since review; revise with exitcode_draft and present the entire contract again"] };
+  }
+  const validation = validateStructure(draft, { policy: root.policy });
+  if (!validation.ok) return validation;
+  root.approval = { digest: root.reviewDigest, at: new Date(io.nowMs()).toISOString(), approvedBy: "user" };
+  saveRoot(io, root);
+  return { ok: true, id: root.id, approval: root.approval };
+}
+
+/** Human acceptance layer; executable checks stay in the same draft. */
+export function rootReviewText(draft) {
+  const lines = ["Root verification contract ready.", "", "Goal", draft.goal, "", "I will consider this complete when:"];
+  for (const criterion of draft.criteria) lines.push(`${criterion.id}: ${criterion.requirement}`);
+  for (const key of ["assumptions", "exclusions"]) {
+    lines.push("", key === "assumptions" ? "Assumptions" : "Exclusions");
+    lines.push(...(draft[key]?.length ? draft[key].map((entry) => `- ${entry}`) : ["- None stated."]));
+  }
+  lines.push("", "Verification", draft.verification ??
+    "Each criterion has an executable check. Behavioral checks must pass valid fixtures, reject invalid fixtures, and reject an empty target. Regression checks must continue to pass.",
+    "", "Approve with /exitcode approve, request changes in a normal message, or cancel with /exitcode exit.",
+    "Approval freezes this exact root draft, including its verification checks. Any revision requires fresh approval.",
+    "After approval, ExitCode runs E0 and works autonomously until the root passes or reaches a blocker.",
+    "Children need no separate approval and cannot weaken the approved root criteria.");
+  return lines.join("\n");
+}
+
 // --- seal ----------------------------------------------------------------
 
 export async function sealNode(io, nodeId) {
@@ -1242,6 +1312,17 @@ export async function sealNode(io, nodeId) {
   if (node.status !== NodeState.DRAFT) return { ok: false, errors: [`${nodeId} is ${node.status}; only DRAFT nodes can be sealed`] };
   if (root.status !== NodeState.ACTIVE) return { ok: false, errors: [`root ${root.id} is ${root.status}`] };
 
+  const stored = readJson(draftFile(io.cwd, nodeId));
+  if (!stored?.draft) return { ok: false, errors: [`draft for ${nodeId} is missing`] };
+  const draft = JSON.parse(stableStringify(stored.draft)); // immutable gate copy
+  if (!node.parentId && !approvalMatches(root, draft)) {
+    return {
+      ok: false,
+      errors: [root.approval ? "root contract changed since user approval" : "root contract requires explicit user approval"],
+      next: "present the root contract and wait for user /exitcode approve",
+    };
+  }
+
   const nowMs = io.nowMs();
   if (isExpired(root, nowMs)) {
     return blockNode(io, nodeId, { reason: "shared deadline exceeded during drafting", code: "BUDGET_EXHAUSTED" });
@@ -1252,9 +1333,8 @@ export async function sealNode(io, nodeId) {
     return blockNode(io, nodeId, { reason: `evaluator draft budget exhausted (${MAX_DRAFT_PROPOSALS} proposals)`, code: "EVALUATOR_UNBUILDABLE" });
   }
 
-  const stored = readJson(draftFile(io.cwd, nodeId));
-  if (!stored?.draft) return { ok: false, errors: [`draft for ${nodeId} is missing`] };
-  const draft = JSON.parse(stableStringify(stored.draft)); // immutable gate copy
+  // Persist the E0 proposal before asynchronous probes can overlap a revision.
+  saveNodeState(io, node);
   let parentBundle = null;
   let parentResult = null;
   if (node.parentId) {
@@ -1285,6 +1365,16 @@ export async function sealNode(io, nodeId) {
     fs.rmSync(wiringDir, { recursive: true, force: true });
   }
 
+  if (!node.parentId) {
+    const currentRoot = loadRoot(io, root.id);
+    const currentDraft = readJson(draftFile(io.cwd, nodeId))?.draft;
+    if (currentRoot?.status !== NodeState.ACTIVE || loadNodeState(io, nodeId)?.status !== NodeState.DRAFT ||
+        !approvalMatches(currentRoot, draft) || !approvalMatches(currentRoot, currentDraft)) {
+      return { ok: false, errors: ["root contract or approval changed during E0; review and approve again"],
+        next: "revise with exitcode_draft and wait for user /exitcode approve" };
+    }
+  }
+
   if (!gate.ok) {
     saveNodeState(io, node);
     const left = MAX_DRAFT_PROPOSALS - node.sealAttempts;
@@ -1292,7 +1382,7 @@ export async function sealNode(io, nodeId) {
       return blockNode(io, nodeId, { reason: `no valid evaluator after ${MAX_DRAFT_PROPOSALS} proposals: ${gate.errors.join("; ")}`, code: "EVALUATOR_UNBUILDABLE" });
     }
     const tool = node.parentId ? "exitcode_child" : "exitcode_draft";
-    return { ok: false, errors: gate.errors, sealAttemptsLeft: left, next: `revise with ${tool} (revise:"${nodeId}") then exitcode_seal` };
+    return { ok: false, errors: gate.errors, sealAttemptsLeft: left, next: `revise with ${tool} (revise:"${nodeId}") then ${node.parentId ? "exitcode_seal" : "present the entire contract and wait for user /exitcode approve"}` };
   }
 
   writeJsonAtomic(sealedFile(io.cwd, nodeId), gate.bundle);
@@ -1602,9 +1692,12 @@ export async function blockNode(io, nodeId, { reason, code = "NO_PATH" }) {
 
 // --- status ----------------------------------------------------------------
 
-export function nextAction(root, node) {
+export function nextAction(root, node, draft = null) {
   if (!node) return "no active node";
-  if (node.status === NodeState.DRAFT) return `seal ${node.id} with exitcode_seal`;
+  if (node.status === NodeState.DRAFT) {
+    if (!node.parentId && !approvalMatches(root, draft)) return "present the root contract and wait for user /exitcode approve (or revisions / /exitcode exit)";
+    return `seal ${node.id} with exitcode_seal`;
+  }
   if (node.status !== NodeState.ACTIVE) return `${node.id} is ${node.status}`;
   const failing = (node.lastResult?.outcomes ?? []).filter((o) => o.status !== "PASS").map((o) => o.criterionId);
   const repairs = root.policy.localRepairs ?? DEFAULT_POLICY.localRepairs;
@@ -1634,6 +1727,9 @@ export function statusSnapshot(io) {
   }
   const leafId = leafOf(root);
   const leaf = leafId ? loadNodeState(io, leafId) : null;
+  const rootNode = loadNodeState(io, root.id);
+  const rootDraft = rootNode?.status === NodeState.DRAFT ? readJson(draftFile(io.cwd, root.id))?.draft : null;
+  const awaitingApproval = rootNode?.status === NodeState.DRAFT && !approvalMatches(root, rootDraft);
   return {
     active: true,
     root: root.id,
@@ -1644,7 +1740,10 @@ export function statusSnapshot(io) {
     maxTotalAttempts: root.policy.maxTotalAttempts,
     deadlineAt: new Date(root.deadlineAt).toISOString(),
     expired: isExpired(root, io.nowMs()),
-    next: leaf ? nextAction(root, leaf) : "none",
+    approval: root.approval ?? null,
+    awaitingApproval,
+    review: rootDraft ? rootReviewText(rootDraft) : null,
+    next: leaf ? nextAction(root, leaf, leaf.id === root.id ? rootDraft : null) : "none",
   };
 }
 
@@ -1658,6 +1757,7 @@ export function statusText(io) {
   }
   lines.push(`  budget: ${snap.consumedAttempts}/${snap.maxTotalAttempts} attempts, deadline ${snap.deadlineAt}${snap.expired ? " (EXPIRED)" : ""}`);
   lines.push(`  next: ${snap.next}`);
+  if (snap.review) lines.push("", snap.review);
   return lines.join("\n");
 }
 

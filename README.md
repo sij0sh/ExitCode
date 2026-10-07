@@ -12,8 +12,8 @@ This implements the blueprint in `.agents/artifacts/specs.md`, distilled from
 
 ## Use
 
-The root goal is user-invoked. Children are proposed by the agent and follow
-the same protocol.
+The root goal is user-invoked and requires explicit user approval.
+Children use the same evaluation protocol without separate user approval.
 
 ```
 /exitcode Add password reset via emailed tokens
@@ -26,7 +26,9 @@ prompt, and it blocks no tool calls.
 
 | Step | Who | What |
 | --- | --- | --- |
+| Discover | agent + user | inspect the project without implementation and resolve known product ambiguities |
 | Draft | agent | `exitcode_draft` proposes goal + observable criteria with executable checks and valid/invalid fixture setups |
+| Review | user | approve the root contract with `/exitcode approve`, request revisions naturally, or cancel with `/exitcode exit` |
 | Seal | supervisor | `exitcode_seal` runs the fixed gate (structure, discrimination, wiring, baseline) and freezes the bundle |
 | Implement | agent | source writes unlock; repair toward the sealed criteria |
 | Evaluate | supervisor | `exitcode_evaluate` runs every check fresh; ALL PASS closes the goal |
@@ -36,8 +38,9 @@ prompt, and it blocks no tool calls.
 Supporting commands:
 
 ```
+/exitcode approve  approve the exact root draft, run E0, and start autonomous work
 /exitcode status   show the active contract, result vectors, budgets, next step
-/exitcode resume   re-enter mode for the on-disk ACTIVE root
+/exitcode resume   re-enter mode for the on-disk root, including pending review
 /exitcode exit     leave mode (contracts on disk are preserved)
 ```
 
@@ -45,6 +48,33 @@ Starting policy per root (overridable once at draft): 2 local repairs before
 a child is expected, depth 3 below the root, 12 total attempts, 60-minute
 shared deadline, 120s default per-check timeout. Two evaluator proposals per
 node; then BLOCKED.
+
+## Root approval
+
+The agent first inspects the project without implementing changes.
+It then presents the full acceptance specification in plain language.
+The review includes the goal, every requirement, assumptions, exclusions, and verification approach.
+Executable checks and fixture setups remain part of the same draft, but are not dumped into the review.
+Use `/exitcode status` to see the review again.
+
+Use `/exitcode approve` after reviewing the criteria.
+Approval records the SHA-256 digest, timestamp, and user attribution on the root record.
+The digest covers the exact draft, including verification commands and expectations.
+Only the user command grants approval; there is no agent approval tool.
+Root sealing rejects missing or mismatched approval before running E0 or consuming a seal proposal.
+Any accepted root revision clears approval and presents the entire contract again.
+Direct draft edits require a new `exitcode_draft` revision before approval.
+
+Approval automatically runs E0, seals the contract, and continues autonomous work.
+If E0 needs a revised root evaluator, the revised draft needs fresh approval.
+Children require no approval and may only advance a failing approved parent criterion.
+Children cannot weaken an ancestor contract.
+The agent pauses without settle nudges while root approval is pending.
+The existing shared deadline still starts at root draft creation.
+An expired run remains paused for review, but approval then reports budget exhaustion.
+`/exitcode exit` leaves mode without executing checks or deleting the draft.
+`/exitcode resume` restores the pending review.
+Existing sealed roots remain usable; legacy unsealed drafts must be revised and approved.
 
 ## Install
 
@@ -71,7 +101,9 @@ Or symlink/copy the directory into your Pi extensions path. `typebox` and
 - `exitcode.test.mjs` — tests over the core: gate discrimination/wiring,
   attempt accounting, child boundaries (a passing child reruns but never
   closes its parent), regression restore, stale-PASS detection, seal tamper
-  detection, budget/deadline enforcement, and guard invisibility.
+  detection, budget/deadline enforcement, approval hashing, and guard invisibility.
+- `exitcode-adapter.test.mjs` - adapter tests for review pauses, approval commands,
+  automatic E0 and continuation, cancellation, and resume.
 
 ```bash
 ./scripts/verify   # syntax checks and the complete test suite
