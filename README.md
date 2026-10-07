@@ -102,16 +102,18 @@ Unclear replies require clarification, not inferred approval.
 Acceptance starts evaluator validation and autonomous work.
 If validation requires a revised root contract, you review it again.
 The loop pauses while root review is pending.
+Clarification pauses and reloads preserve discovery mode and the original goal.
 
 | Command | Purpose |
 | --- | --- |
 | `/exitcode approve` | Optional shortcut to approve the exact root draft and start work. |
 | `/exitcode status` | Show the contract, review, results, budgets, and next action. |
-| `/exitcode exit` | Leave mode without running checks or deleting contracts. |
+| `/exitcode exit` | User cancellation without completing the goal or deleting contracts. |
 | `/exitcode resume` | Re-enter the on-disk run, including pending review. |
 
 While active, ExitCode adds six `exitcode_*` tools and a protocol prompt section to Pi.
-Root PASS or BLOCKED exits mode automatically.
+Only a fresh root PASS exits mode automatically.
+BLOCKED stops autonomous work but keeps enforcement on until you cancel.
 Outside mode, its tools are hidden and unreachable, it adds no protocol, and it blocks no calls.
 Contracts and state live under `<project>/.exitcode/`.
 Leaving or resuming mode does not reset the budget.
@@ -138,9 +140,12 @@ These are different responsibilities, not an endless recursion of evaluators.
   E0 records the current candidate's results and rejects detected candidate mutation before
   sealing.
   Mutation rejection does not automatically restore the candidate.
-- **Protect the sealed goal.** Before sealing, agent writes are limited to `.exitcode/drafts/`
-  and agent shell calls are blocked.
-  After sealing, source writes unlock, but guards still protect `.exitcode/` artifacts.
+- **Protect the sealed goal.** Before sealing, only `read`, `grep`, `ls`, and the six ExitCode
+  tools are allowed.
+  Other tools are suspended and denied, including shell, `find`, `context`, `codemode`, custom
+  tools, and direct draft-file writes.
+  Submit contracts through `exitcode_draft` or `exitcode_child`.
+  Sealing restores the execution loadout, but guards still protect `.exitcode/` artifacts.
   A changed sealed bundle blocks the node instead of redefining success.
 - **Verify progress and completion.** Evaluations run all criteria fresh.
   Candidate changes make a recorded PASS stale.
@@ -177,8 +182,10 @@ This is a lean v1 workflow supervisor, not a sandbox or a guarantee of autonomou
 - **Long-running still depends on a live Pi session.** The adapter supplies at most three
   continuation nudges per idle stretch, not an external scheduler.
   Per-check timeouts are not hard deadlines for every activity or descendant process.
-- **Configuration flexibility is not universal enforcement.** Recognized tool guards and
-  best-effort shell checks do not cover every custom tool or possible bypass.
+- **Tool guards are not operating-system isolation.** The pre-seal allowlist denies unknown
+  agent tools, including nested calls.
+  Post-seal shell checks remain best-effort.
+  Guards do not constrain extension-internal execution or supervisor-run check commands.
   The extension and its commands run with your operating-system permissions.
 - **Immutable contracts are not complete evaluator isolation.** Digest checks protect contract
   data, not every script or dependency the checks invoke.

@@ -80,6 +80,7 @@ type Runtime = {
   pendingGoal: string | undefined;
   nudges: number;
   discoveryToolsAdded: string[];
+  toolsSuspended: string[];
 };
 
 type ToolDef = {
@@ -121,16 +122,9 @@ function cascadeLines(cascade: { events?: string[]; terminal?: { root: string; s
 }
 
 export default function (pi: ExtensionAPI) {
-  const rt: Runtime = { pi, modeOn: false, rootId: undefined, pendingGoal: undefined, nudges: 0, discoveryToolsAdded: [] };
-  const DISCOVERY_TOOL_NAMES = ["grep", "find", "ls"];
-  const TOOL_NAMES = [
-    "exitcode_status",
-    "exitcode_draft",
-    "exitcode_seal",
-    "exitcode_evaluate",
-    "exitcode_child",
-    "exitcode_block",
-  ];
+  const rt: Runtime = { pi, modeOn: false, rootId: undefined, pendingGoal: undefined, nudges: 0, discoveryToolsAdded: [], toolsSuspended: [] };
+  const DISCOVERY_TOOL_NAMES = core.DISCOVERY_TOOL_NAMES;
+  const TOOL_NAMES = core.EXITCODE_TOOL_NAMES;
 
   const assertMode = () => {
     if (!rt.modeOn) throw new Error("exitcode mode is not active. The user enters it with /exitcode <goal>.");
@@ -150,7 +144,8 @@ export default function (pi: ExtensionAPI) {
 
   const persistMode = () => {
     pi.appendEntry(core.MODE_ENTRY_TYPE, {
-      on: rt.modeOn, rootId: rt.rootId, discoveryToolsAdded: rt.discoveryToolsAdded,
+      on: rt.modeOn, rootId: rt.rootId, pendingGoal: rt.pendingGoal,
+      discoveryToolsAdded: rt.discoveryToolsAdded, toolsSuspended: rt.toolsSuspended,
     });
   };
 
@@ -160,29 +155,56 @@ export default function (pi: ExtensionAPI) {
     rt.discoveryToolsAdded = [];
   };
 
+  const restoreExecutionTools = () => {
+    if (rt.toolsSuspended.length === 0) return;
+    pi.setActiveTools([...new Set([...pi.getActiveTools(), ...rt.toolsSuspended])]);
+    rt.toolsSuspended = [];
+  };
+
   const syncDiscoveryTools = (ctx: ExtensionContext) => {
     if (!rt.modeOn) return;
     const snap = core.statusSnapshot(core.makeIo(ctx.cwd));
     const leafId = snap.stack?.at(-1);
     const leafStatus = leafId ? (snap.nodes as any)?.[leafId]?.status : undefined;
-    // Use the current leaf, not the root: child drafts also need discovery.
-    const discovering = !snap.active || leafStatus === "DRAFT";
-    if (!discovering) {
-      if (rt.discoveryToolsAdded.length === 0) return;
+    // Only a sealed ACTIVE leaf unlocks execution, including after child drafts.
+    if (snap.status === "ACTIVE" && leafStatus === "ACTIVE") {
+      if (rt.discoveryToolsAdded.length === 0 && rt.toolsSuspended.length === 0) return;
       restoreDiscoveryTools();
+      restoreExecutionTools();
       persistMode();
       return;
     }
     const active = pi.getActiveTools();
+    const allowed = [...DISCOVERY_TOOL_NAMES, ...TOOL_NAMES];
+    const suspended = active.filter((name) => !allowed.includes(name));
     const missing = DISCOVERY_TOOL_NAMES.filter((name) => !active.includes(name));
-    if (missing.length === 0) return;
-    pi.setActiveTools([...active, ...missing]);
+    if (missing.length === 0 && suspended.length === 0) return;
+    pi.setActiveTools([...active.filter((name) => allowed.includes(name)), ...missing]);
     // Pi ignores unavailable/excluded tools. Own only names actually enabled.
     const enabled = pi.getActiveTools();
     const added = missing.filter((name) => enabled.includes(name) && !rt.discoveryToolsAdded.includes(name));
-    if (added.length === 0) return;
     rt.discoveryToolsAdded = [...rt.discoveryToolsAdded, ...added];
-    persistMode();
+    rt.toolsSuspended = [...new Set([...rt.toolsSuspended, ...suspended])];
+    if (added.length > 0 || suspended.length > 0) persistMode();
+  };
+
+  const modeStatusText = (io: ReturnType<typeof core.makeIo>) => {
+    const snap = core.statusSnapshot(io);
+    if (snap.active) return core.statusText(io);
+    if (rt.rootId) {
+      const root = core.loadRoot(io, rt.rootId);
+      return [
+        `exitcode root ${rt.rootId} [${root?.status ?? "MISSING"}]`,
+        ...(root?.outcome?.reason ? [`${root.outcome.code}: ${root.outcome.reason}`] : []),
+        "Enforcement remains on. Only a fresh root PASS exits automatically.",
+        "Use /exitcode exit to cancel without completing the goal.",
+      ].join("\n");
+    }
+    return [
+      "exitcode: DISCOVERY (enforcement on)",
+      ...(rt.pendingGoal ? [`Root goal: ${rt.pendingGoal}`] : []),
+      `Inspect with ${DISCOVERY_TOOL_NAMES.join(", ")}. Clarify the goal, then propose its acceptance contract with exitcode_draft.`,
+    ].join("\n");
   };
 
   const enterMode = (ctx: ExtensionContext, pendingGoal?: string) => {
@@ -194,26 +216,31 @@ export default function (pi: ExtensionAPI) {
     syncDiscoveryTools(ctx);
   };
 
-  const exitMode = (reason: string) => {
+  const exitMode = () => {
     rt.modeOn = false;
     rt.rootId = undefined;
     rt.pendingGoal = undefined;
     rt.nudges = 0;
     restoreDiscoveryTools();
+    restoreExecutionTools();
     persistMode();
     applyExposure();
-    return reason;
   };
 
-  const maybeAutoExit = (result: any, ctx: { hasUI: boolean; ui: ExtensionContext["ui"] }) => {
+  const maybeAutoExit = (result: any, ctx: ExtensionContext) => {
     const terminal = result?.terminal;
     if (!terminal || (terminal.status !== "PASS" && terminal.status !== "BLOCKED")) return;
-    exitMode(`root ${terminal.status}`);
+    const io = core.makeIo(ctx.cwd);
+    if (terminal.status === "PASS") {
+      const root = core.loadRoot(io, terminal.root);
+      if (root?.status !== "PASS" || core.terminalStale(io, terminal.root).stale) return;
+      exitMode();
+    }
     if (ctx.hasUI) {
       const summary =
         terminal.status === "PASS"
           ? `exitcode: root ${terminal.root} PASS (candidate ${String(terminal.outcome?.candidateDigest ?? "?").slice(0, 12)}). Mode off.`
-          : `exitcode: root ${terminal.root} BLOCKED (${terminal.outcome?.code ?? "?"}): ${terminal.outcome?.reason ?? "no reason"}. Mode off.`;
+          : `exitcode: root ${terminal.root} BLOCKED (${terminal.outcome?.code ?? "?"}): ${terminal.outcome?.reason ?? "no reason"}. Enforcement remains on; /exitcode exit cancels.`;
       ctx.ui.notify(summary, terminal.status === "PASS" ? "success" : "warning");
     }
   };
@@ -252,7 +279,7 @@ export default function (pi: ExtensionAPI) {
         assertMode();
         rt.nudges = 0;
         const io = core.makeIo(ctx.cwd);
-        return textResult(core.statusText(io), core.statusSnapshot(io));
+        return textResult(modeStatusText(io), { ...core.statusSnapshot(io), modeOn: rt.modeOn, rootId: rt.rootId, pendingGoal: rt.pendingGoal });
       },
     },
     {
@@ -278,6 +305,9 @@ export default function (pi: ExtensionAPI) {
         assertMode();
         rt.nudges = 0;
         const io = core.makeIo(ctx.cwd);
+        if (rt.rootId && !core.statusSnapshot(io).active) {
+          return textResult("draft rejected:\n- the previous root is terminal or missing; the user must cancel with /exitcode exit before starting a new goal", { ok: false }, true);
+        }
         const result = core.draftNode(io, {
           goal: params.goal,
           originalRequest: params.originalRequest ?? rt.pendingGoal,
@@ -399,7 +429,7 @@ export default function (pi: ExtensionAPI) {
       label: "Exitcode Block",
       description:
         "Report a node as BLOCKED with the specific missing requirement or cause. Restores the parent candidate, " +
-        "retains diagnostics, and reruns the parent. Terminal for roots.",
+        "retains diagnostics, and reruns the parent. Terminal for roots, but enforcement stays on until the user cancels. BLOCKED is not success.",
       promptSnippet: "exitcode_block: report BLOCKED with the exact missing requirement",
       parameters: Type.Object({
         node: Type.Optional(Type.String({ description: "Node id (defaults to the active leaf)" })),
@@ -422,7 +452,7 @@ export default function (pi: ExtensionAPI) {
         maybeAutoExit(result, ctx);
         syncDiscoveryTools(ctx);
         const lines = [...(result.events ?? [])];
-        if (result.terminal) lines.push(`terminal: root ${result.terminal.root} ${result.terminal.status}`);
+        if (result.terminal) lines.push(`terminal: root ${result.terminal.root} ${result.terminal.status}`, "Enforcement remains on. Only the user can cancel with /exitcode exit.");
         return textResult(lines.join("\n"), result);
       },
     },
@@ -442,19 +472,33 @@ export default function (pi: ExtensionAPI) {
     rt.modeOn = mode.on;
     rt.rootId = mode.rootId;
     rt.nudges = 0;
-    rt.pendingGoal = undefined;
+    rt.pendingGoal = mode.pendingGoal;
     const entry = branch.findLast((entry) => entry.type === "custom" && entry.customType === core.MODE_ENTRY_TYPE);
-    const added = (entry as { data?: { discoveryToolsAdded?: unknown } } | undefined)?.data?.discoveryToolsAdded;
-    rt.discoveryToolsAdded = Array.isArray(added) ? added.filter((name) => DISCOVERY_TOOL_NAMES.includes(name)) : [];
-    if (!rt.modeOn) restoreDiscoveryTools();
+    const data = (entry as { data?: { discoveryToolsAdded?: unknown; toolsSuspended?: unknown } } | undefined)?.data;
+    const added = data?.discoveryToolsAdded;
+    // Clean up borrowed find from older transcripts without claiming user tools.
+    rt.discoveryToolsAdded = Array.isArray(added) ? added.filter((name) => DISCOVERY_TOOL_NAMES.includes(name) || name === "find") : [];
+    const suspended = data?.toolsSuspended;
+    rt.toolsSuspended = Array.isArray(suspended) ? suspended.filter((name) => typeof name === "string" && ![...DISCOVERY_TOOL_NAMES, ...TOOL_NAMES].includes(name)) : [];
+    const obsolete = rt.discoveryToolsAdded.filter((name) => !DISCOVERY_TOOL_NAMES.includes(name));
+    if (obsolete.length > 0) {
+      pi.setActiveTools(pi.getActiveTools().filter((name) => !obsolete.includes(name)));
+      rt.discoveryToolsAdded = rt.discoveryToolsAdded.filter((name) => !obsolete.includes(name));
+      persistMode();
+    }
+    if (!rt.modeOn) {
+      restoreDiscoveryTools();
+      restoreExecutionTools();
+    }
     applyExposure();
     syncDiscoveryTools(ctx);
   });
 
-  // Keep ownership in the branch entry, but remove temporary tools from the
-  // retiring runtime so reload does not mistake them for user-selected tools.
+  // Keep ownership in the branch entry, but restore the retiring loadout so
+  // reload does not mistake borrowed tools for user-selected tools.
   pi.on("session_shutdown", () => {
     restoreDiscoveryTools();
+    restoreExecutionTools();
   });
 
   pi.on("input", () => {
@@ -468,19 +512,13 @@ export default function (pi: ExtensionAPI) {
     }
     syncDiscoveryTools(ctx);
     const io = core.makeIo(ctx.cwd);
-    const lines = [core.PROTOCOL_PROMPT, ""];
-    if (rt.pendingGoal) {
-      const snap = core.statusSnapshot(io);
-      if (!snap.active) lines.push(`Root goal: ${rt.pendingGoal}`, "Propose its acceptance contract with exitcode_draft.", "");
-      else rt.pendingGoal = undefined;
-    }
-    lines.push(core.statusText(io));
+    const lines = [core.PROTOCOL_PROMPT, "", modeStatusText(io)];
     event.systemPromptOptions.sections["exitcode"] = lines.join("\n");
   });
 
   pi.on("tool_call", (event, ctx) => {
     if (!rt.modeOn) return undefined;
-    if (event.toolName.startsWith("exitcode_")) {
+    if (TOOL_NAMES.includes(event.toolName)) {
       rt.nudges = 0;
       return undefined;
     }
@@ -488,7 +526,7 @@ export default function (pi: ExtensionAPI) {
     const snap = core.statusSnapshot(io);
     const stack = snap.stack ?? [];
     const leafId = stack.length > 0 ? stack[stack.length - 1] : undefined;
-    const leafStatus = (leafId && (snap.nodes as any)?.[leafId]?.status) || "NO_CONTRACT";
+    const leafStatus = snap.status === "ACTIVE" ? (leafId && (snap.nodes as any)?.[leafId]?.status) || "NO_CONTRACT" : "NO_CONTRACT";
     const verdict = core.guardToolCall({
       modeOn: true,
       leafStatus,
@@ -505,16 +543,15 @@ export default function (pi: ExtensionAPI) {
     const io = core.makeIo(ctx.cwd);
     const snap = core.statusSnapshot(io);
     if (!snap.active) {
-      exitMode("no active root");
+      // Discovery, blockers, and missing state are pauses, not permission to code.
+      const root = rt.rootId ? core.loadRoot(io, rt.rootId) : null;
+      if (root?.status === "PASS") maybeAutoExit({ terminal: { root: root.id, status: root.status, outcome: root.outcome } }, ctx);
       return undefined;
     }
     const stack = snap.stack ?? [];
     const leafId = stack[stack.length - 1];
     const leafStatus = (snap.nodes as any)?.[leafId]?.status;
-    if (leafStatus !== "ACTIVE" && leafStatus !== "DRAFT") {
-      exitMode(`leaf ${leafStatus}`);
-      return undefined;
-    }
+    if (leafStatus !== "ACTIVE" && leafStatus !== "DRAFT") return undefined;
     // The human checkpoint is a review pause, not autonomous work.
     if (snap.awaitingApproval) return undefined;
     if (snap.expired) {
@@ -551,7 +588,7 @@ export default function (pi: ExtensionAPI) {
       "/exitcode approve optional shortcut to approve the root draft and start autonomous work",
       "/exitcode status  show the active contract, vectors, and budgets",
       "/exitcode resume  re-enter mode for the on-disk root, including pending review",
-      "/exitcode exit    leave exitcode mode (work on disk is preserved)",
+      "/exitcode exit    user cancellation only; not successful completion (work on disk is preserved)",
     ].join("\n");
 
   pi.registerCommand("exitcode", {
@@ -562,11 +599,11 @@ export default function (pi: ExtensionAPI) {
       const io = core.makeIo(ctx.cwd);
 
       if (!text || sub === "help") {
-        ctx.ui.notify(rt.modeOn ? `${core.statusText(io)}\n\n${usage()}` : usage(), "info");
+        ctx.ui.notify(rt.modeOn ? `${modeStatusText(io)}\n\n${usage()}` : usage(), "info");
         return;
       }
       if (sub === "status") {
-        ctx.ui.notify(rt.modeOn ? core.statusText(io) : `exitcode mode is off.\n${core.statusText(io)}`, "info");
+        ctx.ui.notify(rt.modeOn ? modeStatusText(io) : `exitcode mode is off.\n${core.statusText(io)}`, "info");
         return;
       }
       if (sub === "approve") {
@@ -595,16 +632,20 @@ export default function (pi: ExtensionAPI) {
           content: `User approved root ${approval.id} (digest ${approval.approval.digest}).\n${sealed.content[0].text}`,
           display: true,
           details: result,
-        }, { triggerTurn: rt.modeOn });
+        }, { triggerTurn: rt.modeOn && core.statusSnapshot(io).active });
         return;
       }
       if (sub === "exit") {
+        if (text !== "exit") {
+          ctx.ui.notify("Usage: /exitcode exit", "warning");
+          return;
+        }
         if (!rt.modeOn) {
           ctx.ui.notify("exitcode mode is already off.", "info");
           return;
         }
-        exitMode("user exit");
-        ctx.ui.notify("Left exitcode mode. Contracts on disk are preserved; /exitcode resume re-enters.", "info");
+        exitMode();
+        ctx.ui.notify("Cancelled exitcode mode without completing the goal. Contracts on disk are preserved; /exitcode resume re-enters an active root.", "info");
         return;
       }
       if (sub === "resume") {

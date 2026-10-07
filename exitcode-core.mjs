@@ -70,6 +70,13 @@ export const BLOCK_CODES = Object.freeze([
   "NO_PATH",
 ]);
 
+/** Exact agent tool allowlists. Unknown names never inherit supervisor access. */
+export const DISCOVERY_TOOL_NAMES = Object.freeze(["read", "grep", "ls"]);
+export const EXITCODE_TOOL_NAMES = Object.freeze([
+  "exitcode_status", "exitcode_draft", "exitcode_seal",
+  "exitcode_evaluate", "exitcode_child", "exitcode_block",
+]);
+
 /** Short protocol instructions supplied to Pi while exitcode mode is on. */
 export const PROTOCOL_PROMPT = [
   "EXITCODE MODE - FIX SUCCESS / PURSUE SUCCESS / PROVE SUCCESS.",
@@ -77,6 +84,7 @@ export const PROTOCOL_PROMPT = [
   "Resolve known product ambiguity with the user and propose observable acceptance criteria with executable checks.",
   "Present the complete root contract for review and wait for explicit user approval.",
   "Any root draft revision requires fresh approval.",
+  `Before sealing, inspect only with ${DISCOVERY_TOOL_NAMES.join(", ")}. Submit contracts through ExitCode tools; all other agent tools are blocked.`,
   "The supervisor validates the evaluator before sealing the contract.",
   "The sealed contract is fixed and cannot be weakened.",
   "PURSUE SUCCESS: Implement the approved goal. Use the sealed criteria to measure whether it has been achieved.",
@@ -88,6 +96,7 @@ export const PROTOCOL_PROMPT = [
   "Only a fresh supervisor evaluation with all criteria passing completes a goal.",
   "A passing child does not complete its parent; follow the supervisor's returned parent result and next action.",
   "If no viable autonomous path remains, report the concrete blocker.",
+  "Only a fresh root PASS exits mode automatically. A blocker or clarification pause keeps enforcement on. Only the user can cancel with /exitcode exit.",
 ].join(" ");
 
 // ---------------------------------------------------------------------------
@@ -819,25 +828,15 @@ export function isPathUnder(filePath, dir) {
  */
 export function guardToolCall({ modeOn, leafStatus, cwd, toolName, input }) {
   if (!modeOn) return null;
-  if (toolName.startsWith("exitcode_")) return null;
+  if (EXITCODE_TOOL_NAMES.includes(toolName)) return null;
   const storeRoot = path.join(cwd, EXITCODE_DIR);
 
   if (leafStatus !== NodeState.ACTIVE) {
-    if (toolName === "write" || toolName === "edit") {
-      const target = resolveWithin(cwd, String(input?.path ?? ""));
-      if (isPathUnder(target, path.join(storeRoot, "drafts"))) return null;
-      return {
-        block: true,
-        reason: `exitcode: source writes are blocked until the contract is sealed and ACTIVE (state ${leafStatus ?? "NO_CONTRACT"}). Use exitcode_status for the required next action.`,
-      };
-    }
-    if (toolName === "bash" || toolName === "powershell") {
-      return {
-        block: true,
-        reason: "exitcode: shell use is blocked until the contract is sealed and ACTIVE. Inspect with read/grep/find/ls. The supervisor runs evaluator probes during sealing.",
-      };
-    }
-    return null;
+    if (DISCOVERY_TOOL_NAMES.includes(toolName)) return null;
+    return {
+      block: true,
+      reason: `exitcode: ${toolName} is blocked until the contract is sealed and ACTIVE (state ${leafStatus ?? "NO_CONTRACT"}). Inspect with ${DISCOVERY_TOOL_NAMES.join(", ")}. Use exitcode_draft or exitcode_child to submit contracts and exitcode_status for the required next action. The supervisor runs evaluator probes during sealing.`,
+    };
   }
 
   if (toolName === "write" || toolName === "edit") {
@@ -861,10 +860,11 @@ export function guardToolCall({ modeOn, leafStatus, cwd, toolName, input }) {
 // ---------------------------------------------------------------------------
 
 export function resolveModeFromBranch(branch) {
-  let mode = { on: false, rootId: undefined };
+  let mode = { on: false, rootId: undefined, pendingGoal: undefined };
   for (const entry of branch ?? []) {
     if (entry?.type === "custom" && entry?.customType === MODE_ENTRY_TYPE) {
-      mode = { on: Boolean(entry?.data?.on), rootId: entry?.data?.rootId };
+      mode = { on: Boolean(entry?.data?.on), rootId: entry?.data?.rootId,
+        pendingGoal: typeof entry?.data?.pendingGoal === "string" ? entry.data.pendingGoal : undefined };
     }
   }
   return mode;

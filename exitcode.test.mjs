@@ -1271,24 +1271,29 @@ test("guardToolCall: invisible when mode is off", () => {
   assert.equal(guardToolCall({ modeOn: false, leafStatus: null, cwd: dir, toolName: "bash", input: { command: "rm -rf /" } }), null);
 });
 
-test("guardToolCall: drafting blocks source writes and shell", () => {
+test("guardToolCall: unsealed states allow only discovery and exact supervisor tools", () => {
   const dir = tempProject();
-  const blocked = guardToolCall({ modeOn: true, leafStatus: "DRAFT", cwd: dir, toolName: "write", input: { path: "src/a.ts" } });
-  assert.equal(blocked.block, true);
-  assert.ok(blocked.reason.includes("until the contract is sealed"));
-  assert.match(blocked.reason, /state DRAFT/);
-  assert.match(blocked.reason, /exitcode_status/);
-  assert.doesNotMatch(blocked.reason, /root user approval/);
-  const draftArea = guardToolCall({ modeOn: true, leafStatus: "DRAFT", cwd: dir, toolName: "write", input: { path: ".exitcode/drafts/x.json" } });
-  assert.equal(draftArea, null);
-  const shell = guardToolCall({ modeOn: true, leafStatus: "DRAFT", cwd: dir, toolName: "bash", input: { command: "ls" } });
-  assert.equal(shell.block, true);
-  assert.match(shell.reason, /until the contract is sealed and ACTIVE/);
-  assert.match(shell.reason, /Inspect with read/);
-  const read = guardToolCall({ modeOn: true, leafStatus: "DRAFT", cwd: dir, toolName: "read", input: { path: "src/a.ts" } });
-  assert.equal(read, null);
-  const own = guardToolCall({ modeOn: true, leafStatus: "DRAFT", cwd: dir, toolName: "exitcode_status", input: {} });
-  assert.equal(own, null);
+  for (const leafStatus of [null, "NO_CONTRACT", "DRAFT", "BLOCKED", "PASS", "UNKNOWN"]) {
+    for (const toolName of ["read", "grep", "ls", "exitcode_status", "exitcode_draft",
+      "exitcode_seal", "exitcode_evaluate", "exitcode_child", "exitcode_block"]) {
+      assert.equal(guardToolCall({ modeOn: true, leafStatus, cwd: dir, toolName, input: {} }), null, `${leafStatus}: ${toolName}`);
+    }
+    for (const [toolName, input] of [
+      ["write", { path: "src/a.ts" }], ["edit", { path: ".exitcode/drafts/x.json" }],
+      ["write", { path: ".agents/artifacts/acceptance.md" }], ["bash", { command: "/exitcode exit" }],
+      ["powershell", { command: "ls" }], ["find", {}], ["context", {}],
+      ["codemode", { code: 'await tools.read({path: "src/a.ts"})' }],
+      ["git_commit_plan", {}], ["git_plan_context", {}], ["custom_read_only", {}],
+      ["exitcode_exit", {}], ["exitcode_fake", {}],
+    ]) {
+      const verdict = guardToolCall({ modeOn: true, leafStatus, cwd: dir, toolName, input });
+      assert.equal(verdict.block, true, `${leafStatus}: ${toolName}`);
+      assert.match(verdict.reason, /until the contract is sealed and ACTIVE/);
+      assert.match(verdict.reason, /Inspect with read, grep, ls/);
+      assert.match(verdict.reason, /exitcode_status/);
+      assert.match(verdict.reason, new RegExp(`state ${leafStatus ?? "NO_CONTRACT"}`));
+    }
+  }
 });
 
 test("guardToolCall: active contracts protect sealed artifacts only", () => {
@@ -1310,14 +1315,20 @@ test("guardToolCall: active contracts protect sealed artifacts only", () => {
 });
 
 test("resolveModeFromBranch: last mode entry wins; other entries ignored", () => {
-  assert.deepEqual(resolveModeFromBranch([]), { on: false, rootId: undefined });
+  assert.deepEqual(resolveModeFromBranch([]), { on: false, rootId: undefined, pendingGoal: undefined });
   const branch = [
     { type: "message" },
     { type: "custom", customType: MODE_ENTRY_TYPE, data: { on: true, rootId: "G1" } },
     { type: "custom", customType: "other", data: { on: true } },
     { type: "custom", customType: MODE_ENTRY_TYPE, data: { on: false } },
   ];
-  assert.deepEqual(resolveModeFromBranch(branch), { on: false, rootId: undefined });
+  assert.deepEqual(resolveModeFromBranch(branch), { on: false, rootId: undefined, pendingGoal: undefined });
+  assert.deepEqual(resolveModeFromBranch([
+    { type: "custom", customType: MODE_ENTRY_TYPE, data: { on: true, pendingGoal: "Original goal" } },
+  ]), { on: true, rootId: undefined, pendingGoal: "Original goal" });
+  assert.deepEqual(resolveModeFromBranch([
+    { type: "custom", customType: MODE_ENTRY_TYPE, data: { on: true, rootId: "G1", pendingGoal: 42 } },
+  ]), { on: true, rootId: "G1", pendingGoal: undefined });
 });
 
 test("status and nextAction track the loop position", async () => {
