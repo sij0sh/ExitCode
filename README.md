@@ -31,7 +31,7 @@ The normal path needs one approval and no clarification turn.
 Ask a question only when there are multiple credible interpretations, a material effect on acceptance or compatibility, and no resolved repository convention or default.
 Group at most three questions and include the recommended default.
 A material unresolved question pauses the run in CLARIFICATION.
-READY_FOR_APPROVAL pauses automatic continuation and keeps coding tools locked.
+READY_FOR_APPROVAL pauses automatic continuation; the candidate stays read-only until sealing.
 Silence and requests for changes are not approval.
 
 ## Usage
@@ -60,11 +60,14 @@ Unavailable isolation is a runner error, not evidence of a detected defect.
 | `/exitcode approve` | Approve and seal the exact validated plan. |
 | `/exitcode status` | Show policy, original request, commands, digests, evidence, metrics, and next action. |
 | `/exitcode exit` | Cancel enforcement without claiming success or deleting work. |
-| `/exitcode resume` | Resume on-disk work or a pending review. |
+| `/exitcode resume [Gid]` | Resume the same root, pending review, or saved operation, even while mode is on. |
+| `/exitcode resume minutes=N attempts=N evaluators=N` | Record explicit positive execution or evaluator-construction grants and resume. |
 
 Plain-English approval also works.
 The agent quotes your acceptance when calling `exitcode_seal`.
-The supervisor binds it to the prepared bundle, policy, and original clock.
+The supervisor binds it to the prepared bundle and policy.
+New roots approve an execution duration, not a countdown spent during review.
+Legacy sealed roots keep their original clock.
 It does not authenticate the origin or semantic meaning of that quote.
 
 The adapter exposes six tools only during ExitCode mode.
@@ -73,10 +76,40 @@ The adapter exposes six tools only during ExitCode mode.
 Stale candidate, environment, or evaluator evidence requires preparation and approval again.
 `exitcode_evaluate` runs sealed checks fresh.
 `exitcode_child` proposes one reduction of a failed parent criterion.
-`exitcode_block` reports a concrete blocker.
+`exitcode_block` preserves a concrete blocker as a resumable root pause.
+Only a genuinely declined child path uses `NO_PATH` to withdraw child edits and rerun its ancestors.
 `exitcode_status` exposes detailed mechanics.
 Only root PASS automatically exits mode.
-BLOCKED keeps enforcement on until user cancellation.
+PAUSED and legacy BLOCKED roots keep enforcement on until user cancellation.
+
+## Before sealing
+
+ExitCode never changes your tool loadout or classifies tools by name.
+Any built-in, custom, or extension tool stays available in every phase.
+Instead, ExitCode enforces two state invariants:
+
+- Before sealing, the candidate is immutable.
+- `.exitcode/` is private to the supervisor in every phase.
+
+Entering `/exitcode` or proposing a child snapshots the current candidate as the pre-seal baseline.
+A resumable pause freezes its useful work, not an earlier execution candidate.
+Resuming from mode-off captures the current tree after cancellation.
+ExitCode compares the candidate to that baseline before preparation, after preparation, before approval, before sealing, and when an agent run settles.
+On any difference, it saves the changed and added files under `.exitcode/discarded/`, restores the baseline, and reports the change to the agent.
+Evidence prepared from a changed candidate never reaches approval.
+The latest three discarded change sets are kept.
+This applies to every source, including your own edits during review.
+To change the candidate before approval, use `/exitcode exit`, edit, then `/exitcode resume` and review a fresh preparation.
+Sealing releases the baseline, and the agent then implements normally.
+
+Built-in file tools cannot read or write `.exitcode/`.
+Shell commands that mention it are blocked.
+ExitCode cannot inspect arbitrary tools' arguments, so sealed bundles also carry content digests that block execution when changed.
+ExitCode protects its candidate and supervisor state, not the world.
+A tool can still send email, change a database, push a branch, call an API, or write outside the project.
+Installed dependency content participates in candidate identity, snapshots, and pre-seal restoration.
+Git metadata and supervisor directories are excluded.
+These checks are not an operating-system boundary against compromised trusted host tools.
 
 ## Recipes and discovery
 
@@ -97,6 +130,9 @@ The bounded initial recipe set is:
 
 Checks use `check.recipe` or legacy `check.command`, never both.
 `check.expect` can fix exit and stdout expectations.
+`check.timeoutSeconds` is an immutable explicit watchdog and is never silently shortened in the contract.
+Its actual execution allowance cannot exceed the remaining global deadline.
+Without an explicit timeout, post-seal checks use the remaining execution budget.
 Discovery reads package scripts, conventional source/test roots, and literal Node test names without executing repository code.
 The capability manifest is content-keyed and cached.
 Dynamic test names are not discovered.
@@ -173,17 +209,53 @@ It prefers existing relevant tests, then focused tests in the existing framework
 Review findings produce repair diagnostics rather than silently rewriting criteria.
 The internal coverage and risk evidence is available in status, not added as a routine user-facing matrix.
 
+### Immutable evaluator assets
+
+Preparation captures conventional tests, fixtures, runner configuration, and required case inventory.
+The sealed bundle records their content identities and supervisor-owned copies.
+Custom assertion helpers and imported expectation/configuration files outside those paths must appear in `check.assets`.
+For example, `"assets": ["checks/accept.mjs", "checks/expected.json"]` freezes those helpers.
+Product source remains mutable merely because a check imports or executes it.
+Independent review must flag undeclared acceptance helpers.
+Automatic discovery cannot infer arbitrary shell or import graphs.
+Fixture setup cannot replace the authoritative acceptance bytes.
+Each executable check gets frozen assets mounted read-only inside a disposable candidate copy.
+Changed acceptance bytes or test-selection inventory pause execution rather than weaken the evaluator.
+User resume can restore those exact supervisor-owned bytes and remove added acceptance files before reevaluating.
+It never constructs replacement acceptance from the current candidate.
+
+Use `specificationPaths` to include referenced Markdown plans in independent review.
+Explicit paths may select hidden project plans such as `.agents/artifacts/plan.md`.
+Credential exclusions and context bounds still apply.
+Missing or unsafe declared specifications prevent approval.
+
+Set `mutableDependencies: true` only when the approved goal needs product dependency changes.
+This initial boundary supports npm-style `package.json` and regular installed `node_modules` trees.
+Product dependency declarations and product-only library bytes become identified candidate inputs.
+Development dependencies, installed executable packages, their transitive installed dependencies, and runner configuration remain frozen.
+Added files or changed optional dependency resolution in that evaluator boundary invalidate evidence.
+Other package-manager layouts may need intervention rather than a relaxed boundary.
+This flag does not grant installation, network, credentials, or external authority.
+
 ### Model calls and bounds
 
 New root and child preparation uses the currently selected Pi model and session thinking level through `ctx.modelRegistry.streamSimple()`.
-It makes at most two separate, tool-free calls per preparation.
+It makes two separate, tool-free semantic review phases per successful preparation.
 Each call starts with a fresh context containing only the phase's review prompt and input, not the session history.
 Changing the session model or thinking level applies to subsequent review calls without separate reviewer configuration.
-Each call has a 30-second cancellation/time bound and an 8192-token output limit.
+Initial model review has no ExitCode wall-clock ceiling.
+Each response retains an 8192-token output limit.
+Tool updates report phase and elapsed progress.
+Cancellation still aborts the call.
+Child review after sealing shares the original execution deadline.
 Provider errors, invalid JSON, malformed or missing review evidence, and cancellation prevent approval.
-There is no host-execution or heuristic fallback and no automatic provider retry.
+There is no host-execution or heuristic fallback.
+Transient 408, 429, 5xx, and connection failures get at most two retries per review phase with bounded backoff.
+Invalid requests, invalid responses, assertions, and semantic rejections are not retried until green.
+Repeated infrastructure failures pause the same root for focused intervention.
 Review source context is limited to 64 files, 12 KiB per file, and 96 KiB total per repository view.
-Hidden paths, credential-named files, binary files, and symlink targets are excluded from source context.
+Hidden paths are excluded unless they are explicitly selected Markdown specifications.
+Credential-named files, detected credential content, binary files, and symlink targets remain excluded.
 Large contracts exceeding the adapter input bound require a narrower evaluator.
 Repository context can be incomplete; the reviewer must report insufficient evidence rather than assume success.
 Model calls add cost and latency even when mechanical probe evidence is cached.
@@ -195,7 +267,8 @@ Diagnostics contain `code`, `stage`, `criterionId`, `evidence`, `repairability`,
 Examples include INTENT_UNCOVERED, TEST_SELECTOR_NOT_FOUND, REJECT_NOT_DISCRIMINATED, EMPTY_TARGET_PASS, NONDETERMINISTIC, and EXTERNAL_DEPENDENCY.
 Mechanical repair normalizes numeric timeouts and discovered runner selection.
 Other repairs are agent-authored evaluator revisions inside a bounded construction budget.
-The original clock and implementation counters never reset.
+The sealed execution start and implementation counters never reset.
+An explicit user grant adds budget without changing the approved acceptance policy.
 Intent and evaluator digests are separate.
 Approval binds the exact validation evidence and candidate/environment identity as well as the semantic plan.
 
@@ -214,7 +287,9 @@ The runner exposes system runtime trees and an independent workspace, not host h
 It clears inherited environment variables and mounts private `/proc`, `/dev`, and `/tmp`.
 It unshares network, process, IPC, user, and other namespaces, drops capabilities, and creates a new session.
 Each stream is capped at 64 KiB.
-Timeouts kill the runner process group and its private namespace processes.
+Timeouts and cancellation kill the runner process group and its private namespace processes.
+The supervisor waits for process close before deleting fixtures or releasing the workspace operation lock.
+Injected executable runners must honor the signal and settle only after their processes stop.
 Fixtures can be writable for setup and builds but never alias real candidate files.
 Public sandbox commands use a read-only workspace by default.
 
@@ -223,7 +298,8 @@ No writable hard links are used.
 The logical candidate cap remains 8 GiB and includes ignored build outputs and retained evidence.
 Dependencies are independent copies for executable fixtures.
 Candidate identities hash full content, file modes, and symlink targets instead of sampling large files.
-Dependency identities participate in evaluator environment invalidation.
+Dependency identities participate in candidate and evaluator environment checks.
+Approved product dependency changes do not relax the frozen evaluator runtime boundary.
 Supervisor directories and Git metadata are not candidate content.
 Commands cannot infer the candidate's Git ancestry from the isolated workspace.
 Large fixtures and dependency copies can still consume substantial disk space.
@@ -231,14 +307,17 @@ Large fixtures and dependency copies can still consume substantial disk space.
 The extension itself is trusted code running with host permissions.
 Bubblewrap is a boundary for probes, not a claim against a compromised kernel or trusted extension.
 This runner is not a general-purpose hostile-workload service or CPU/memory quota manager.
-Agent coding tools after sealing remain host tools guarded by the existing supervisor protocol.
+Agent tools are host tools in every phase. ExitCode verifies candidate and supervisor state, not what those tools can reach.
 
 ## Focused recursion and budgets
 
 A child targets exactly one failed parent criterion.
 One child runs at a time.
 Passing a child reruns the parent; it never closes the parent by inference.
-Ancestor regressions trigger restoration and fresh reevaluation.
+Conclusive ancestor regressions trigger restoration and fresh reevaluation.
+Runner ERROR, timeout, and cancellation are inconclusive and preserve useful edits and the active stack.
+A declined child must restore its exact verified pre-child checkpoint before ancestor reevaluation.
+A missing or damaged checkpoint pauses without an arbitrary fallback.
 Rejected implementation attempts still count.
 Fresh completion and boundary parent reruns bypass all preparation caches.
 Sealed contracts cannot be revised or weakened.
@@ -249,30 +328,54 @@ A changed sealed digest blocks execution.
 | `localRepairs` | 2 changed-candidate attempts before ordinary decomposition |
 | `maxDepth` | 3 levels below the root |
 | `maxTotalAttempts` | 12 changed-candidate attempts across the tree |
-| `deadlineMinutes` | 60 minutes from root creation, including review |
-| `evalTimeoutSeconds` | 120 seconds per executable check |
-| `evaluatorAttempts` | 6 preparation attempts per node |
+| `deadlineMinutes` | 60 execution minutes from successful root seal |
+| `evalTimeoutSeconds` | 900-second initial executable preparation watchdog |
+| `evaluatorAttempts` | 6 substantive preparation proposals per node |
 
-Initial policy corrections are allowed before preparation or approval.
-Preparation locks policy permanently, even when it fails.
+Initial operational-policy corrections are allowed before first approval.
+Changing a draft or its policy invalidates affected preparation and approval.
+Approval locks policy even if an unsealed contract is later revised.
 Children inherit effective limits.
-Revisions, reloads, resume, and children never reset time or counters.
-Construction failures use `evaluatorAttempts`, not implementation attempts or user reviews.
-Budget exhaustion reports EVALUATOR_UNBUILDABLE.
+Initial discovery, clarification, model review, executable E0, and human approval spend no execution time.
+Initial executables retain the preparation watchdog to stop hung processes.
+After sealing, child preparation, evaluation, restoration, retries, and ancestor reruns share the root deadline.
+A free unchanged-candidate rerun still needs time and fresh complete evidence.
+Implementation reservations are persisted before executable or snapshot work.
+Substantive construction reservations survive interrupted operations.
+Confirmed infrastructure failures are recorded without charging a substantive evaluator proposal.
 
-Legacy sealed bundles retain their acceptance contracts and fresh recursive evaluation.
-Unsealed legacy drafts cannot reuse old draft-only approval.
-They must prepare safely and obtain fresh validated-plan approval.
-Legacy shell drafts acquire an explicit criterion coverage map during migration.
-That map does not substitute for independent review.
-Newly prepared drafts and children must pass the stronger gate.
-Already-sealed bundles do not require new model review and keep their exact acceptance contracts.
-Interrupted preparation returns to a locked preparation phase on reload.
+### Pause and resume
+
+A pause preserves root identity, original request, phase, stack, approval, bundle, useful edits, diagnostics, and cumulative counters.
+`/exitcode resume` retries the saved operation after its prerequisite is restored.
+Only one supervisor operation owns a workspace at a time.
+Reload or another session cannot clear a live operation's lock.
+A transcript must explicitly adopt another active workspace root through the resume command.
+No external worker, scheduler, installation, credential acquisition, or authority grant is automatic.
+
+Execution exhaustion requires `/exitcode resume minutes=N` or `/exitcode resume attempts=N`.
+Construction exhaustion reports EVALUATOR_UNBUILDABLE and requires `/exitcode resume evaluators=N` before further proposals.
+Values are positive additions, not replacement limits.
+Time additions extend the later of the previous deadline and the grant time.
+Grants are user-command records separate from sealed policy.
+They never reset consumed attempts, execution start, acceptance, or prior evidence.
+Contradictory acceptance, missing authority, damaged trusted evidence, or unavailable isolation still require focused intervention.
+Fixing an incorrect sealed evaluator requires a superseding contract and fresh user approval, not resume-time editing.
+
+Legacy sealed roots retain exact contracts, policy, deadlines, and original attempt-accounting rules.
+They do not acquire new seal-time evidence from current mutable files.
+A legacy command evaluator without trustworthy frozen acceptance assets reports LEGACY_EVIDENCE_MISSING.
+It requires a superseding approved contract.
+Legacy self-contained built-in checks can still run fresh within their original limits.
+Unsealed legacy roots with no implementation history can migrate on explicit resume.
+Migration preserves timing history and counters, invalidates old approval, and requires fresh preparation and validated-plan approval.
+Other legacy terminal execution is not automatically revived.
 
 ## Instrumentation and benchmark
 
-Status exposes evaluator proposals, preparation attempts, probe/shell executions, fixture counts/bytes, elapsed preparation time, diagnostic categories, review turns, cache hits, and peak concurrency.
-Model usage is available for Pi review calls.
+Status exposes evaluator proposals, construction attempts, reviewer calls/completions/retries, probe/shell executions, fixture counts/bytes, elapsed preparation time, diagnostics, pauses, grants, review turns, cache hits, and peak concurrency.
+Model usage is reported when the provider returns it.
+Missing final usage is unavailable cost, not evidence of zero billing.
 Other integrations report usage only when their host supplies it.
 No token reduction claim is made.
 
@@ -298,7 +401,7 @@ The benchmark demonstrates operation-count savings, not a universal latency perc
 ## Remaining limits
 
 Long-running work still requires a live Pi session.
-The adapter sends at most three continuation nudges per idle stretch.
+The adapter sends at most three continuation nudges without observable progress, then records an explicit resumable pause.
 There is no external scheduler, parallel worker pool, exhaustive semantic test writer, or universal repair engine.
 Useful criteria, ambiguity selection, and child decomposition remain model-dependent.
 Keep the original objective above extension housekeeping and commit reminders.
