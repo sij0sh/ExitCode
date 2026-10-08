@@ -81,15 +81,18 @@ function testIo(dir, exec, nowRef = { now: Date.now() }) {
 }
 
 const ROOT_CRITERIA = [behavior("C1", "check:c1"), regression("C2", "check:reg")];
+const ROOT_SEQUENCE = [{ objective: "Establish the first proof", verify: ["C1"] }, { objective: "Finish the last proof", verify: ["C3"] }];
+const ORDERED_CRITERIA = [...ROOT_CRITERIA, { id: "C3", requirement: "The last literal artifact contains done",
+  check: { recipe: { kind: "file_contains", path: "last.txt", value: "done" } } }];
 const childCriteria = () => [behavior("D1", "check:d1")];
 const childArgs = (extra = {}) => ({ parentId: "G1", target: "C1", goal: "sub", criteria: childCriteria(), reason: "r",
   prerequisite: true, prerequisiteArtifact: "a", ...extra });
 
-async function sealedRoot(t, { files, policy, nowRef = { now: Date.now() } } = {}) {
+async function sealedRoot(t, { files, policy, sequence, nowRef = { now: Date.now() } } = {}) {
   const dir = tempProject(t, files);
   const exec = fileExec(dir, { checks: standardChecks });
   const { io } = testIo(dir, exec, nowRef);
-  const draft = draftNode(io, { goal: "Add the thing", criteria: ROOT_CRITERIA, ...(policy ? { policy } : {}) });
+  const draft = draftNode(io, { goal: "Add the thing", criteria: sequence ? ORDERED_CRITERIA : ROOT_CRITERIA, ...(sequence ? { sequence } : {}), ...(policy ? { policy } : {}) });
   assert.equal(draft.ok, true, JSON.stringify(draft.errors));
   assert.equal((await prepareNode(io)).ok, true);
   assert.equal(approveRoot(io).ok, true);
@@ -104,7 +107,7 @@ const write = (dir, rel, content) => fs.writeFileSync(path.join(dir, rel), conte
 // Contract structure
 // ---------------------------------------------------------------------------
 
-test("structure: drafts are validated before any probe, and controls are optional witnesses", () => {
+test("structure: drafts are validated before any probe, and controls are optional witnesses", async (t) => {
   assert.deepEqual(validateStructure(rootDraft(), { policy: DEFAULT_POLICY }), { ok: true, errors: [] });
   // Thin contracts: a behavior criterion may omit controls, and a root needs no regression criterion.
   assert.equal(validateStructure(rootDraft({ criteria: [{ id: "C1", requirement: "r", check: custom("c") }] })).ok, true);
@@ -129,6 +132,39 @@ test("structure: drafts are validated before any probe, and controls are optiona
     assert.ok(result.errors.some((e) => e.includes(fragment)), `${label}: ${result.errors.join("; ")}`);
   }
   assert.deepEqual(assignCriterionIds([{ requirement: "a" }, { id: "C9", requirement: "b" }, { requirement: "c" }]).map((c) => c.id), ["C1", "C9", "C2"]);
+  const ordered = rootDraft({ criteria: ORDERED_CRITERIA, sequence: ROOT_SEQUENCE });
+  assert.equal(validateStructure(ordered).ok, true);
+  assert.equal(validateStructure({ ...ordered, sequence: [{ objective: "x".repeat(200), verify: ["C1", "C3"] }] }).ok, true);
+  for (const [label, sequence] of [
+    ["empty", []], ["null", null], ["object", {}], ["slice object", [null]], ["objective type", [{ objective: 1, verify: ["C1", "C3"] }]],
+    ["blank objective", [{ objective: "   ", verify: ["C1", "C3"] }]], ["long objective", [{ objective: "x".repeat(201), verify: ["C1", "C3"] }]],
+    ["empty proof", [{ objective: "First", verify: [] }]], ["proof type", [{ objective: "First", verify: "C1" }]],
+    ["unknown", [{ objective: "First", verify: ["C1", "C3", "unknown"] }]],
+    ["regression", [{ objective: "First", verify: ["C1", "C2", "C3"] }]],
+    ["missing", [{ objective: "First", verify: ["C1"] }]],
+    ["repeated within", [{ objective: "First", verify: ["C1", "C1", "C3"] }]],
+    ["repeated across", [...ROOT_SEQUENCE, { objective: "Again", verify: ["C1"] }]],
+    ["nonstring ID", [{ objective: "First", verify: ["C1", "C3", 1] }]],
+    ["too many", Array.from({ length: 13 }, (_, i) => ({ objective: `Slice ${i}`, verify: ["C1"] }))],
+  ]) {
+    assert.equal(validateStructure({ ...ordered, sequence }).ok, false, label);
+    const dir = tempProject(t), exec = fileExec(dir), io = makeIo(dir, { exec });
+    const rejected = draftNode(io, { goal: "g", criteria: ORDERED_CRITERIA, sequence });
+    assert.equal(rejected.ok, false, `${label} rejected at the draft boundary`);
+    assert.equal(exec.calls.length, 0);
+    assert.equal(core.loadIndex(dir).activeRootId, null, "invalid order creates no root");
+  }
+  const twelve = Array.from({ length: 12 }, (_, i) => ({ id: `B${i}`, requirement: `Outcome ${i}`, check: custom("observe") }));
+  assert.equal(validateStructure(rootDraft({ criteria: twelve, sequence: twelve.map(c => ({ objective: c.requirement, verify: [c.id] })) })).ok, true);
+  assert.equal(validateStructure(child(["C1"], { sequence: [{ objective: "Child", verify: ["C1"] }] }), { parent, parentDepth: 0 }).ok, false, "sequences are root-only");
+  const dir = tempProject(t), io = makeIo(dir);
+  const assigned = draftNode(io, { goal: "g", criteria: ORDERED_CRITERIA.map(({ id, ...c }) => c), sequence: ROOT_SEQUENCE });
+  assert.equal(assigned.ok, true, "sequence references supervisor-assigned criterion IDs");
+  assert.deepEqual(assigned.draft.sequence, ROOT_SEQUENCE);
+  const before = [fs.readFileSync(core.draftFile(dir, "G1"), "utf8"), loadRoot(io, "G1"), loadNodeState(io, "G1")];
+  assert.equal(draftNode(io, { revise: "G1", goal: "bad", criteria: ORDERED_CRITERIA, sequence: [] }).ok, false);
+  assert.deepEqual([fs.readFileSync(core.draftFile(dir, "G1"), "utf8"), loadRoot(io, "G1"), loadNodeState(io, "G1")], before, "invalid revision is atomic");
+  assert.deepEqual(draftNode(io, { revise: "G1", goal: "g", criteria: ORDERED_CRITERIA }).draft.sequence, ROOT_SEQUENCE, "omitted order is retained on revision");
 });
 
 test("verdict: runner errors, timeouts, and truncated output never PASS; only PASS -> FAIL regresses", async () => {
@@ -232,7 +268,7 @@ test("approval: every revision or on-disk edit invalidates approval", async (t) 
   const dir = tempProject(t);
   const exec = fileExec(dir, { checks: standardChecks });
   const { io } = testIo(dir, exec);
-  draftNode(io, { goal: "g", criteria: ROOT_CRITERIA, assumptions: ["Existing policy"], exclusions: ["No redesign"], policy: { evaluatorAttempts: 12 } });
+  draftNode(io, { goal: "g", criteria: ROOT_CRITERIA, sequence: [{ objective: "Prove the feature", verify: ["C1"] }], assumptions: ["Existing policy"], exclusions: ["No redesign"], policy: { evaluatorAttempts: 12 } });
   assert.equal((await prepareNode(io)).ok, true);
   assert.equal(approveRoot(io).ok, true);
   exec.calls.length = 0;
@@ -251,6 +287,8 @@ test("approval: every revision or on-disk edit invalidates approval", async (t) 
     (draft) => { draft.criteria[0].check.recipe.command = "true"; },
     (draft) => { draft.criteria[0].controls.reject[0].mutations[0].content = "done\n"; },
     (draft) => { draft.assumptions = ["Changed policy"]; },
+    (draft) => { draft.sequence[0].objective = "Weakened implementation objective"; },
+    (draft) => { draft.sequence[0].verify = []; },
   ]) {
     assert.equal((await prepareNode(io)).ok, true);
     assert.equal(approveRoot(io).ok, true);
@@ -797,25 +835,45 @@ test("child: gates require a failing target, a prerequisite before local repairs
 });
 
 test("child: PASS reruns the parent and only a passing parent cascades to root PASS", async (t) => {
-  const { dir, io } = await sealedRoot(t);
-  assert.equal(draftNode(io, childArgs()).ok, true);
-  assert.equal((await sealNode(io, "G1.1")).ok, true);
-  write(dir, "child1.txt", "ok");
-  const result = await evaluateNode(io, null);
-  assert.ok(result.cascade.events.some((e) => e.includes("G1.1 PASS")));
-  assert.ok(result.cascade.events.some((e) => e.includes("G1 rerun: C1=FAIL C2=PASS")));
-  assert.equal(result.cascade.terminal, null);
-  assert.deepEqual(loadRoot(io, "G1").stack, ["G1"]);
-  write(dir, "child1.txt", "ok v2");
-  const reread = await evaluateNode(io, "G1.1");
-  assert.equal(reread.status, NodeState.PASS);
-  assert.equal(reread.stale, true, "a terminal child reports stale when the tree moved on");
-  const second = await sealedRoot(t);
-  assert.equal(draftNode(second.io, childArgs()).ok, true);
-  assert.equal((await sealNode(second.io, "G1.1")).ok, true);
-  write(second.dir, "child1.txt", "ok");
-  write(second.dir, "feature.txt", "done\n");
-  assert.equal((await evaluateNode(second.io, null)).cascade.terminal.status, NodeState.PASS);
+  for (const ordered of [false, true]) await t.test(ordered ? "ordered parent" : "unordered parent", async (t) => {
+    const options = ordered ? { sequence: ROOT_SEQUENCE } : {};
+    const { dir, io } = await sealedRoot(t, options);
+    if (ordered) {
+      assert.equal(draftNode(io, childArgs({ target: "C3" })).ok, false, "future proof is not a child target despite E0 failure evidence");
+      assert.equal(draftNode(io, { ...childArgs(), sequence: [{ objective: "Child", verify: ["D1"] }] }).ok, false, "children cannot submit a sequence");
+    }
+    assert.equal(draftNode(io, childArgs()).ok, true);
+    if (ordered) assert.equal(draftNode(io, { ...childArgs(), revise: "G1.1", sequence: [{ objective: "Child", verify: ["D1"] }] }).ok, false, "child revision cannot add order");
+    assert.equal((await sealNode(io, "G1.1")).ok, true);
+    write(dir, "child1.txt", "ok");
+    const result = await evaluateNode(io, null);
+    assert.ok(result.cascade.events.some((e) => e.includes("G1.1 PASS")));
+    assert.ok(result.cascade.events.some((e) => e.includes("G1 rerun: C1=FAIL C2=PASS")));
+    assert.equal(result.cascade.terminal, null);
+    assert.deepEqual(loadRoot(io, "G1").stack, ["G1"]);
+    if (ordered) assert.equal(loadNodeState(io, "G1").sequenceIndex, 0, "child PASS does not infer parent proof");
+    write(dir, "child1.txt", "ok v2");
+    const reread = await evaluateNode(io, "G1.1");
+    assert.equal(reread.status, NodeState.PASS);
+    assert.equal(reread.stale, true, "a terminal child reports stale when the tree moved on");
+    const second = await sealedRoot(t, options);
+    assert.equal(draftNode(second.io, childArgs()).ok, true);
+    assert.equal((await sealNode(second.io, "G1.1")).ok, true);
+    write(second.dir, "child1.txt", "ok");
+    write(second.dir, "feature.txt", "done\n");
+    const passed = await evaluateNode(second.io, null);
+    if (ordered) {
+      assert.equal(passed.cascade.terminal, null, "fresh parent prefix proof is not root PASS");
+      assert.equal(loadNodeState(second.io, "G1").status, "ACTIVE");
+      assert.equal(loadNodeState(second.io, "G1").sequenceIndex, 1);
+      assert.equal(draftNode(second.io, childArgs({ target: "C3", goal: "Unproven future" })).ok, false, "newly active proof needs a current FAIL, not missing evidence");
+      assert.equal((await evaluateNode(second.io, "G1")).vector, "C1=PASS C2=PASS C3=FAIL");
+      assert.equal(draftNode(second.io, childArgs({ target: "C3", goal: "Reduce the final proof" })).ok, true, "current failing proof can be reduced");
+      assert.equal((await blockNode(second.io, "G1.2", { code: "NO_PATH", reason: "Withdraw this reduction" })).status, "BLOCKED");
+      write(second.dir, "last.txt", "done");
+      assert.equal((await evaluateNode(second.io, "G1")).cascade.terminal.status, "PASS");
+    } else assert.equal(passed.cascade.terminal.status, NodeState.PASS);
+  });
 });
 
 test("child: BLOCKED restores the pre-child candidate and ancestor regressions are reverted", async (t) => {
@@ -1032,6 +1090,26 @@ test("status: injected state is bounded and evidence-free; explicit evidence is 
   write(dir, "feature.txt", "v3\n"); await evaluateNode(io, null);
   assert.match(statusSnapshot(io).next, /exitcode_child targeting one of \[C1\], subject to supervisor gates/);
   assert.match(nextAction({ policy: DEFAULT_POLICY }, { id: "G1.1", parentId: "G1", status: NodeState.DRAFT }), /seal G1\.1 with exitcode_seal/);
+  const ordered = await sealedRoot(t, { sequence: ROOT_SEQUENCE });
+  for (const text of [promptStatusText(ordered.io), statusText(ordered.io)]) {
+    assert.match(text, /slice 1\/2: Establish the first proof/);
+    assert.match(text, /proof: C1=FAIL C2=PASS/);
+    assert.doesNotMatch(text, /C3=FAIL|check:c1|write_file/);
+  }
+  assert.match(statusSnapshot(ordered.io).next, /Establish the first proof/);
+  assert.doesNotMatch(statusSnapshot(ordered.io).next, /C3/);
+  write(ordered.dir, "feature.txt", "done\n");
+  await evaluateNode(ordered.io, "G1");
+  for (const text of [promptStatusText(ordered.io), statusText(ordered.io)]) {
+    assert.match(text, /slice 2\/2: Finish the last proof/);
+    assert.match(text, /proof: C1=PASS C2=PASS C3=(?:PENDING|NOT_RUN)/, "newly active proof is explicitly unproven");
+  }
+  assert.match(statusSnapshot(ordered.io).next, /Finish the last proof/);
+  assert.match(statusSnapshot(ordered.io).next, /evaluate/, "a new slice requires fresh evidence before child reduction");
+  await evaluateNode(ordered.io, "G1");
+  assert.match(promptStatusText(ordered.io), /proof: C1=PASS C2=PASS C3=FAIL/);
+  assert.match(statusSnapshot(ordered.io).next, /\[C3\]/);
+  assert.ok(Buffer.byteLength(promptStatusText(ordered.io)) <= PROMPT_STATUS_MAX_BYTES);
 });
 
 test("protocol: the injected protocol explains only the loop", () => {

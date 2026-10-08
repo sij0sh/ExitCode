@@ -213,6 +213,9 @@ test('review: derivations are compact, clipped, and supervisor-numbered; respons
     { criteria: [{ criterionId: 'C1', observation: 'o', nearMisses: ['a', 'b', 'c'] }] }, { uncovered: 'x', criteria: [{ criterionId: 'C1', observation: 'o', structural: true }] }])
     assert.throws(() => validateDerivation(bad, criteria), e => e.code === 'REVIEW_RESPONSE_INVALID');
   assert.ok(REVIEW_MAX_TOKENS <= 4096);
+  assert.doesNotMatch(reviewPrompt('derive'), /SEQUENCE_INVALID/);
+  assert.match(reviewPrompt('assess'), /SEQUENCE_INVALID/);
+  assert.match(reviewPrompt('assess'), /only when.*earlier.*later/, 'ordering review catches only obvious backwards proof dependencies');
   for (const phase of ['derive', 'assess']) {
     assert.ok(reviewPrompt(phase).length < 2600, `${phase} prompt is compact`);
     assert.match(reviewPrompt(phase), /submit_review/);

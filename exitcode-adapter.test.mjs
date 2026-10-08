@@ -147,9 +147,11 @@ test("adapter: a draft returns a compact validated plan only after E0, and repai
   assert.match(failed.content[0].text, /Evaluator preparation needs repair/);
   assert.equal(core.statusSnapshot(io(h)).awaitingApproval, false);
   assert.equal((await settle(h)).continue, true, "the agent keeps repairing");
-  const result = await h.tool("exitcode_draft", { goal: "Finish the feature", criteria, revise: "G1", assumptions: ["Use the existing interface"] });
+  const sequence = [{ objective: "Prove the feature", verify: ["C1"] }];
+  const result = await h.tool("exitcode_draft", { goal: "Finish the feature", criteria, sequence, revise: "G1", assumptions: ["Use the existing interface"] });
+  assert.deepEqual(JSON.parse(fs.readFileSync(core.draftFile(h.cwd, "G1"), "utf8")).draft.sequence, sequence);
   const text = result.content[0].text;
-  for (const fragment of [/Validated plan/, /C1: The feature is done/, /C2: Existing behavior is preserved/, /Use the existing interface/, /Verification\n- C1: an isolated custom command; rejected 1 independent near-miss\./, /Approve this plan/])
+  for (const fragment of [/Validated plan/, /C1: The feature is done/, /C2: Existing behavior is preserved/, /Use the existing interface/, /Implementation order\n\n1\. Prove the feature\n   Proves: C1/, /Verification\n- C1: an isolated custom command; rejected 1 independent near-miss\./, /Approve this plan/])
     assert.match(text, fragment);
   assert.doesNotMatch(text, /grep -qx|write_file/);
   assert.ok(Buffer.byteLength(text) < 2048);
@@ -305,6 +307,27 @@ test("adapter: settle restores pre-seal changes, bounds continuations, and canno
 });
 
 test("adapter: only a fresh root PASS exits mode; child PASS, stale PASS, and pauses keep enforcement", async (t) => {
+  const ordered = harness(t);
+  const orderedCriteria = [...criteria, { id: "C3", requirement: "The final artifact contains done",
+    check: { recipe: { kind: "file_contains", path: "last.txt", value: "done" } } }];
+  const sequence = [{ objective: "Prove the feature", verify: ["C1"] }, { objective: "Prove the last artifact", verify: ["C3"] }];
+  await draft(ordered, { criteria: orderedCriteria, sequence });
+  await ordered.command("approve");
+  fs.writeFileSync(path.join(ordered.cwd, "feature.txt"), "done\n");
+  const prefix = await ordered.tool("exitcode_evaluate", { node: "G1" });
+  assert.equal(prefix.details.status, "ACTIVE");
+  assert.equal(prefix.details.cascade?.terminal ?? null, null);
+  assert.match(prefix.content[0].text, /Prove the last artifact/, "slice transition returns the next objective");
+  assertEnforced(ordered);
+  assert.equal(core.loadNodeState(io(ordered), "G1").sequenceIndex, 1);
+  assert.match(promptText(ordered), /slice 2\/2: Prove the last artifact/);
+  await ordered.reload();
+  assertEnforced(ordered);
+  assert.equal(core.loadNodeState(io(ordered), "G1").sequenceIndex, 1);
+  fs.writeFileSync(path.join(ordered.cwd, "last.txt"), "done");
+  const complete = await ordered.tool("exitcode_evaluate", { node: "G1" });
+  assert.equal(complete.details.cascade.terminal.status, "PASS");
+  assert.equal(core.resolveModeFromBranch(ordered.entries).on, false);
   const h = harness(t);
   await draft(h);
   await h.command("approve");
