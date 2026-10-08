@@ -147,7 +147,7 @@ function reviewIo(ctx: ExtensionContext, signal?: AbortSignal) {
       const result=await ctx.modelRegistry.streamSimple(ctx.model, {
         systemPrompt:core.reviewPrompt(input.phase),
         messages:[{role:"user",content:encoded,timestamp:Date.now()}],
-      }, {maxTokens:core.REVIEW_MAX_TOKENS,signal:options.signal}).result();
+      }, {reasoning:ctx.thinkingLevel,maxTokens:core.REVIEW_MAX_TOKENS,signal:options.signal}).result();
       // Provider errors can still carry billable usage.
       for(const k of ["input","output","cacheRead","cacheWrite","totalTokens"] as const)
         usage[k]+=result.usage?.[k] ?? 0;

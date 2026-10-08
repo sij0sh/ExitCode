@@ -175,8 +175,10 @@ The internal coverage and risk evidence is available in status, not added as a r
 
 ### Model calls and bounds
 
-New root and child preparation uses the currently selected Pi model through `ctx.modelRegistry.streamSimple()`.
+New root and child preparation uses the currently selected Pi model and session thinking level through `ctx.modelRegistry.streamSimple()`.
 It makes at most two separate, tool-free calls per preparation.
+Each call starts with a fresh context containing only the phase's review prompt and input, not the session history.
+Changing the session model or thinking level applies to subsequent review calls without separate reviewer configuration.
 Each call has a 30-second cancellation/time bound and an 8192-token output limit.
 Provider errors, invalid JSON, malformed or missing review evidence, and cancellation prevent approval.
 There is no host-execution or heuristic fallback and no automatic provider retry.

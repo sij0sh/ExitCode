@@ -51,7 +51,7 @@ function harness(t, content = "todo\n", initialTools = ["read", "write", "bash"]
     sendMessage: (message, options) => messages.push({ ...message, ...options }),
   };
   const ctx = {
-    cwd, hasUI: false, mode: "print", model:{id:"test-model",provider:"test"},modelRegistry:structuralRegistry(), isIdle: () => idle,
+    cwd, hasUI: false, mode: "print", model:{id:"test-model",provider:"test"},thinkingLevel:"high",modelRegistry:structuralRegistry(), isIdle: () => idle,
     ui: { notify: (content, type) => notifications.push({ content, type }) },
     sessionManager: { getBranch: () => entries },
   };
@@ -739,7 +739,7 @@ for(const mode of ['success','error','invalid-json','malformed','length','missin
     goal:'Literal artifact',criteria,intentAtoms:criteria.map(c=>({id:c.id,outcome:c.requirement,criteria:[c.id]})),
   },controller.signal,()=>{},h.ctx);
   for(const c of registry.calls){
-    assert.equal(c.model,h.ctx.model);assert.ok(c.options.signal instanceof AbortSignal);
+    assert.equal(c.model,h.ctx.model);assert.equal(c.options.reasoning,h.ctx.thinkingLevel);assert.ok(c.options.signal instanceof AbortSignal);
     assert.ok(c.options.maxTokens>0&&c.options.maxTokens<=8192);assert.ok(!c.context.tools?.length);
   }
   if(registry.calls.length){
@@ -753,9 +753,13 @@ for(const mode of ['success','error','invalid-json','malformed','length','missin
     assert.equal(core.loadNodeState(core.makeIo(h.cwd),'G1').evaluatorMetrics.tokenUsage.input,22);
     assert.equal(core.statusSnapshot(core.makeIo(h.cwd)).awaitingApproval,true);
     assert.equal(await h.events.get('agent_before_settle')({},h.ctx),undefined);
-    // Repeated preparation uses new review calls even if artifact probes are cached.
+    // Repeated preparation follows session selection changes, even if probes are cached.
+    h.ctx.model={id:'changed-model',provider:'changed-provider'};h.ctx.thinkingLevel='max';
     const revised=await h.tool('exitcode_draft',{goal:'Literal artifact',criteria,revise:'G1'});
     assert.equal(revised.usage.input,22);assert.equal(registry.calls.length,4);
+    for(const c of registry.calls.slice(2)){
+      assert.equal(c.model,h.ctx.model);assert.equal(c.options.reasoning,h.ctx.thinkingLevel);
+    }
     assert.equal(core.loadNodeState(core.makeIo(h.cwd),'G1').evaluatorMetrics.tokenUsage.input,44);
   }else{
     assert.equal(result.isError,true);assert.equal(core.statusSnapshot(core.makeIo(h.cwd)).awaitingApproval,false);
@@ -764,3 +768,30 @@ for(const mode of ['success','error','invalid-json','malformed','length','missin
     if(mode==='cancel')assert.equal(registry.calls[0].options.signal.aborted,true);
   }
 });
+
+for (const thinkingLevel of ["off", "minimal", "low", "medium", "high", "xhigh", "max"]) {
+  test(`adapter: review inherits session thinking ${thinkingLevel} in fresh tool-free contexts`, async (t) => {
+    const h = harness(t);
+    const registry = reviewRegistry();
+    h.ctx.modelRegistry = registry;
+    h.ctx.thinkingLevel = thinkingLevel;
+    h.ctx.tools = [{ name: "write", description: "Mutate the session candidate" }];
+    h.entries.push({ type: "message", message: {
+      role: "user", content: "Session-only history must not reach the reviewer", timestamp: Date.now(),
+    } });
+
+    const result = await draft(h);
+    assert.equal(result.isError, undefined);
+    assert.deepEqual(registry.calls.map(c => c.input.phase), ["derive", "assess"]);
+    for (const call of registry.calls) {
+      assert.equal(call.model, h.ctx.model);
+      assert.equal(call.options.reasoning, thinkingLevel);
+      assert.equal(call.context.systemPrompt, core.reviewPrompt(call.input.phase));
+      assert.equal(call.context.messages.length, 1);
+      assert.equal(call.context.messages[0].role, "user");
+      assert.equal(call.context.messages[0].content, JSON.stringify(call.input));
+      assert.doesNotMatch(JSON.stringify(call.context), /Session-only history/);
+      assert.ok(!call.context.tools?.length);
+    }
+  });
+}
