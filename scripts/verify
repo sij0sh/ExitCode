@@ -2,6 +2,10 @@
 set -eu
 cd "$(dirname "$0")/.."
 node --check exitcode-core.mjs
+node --check exitcode-evaluator.mjs
+node --check exitcode-preparation.mjs
+node --check exitcode-evaluator-quality.test.mjs
+node --check scripts/benchmark-evaluator.mjs
 node --check exitcode.ts
 node --check exitcode.test.mjs
 npm test

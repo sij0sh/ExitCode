@@ -124,13 +124,8 @@ test("adapter: approve runs E0 and starts autonomous implementation", async (t) 
   assert.equal(h.events.get("tool_call")({ toolName: "write", input: { path: "feature.txt" } }, h.ctx), undefined);
 });
 
-test("adapter: root already satisfied at approval exits without another turn", async (t) => {
-  const h = harness(t, "done\n");
-  await draft(h);
-  await h.command("approve");
-  assert.equal(core.loadRoot(core.makeIo(h.cwd), "G1").status, "PASS");
-  assert.equal(h.messages.at(-1).triggerTurn, false);
-  assert.equal(h.tools.get("exitcode_draft").exposure, "hidden");
+test("adapter: satisfied baseline still needs fresh evaluation to exit", async t=>{
+ const h=harness(t,"done\n");await draft(h);await h.command('approve');assert.equal(core.loadRoot(core.makeIo(h.cwd),'G1').status,'ACTIVE');assert.equal(h.messages.at(-1).triggerTurn,true);await h.tool('exitcode_evaluate',{});assert.equal(core.loadRoot(core.makeIo(h.cwd),'G1').status,'PASS');assert.equal(h.tools.get('exitcode_draft').exposure,'hidden');
 });
 
 test("adapter: busy, extra arguments, mode off, and absent drafts cannot approve", async (t) => {
@@ -177,45 +172,19 @@ test("adapter: expired review refuses approval without consuming work or leaving
   assert.equal(core.loadRoot(io, "G1").approval, undefined);
   assert.equal(core.loadNodeState(io, "G1").sealAttempts, 0);
   assert.match(h.notifications.at(-1).content, /deadline exceeded/);
-  assert.match(h.notifications.at(-1).content, /larger finite policy/);
-  assert.match(core.statusSnapshot(io).review, /Do not approve an expired contract/);
+  assert.match(h.notifications.at(-1).content, /user must cancel/);
+  assert.match(core.statusSnapshot(io).review, /shared deadline expired/);
   const denied = await h.tool("exitcode_seal", { node: "G1", userApproval: "Go ahead" });
   assert.equal(denied.isError, true);
   assert.match(denied.content[0].text, /approval and E0 are unavailable/);
   assert.equal(core.resolveModeFromBranch(h.entries).on, true);
 });
 
-test("adapter: corrected initial limits survive reload and approval locks them", async (t) => {
-  const h = harness(t);
-  await h.command("Complete the implementation");
-  await h.tool("exitcode_draft", { goal: "Commit-only detour", criteria, policy: { deadlineMinutes: 30, maxTotalAttempts: 3 } });
-  const io = core.makeIo(h.cwd);
-  const createdAt = core.loadRoot(io, "G1").createdAt;
-  const revised = await h.tool("exitcode_draft", { revise: "G1", goal: "Complete the implementation", criteria,
-    policy: { deadlineMinutes: 480, maxTotalAttempts: 24, maxDepth: 1, evalTimeoutSeconds: 900 } });
-  assert.equal(revised.isError, undefined);
-  assert.match(revised.content[0].text, /deadlineMinutes: 480/);
-  assert.match(revised.content[0].text, /maxTotalAttempts: 24/);
-  assert.match(revised.content[0].text, /maxDepth: 1/);
-  assert.match(revised.content[0].text, /evalTimeoutSeconds: 900/);
-  assert.match(revised.content[0].text, /Remaining time:/);
-  const deadlineAt = core.loadRoot(io, "G1").deadlineAt;
-  await h.reload();
-  assert.equal(core.statusSnapshot(io).policyEditable, true);
-  assert.equal(core.loadRoot(io, "G1").createdAt, createdAt);
-  assert.equal(core.loadRoot(io, "G1").deadlineAt, deadlineAt);
-  assertRestricted(h);
-  assert.equal(await h.events.get("agent_before_settle")({}, h.ctx), undefined);
-  await h.command("status");
-  assert.match(h.notifications.at(-1).content, /deadlineMinutes: 480/);
-  await h.command("exit");
-  await h.command("resume");
-  assert.equal(core.loadRoot(io, "G1").deadlineAt, deadlineAt);
-  await h.command("approve");
-  assert.equal(core.loadNodeState(io, "G1").status, "ACTIVE");
-  assert.equal(core.loadRoot(io, "G1").policyLocked, true);
-  assert.equal(core.loadRoot(io, "G1").deadlineAt, deadlineAt);
-  assert.equal(core.loadNodeState(io, "G1").sealAttempts, 1);
+test("adapter: initial limits are locked by preparation and survive reload", async t=>{
+ const h=harness(t);await h.command('Complete the implementation');await h.tool('exitcode_draft',{goal:'Complete implementation',criteria,policy:{deadlineMinutes:480,maxTotalAttempts:24,maxDepth:1,evalTimeoutSeconds:900}});
+ const io=core.makeIo(h.cwd),before=core.loadRoot(io,'G1');assert.equal(core.statusSnapshot(io).policyEditable,false);
+ assert.equal((await h.tool('exitcode_draft',{revise:'G1',goal:'Complete implementation',criteria,policy:{deadlineMinutes:900}})).isError,true);assert.deepEqual(core.loadRoot(io,'G1'),before);
+ await h.reload();assertRestricted(h);await h.command('status');assert.match(h.notifications.at(-1).content, /"deadlineMinutes":480/);await h.command('exit');await h.command('resume');await h.command('approve');assert.equal(core.loadNodeState(io,'G1').status,'ACTIVE');assert.equal(core.loadRoot(io,'G1').deadlineAt,before.deadlineAt);
 });
 
 test("adapter: failed E0 policy revision is explicit, atomic, and locked across reload", async (t) => {
@@ -240,11 +209,11 @@ test("adapter: failed E0 policy revision is explicit, atomic, and locked across 
   assert.equal(core.statusSnapshot(io).policyEditable, false);
   assert.equal((await h.tool("exitcode_draft", { revise: "G1", goal: "Feature", criteria,
     policy: { maxTotalAttempts: 24 } })).isError, true);
-  assert.equal(core.loadNodeState(io, "G1").sealAttempts, 1);
+  assert.equal(core.loadNodeState(io, "G1").sealAttempts, 0);
   assertRestricted(h);
   await h.command("approve");
   assert.equal(core.loadNodeState(io, "G1").status, "ACTIVE");
-  assert.equal(core.loadNodeState(io, "G1").sealAttempts, 2);
+  assert.equal(core.loadNodeState(io, "G1").sealAttempts, 1);
 });
 
 test("adapter: extension housekeeping cannot overwrite the retained user objective", async (t) => {
@@ -253,11 +222,11 @@ test("adapter: extension housekeeping cannot overwrite the retained user objecti
   await h.reload();
   const proposal = await h.tool("exitcode_draft", { goal: "Commit-only detour", criteria,
     originalRequest: "Commit ladder: clean the working tree" });
-  assert.equal(proposal.details.draft.originalRequest, "Complete Phases 1 and 2");
-  assert.match(proposal.content[0].text, /Original user request\nComplete Phases 1 and 2/);
+  assert.equal(core.statusSnapshot(core.makeIo(h.cwd)).originalRequest, "Complete Phases 1 and 2");
+  assert.match((await h.tool("exitcode_status",{})).content[0].text, /Complete Phases 1 and 2/);
   const revised = await h.tool("exitcode_draft", { revise: "G1", goal: "Complete the implementation", criteria,
     originalRequest: "Another extension reminder" });
-  assert.equal(revised.details.draft.originalRequest, "Complete Phases 1 and 2");
+  assert.equal(core.statusSnapshot(core.makeIo(h.cwd)).originalRequest, "Complete Phases 1 and 2");
   const event = { systemPromptOptions: { sections: {} } };
   h.events.get("before_agent_start")(event, h.ctx);
   assert.match(event.systemPromptOptions.sections.exitcode, /original objective above extension housekeeping and commit reminders/);
@@ -265,27 +234,11 @@ test("adapter: extension housekeeping cannot overwrite the retained user objecti
   assertRestricted(h);
 });
 
-test("adapter: failed E0 continues to revision and pauses for fresh approval", async (t) => {
-  const h = harness(t);
-  await h.command("Add the feature");
-  const broken = structuredClone(criteria);
-  broken[0].controls.reject[0].setup = "printf 'done\\n' > feature.txt";
-  await h.tool("exitcode_draft", { goal: "g", criteria: broken });
-  await h.command("approve");
-  const io = core.makeIo(h.cwd);
-  assert.equal(core.loadNodeState(io, "G1").status, "DRAFT");
-  assert.equal(core.loadNodeState(io, "G1").sealAttempts, 1);
-  assert.equal(h.messages.at(-1).triggerTurn, true);
-  assert.match(h.messages.at(-1).content, /seal rejected/);
-  const revised = await h.tool("exitcode_draft", { goal: "g", criteria, revise: "G1" });
-  assert.match(revised.content[0].text, /C1: The feature is done/);
-  assert.match(revised.content[0].text, /C2: Existing behavior is preserved/);
-  assert.equal(core.loadRoot(io, "G1").approval, undefined);
-  assert.equal(await h.events.get("agent_before_settle")({}, h.ctx), undefined);
-  assert.equal((await h.tool("exitcode_seal", { node: "G1" })).isError, true);
-  await h.command("approve");
-  assert.equal(core.loadNodeState(io, "G1").status, "ACTIVE");
-  assert.equal(core.loadNodeState(io, "G1").sealAttempts, 2);
+test("adapter: failed preparation repairs before first user review", async t=>{
+ const h=harness(t);await h.command('Add the feature');const broken=structuredClone(criteria);broken[0].controls.reject[0].setup="printf 'done\n' > feature.txt";
+ const result=await h.tool('exitcode_draft',{goal:'g',criteria:broken});assert.equal(result.isError,true);assert.equal(result.details.review,undefined);assert.equal(core.statusSnapshot(core.makeIo(h.cwd)).awaitingApproval,false);
+ assert.equal((await h.events.get('agent_before_settle')({},h.ctx)).continue,true);
+ const repaired=await h.tool('exitcode_draft',{goal:'g',criteria,revise:'G1'});assert.match(repaired.content[0].text,/Validated plan/);assert.equal(await h.events.get('agent_before_settle')({},h.ctx),undefined);await h.command('approve');assert.equal(core.loadNodeState(core.makeIo(h.cwd),'G1').sealAttempts,1);
 });
 
 test("adapter: plain-English acceptance seals and continues without a command", async (t) => {
@@ -334,7 +287,7 @@ test("adapter: conversational E0 failure requires fresh approval after revision"
   await h.reply(firstReply);
   assert.equal((await h.tool("exitcode_seal", { node: "G1", userApproval: firstReply })).isError, true);
   const io = core.makeIo(h.cwd);
-  assert.equal(core.loadNodeState(io, "G1").sealAttempts, 1);
+  assert.equal(core.loadNodeState(io, "G1").sealAttempts, 0);
   await h.tool("exitcode_draft", { goal: "g", criteria, revise: "G1" });
   assert.equal(core.loadRoot(io, "G1").approval, undefined);
   assert.equal(await h.events.get("agent_before_settle")({}, h.ctx), undefined);
@@ -342,19 +295,12 @@ test("adapter: conversational E0 failure requires fresh approval after revision"
   const newReply = "The revised version looks good.";
   await h.reply(newReply);
   assert.equal((await h.tool("exitcode_seal", { node: "G1", userApproval: newReply })).isError, undefined);
-  assert.equal(core.loadNodeState(io, "G1").sealAttempts, 2);
+  assert.equal(core.loadNodeState(io, "G1").sealAttempts, 1);
   assert.equal(core.loadRoot(io, "G1").approval.userReply, newReply);
 });
 
-test("adapter: conversational acceptance of an already-satisfied root exits mode", async (t) => {
-  const h = harness(t, "done\n");
-  await draft(h);
-  await h.reply("Go ahead.");
-  const result = await h.tool("exitcode_seal", { node: "G1", userApproval: "Go ahead." });
-  assert.equal(result.details.alreadySatisfied, true);
-  assert.equal(core.loadRoot(core.makeIo(h.cwd), "G1").status, "PASS");
-  assert.equal(h.tools.get("exitcode_seal").exposure, "hidden");
-  assert.equal(await h.events.get("agent_before_settle")({}, h.ctx), undefined);
+test("adapter: conversational acceptance needs fresh completion even with passing baseline", async t=>{
+ const h=harness(t,'done\n');await draft(h);await h.reply('Go ahead.');await h.tool('exitcode_seal',{node:'G1',userApproval:'Go ahead.'});assert.equal(core.loadRoot(core.makeIo(h.cwd),'G1').status,'ACTIVE');await h.tool('exitcode_evaluate',{});assert.equal(core.loadRoot(core.makeIo(h.cwd),'G1').status,'PASS');assert.equal(h.tools.get('exitcode_seal').exposure,'hidden');assert.equal(await h.events.get('agent_before_settle')({},h.ctx),undefined);
 });
 
 test("adapter: review instructions distinguish acceptance, changes, and unclear intent", async (t) => {
@@ -368,7 +314,7 @@ test("adapter: review instructions distinguish acceptance, changes, and unclear 
   const seal = h.tools.get("exitcode_seal").description;
   for (const text of ["acceptance, requested changes, or a question", "userApproval quoting the reply",
     "reply requesting changes is not approval, even with assent", "Ask when unclear", "Never infer approval",
-    "root revision after E0 failure needs fresh approval", "Children need no userApproval"]) {
+    "revision after review requires validation and fresh approval", "Children need no userApproval"]) {
     assert.ok(seal.includes(text), text);
   }
   assert.doesNotMatch(core.PROTOCOL_PROMPT, /userApproval/);
@@ -534,6 +480,7 @@ test("adapter: only root PASS automatically restores the execution loadout", asy
   await draft(h);
   assertDiscoveryTools(h, true);
   await h.command("approve");
+  await h.tool("exitcode_evaluate",{});
   assert.equal(core.resolveModeFromBranch(h.entries).on, false);
   assert.deepEqual([...h.getActiveTools()].sort(), [...original].sort());
 });
@@ -580,7 +527,7 @@ test("adapter: discovery clarification and ordinary replies never switch enforce
   assert.match(promptText(h), /Complete all five phases/);
   assertRestricted(h);
   const proposal = await h.tool("exitcode_draft", { goal: "Finish the feature", criteria });
-  assert.equal(proposal.details.draft.originalRequest, "Complete all five phases");
+  assert.equal(core.statusSnapshot(core.makeIo(h.cwd)).originalRequest, "Complete all five phases");
   assert.equal(core.loadRoot(core.makeIo(h.cwd), "G1").approval, undefined);
   assert.equal(await h.events.get("agent_before_settle")({}, h.ctx), undefined);
   assertRestricted(h);
@@ -770,18 +717,10 @@ test("adapter: borrowed read is restored and explicit read exclusion wins", asyn
   }
 });
 
-test("adapter: exhausted E0 proposals remain restricted without another autonomous turn", async (t) => {
-  const h = harness(t);
-  await h.command("Complete the feature");
-  const broken = structuredClone(criteria);
-  broken[0].controls.reject[0].setup = "printf 'done\n' > feature.txt";
-  await h.tool("exitcode_draft", { goal: "Feature", criteria: broken });
-  await h.command("approve");
-  assertRestricted(h);
-  await h.tool("exitcode_draft", { goal: "Feature", criteria: broken, revise: "G1" });
-  await h.command("approve");
-  assert.equal(core.loadRoot(core.makeIo(h.cwd), "G1").status, "BLOCKED");
-  assert.equal(h.messages.at(-1).triggerTurn, false);
-  assertRestricted(h);
-  assert.equal(await h.events.get("agent_before_settle")({}, h.ctx), undefined);
+test("adapter: exhausted evaluator construction remains restricted", async t=>{
+ const h=harness(t);await h.command('Add feature');const broken=structuredClone(criteria);broken[0].controls.reject[0].setup="printf 'done\n' > feature.txt";
+ await h.tool('exitcode_draft',{goal:'g',criteria:broken,policy:{evaluatorAttempts:2}});
+ await h.tool('exitcode_draft',{goal:'g',criteria:broken,revise:'G1'});
+ await h.tool('exitcode_draft',{goal:'g',criteria:broken,revise:'G1'});
+ assert.equal(core.loadRoot(core.makeIo(h.cwd),'G1').status,'BLOCKED');assertRestricted(h);assert.equal(await h.events.get('agent_before_settle')({},h.ctx),undefined);assert.equal(core.resolveModeFromBranch(h.entries).on,true);
 });

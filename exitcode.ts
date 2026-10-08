@@ -30,23 +30,31 @@ const ExpectSchema = Type.Object({
 });
 
 const CheckSchema = Type.Object({
-  command: Type.String({ description: "Shell command that observes the candidate" }),
+  command: Type.Optional(Type.String({ description: "Isolated custom shell escape hatch" })),
+  recipe: Type.Optional(Type.Object({
+    kind: Type.Union(core.RECIPE_KINDS.map((x: string) => Type.Literal(x))),
+    path: Type.Optional(Type.String()), value: Type.Optional(Type.Unknown()),
+    pointer: Type.Optional(Type.String()), selector: Type.Optional(Type.String()),
+    runner: Type.Optional(Type.String()), command: Type.Optional(Type.String()),
+    args: Type.Optional(Type.Array(Type.String())),
+  })),
   timeoutSeconds: Type.Optional(Type.Number({ description: "Per-check timeout (defaults to policy)" })),
   expect: Type.Optional(ExpectSchema),
 });
 
-const ControlsSchema = Type.Object({
-  accept: Type.Object({
-    setup: Type.String({ minLength: 1, description: "Shell setup in a temporary candidate copy; must exit 0, then check.command must PASS" }),
-  }),
-  reject: Type.Array(
-    Type.Object({
-      setup: Type.String({ minLength: 1, description: "Shell setup in a fresh temporary candidate copy; must exit 0, then check.command must FAIL (not ERROR)" }),
-      reason: Type.Optional(Type.String({ description: "What defect this control represents" })),
-    }),
-    { minItems: 1, description: "At least one known-invalid candidate fixture" },
-  ),
+const MutationSchema = Type.Object({
+  kind: Type.Union(core.MUTATION_KINDS.map((x: string) => Type.Literal(x))),
+  path: Type.String(), content: Type.Optional(Type.String()), from: Type.Optional(Type.String()),
+  to: Type.Optional(Type.String()), pointer: Type.Optional(Type.String()), value: Type.Optional(Type.Unknown()),
 });
+const FixtureSchema = Type.Object({
+  setup: Type.Optional(Type.String({ minLength:1, description:"Isolated legacy/custom shell setup" })),
+  mutations: Type.Optional(Type.Array(MutationSchema, {minItems:1,maxItems:32})),
+  reason: Type.Optional(Type.String()),
+});
+const ControlsSchema = Type.Object({accept:FixtureSchema,reject:Type.Array(FixtureSchema,{minItems:1})});
+const IntentSchema = Type.Array(Type.Object({id:Type.String(),outcome:Type.String(),criteria:Type.Array(Type.String())}));
+const AmbiguitySchema = Type.Array(Type.Object({question:Type.String(),plausibleAnswers:Type.Array(Type.String()),recommendedDefault:Type.Optional(Type.String()),whyMaterial:Type.String(),affectedCriteria:Type.Array(Type.String()),confidence:Type.Optional(Type.Number()),unresolved:Type.Boolean()}));
 
 const CriterionSchema = Type.Object({
   id: Type.Optional(Type.String({ description: "Suggested id (supervisor assigns C1..Cn when omitted)" })),
@@ -57,6 +65,7 @@ const CriterionSchema = Type.Object({
 });
 
 const PolicySchema = Type.Object({
+  evaluatorAttempts: Type.Optional(Type.Number({description:"Separate evaluator construction budget (default 6)"})),
   localRepairs: Type.Optional(Type.Number({ description: "Local repair attempts before ordinary child decomposition is permitted (default 2)" })),
   maxDepth: Type.Optional(Type.Number({ description: "Recursion depth below the root (default 3)" })),
   maxTotalAttempts: Type.Optional(Type.Number({ description: "Implementation attempts across the tree (default 12)" })),
@@ -295,12 +304,14 @@ export default function (pi: ExtensionAPI) {
         "The same check must PASS the valid fixture and FAIL every invalid fixture, not ERROR. Do not change the real candidate while validating the evaluator. " +
         "Policy corrections are allowed only before first approval or evaluator work; omitted fields retain their effective values. " +
         "Never replace the user's objective with extension housekeeping or a commit reminder. " +
-        "Validates structure only. Present the returned root review and STOP for user review before sealing or implementation.",
+        "Safely prepares and validates before returning review. Repair typed failures internally. Present a validated plan and STOP for user review before sealing or implementation.",
       promptSnippet: "exitcode_draft: propose the root contract (goal + criteria + checks + controls)",
       parameters: Type.Object({
         goal: Type.String({ description: "Goal statement" }),
         originalRequest: Type.Optional(Type.String({ description: "Fallback request only; the /exitcode goal and existing root request take priority" })),
         criteria: Type.Array(CriterionSchema),
+        intentAtoms: Type.Optional(IntentSchema),
+        ambiguities: Type.Optional(AmbiguitySchema),
         policy: Type.Optional(PolicySchema),
         assumptions: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { description: "Resolved product assumptions to show in user review" })),
         exclusions: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { description: "Out-of-scope work to show in user review" })),
@@ -318,6 +329,8 @@ export default function (pi: ExtensionAPI) {
           goal: params.goal,
           originalRequest: rt.pendingGoal ?? params.originalRequest,
           criteria: params.criteria,
+          intentAtoms: params.intentAtoms,
+          ambiguities: params.ambiguities,
           policy: params.policy,
           assumptions: params.assumptions,
           exclusions: params.exclusions,
@@ -329,21 +342,21 @@ export default function (pi: ExtensionAPI) {
         rt.pendingGoal = undefined;
         persistMode();
         syncDiscoveryTools(ctx);
-        return textResult(
-          withWarnings([`draft ${result.id} accepted.`, result.review, `next: ${result.next}`], result.warnings).join("\n"),
-          result,
-        );
+        const prepared = await core.prepareNode(io,result.id);
+        syncDiscoveryTools(ctx);
+        if (!prepared.ok) return textResult(`Evaluator preparation needs repair:\n${errLines(prepared)}${prepared.questions?.length ? '\nClarification: '+JSON.stringify(prepared.questions) : ''}`,prepared,true);
+        return textResult(prepared.review,prepared);
       },
     },
     {
       name: "exitcode_seal",
       label: "Exitcode Seal",
       description:
-        "Run E0: validate structure, test discrimination and empty-target rejection, record the baseline, then seal. " +
+        "Seal the exact safely prepared evaluator bundle. Stale candidate or environment requires preparation and review again. " +
         "For an unapproved root, interpret the user's reply to the current review: acceptance, requested changes, or a question. " +
         "On acceptance (for example 'looks good, go ahead'), supply userApproval quoting the reply. /exitcode approve is an optional shortcut. " +
         "A reply requesting changes is not approval, even with assent. Revise and present the complete contract again. Ask when unclear. Never infer approval. " +
-        "Any root revision after E0 failure needs fresh approval. Children need no userApproval. Coding tools unlock after sealing.",
+        "Evaluator failures are repaired before review. A revision after review requires validation and fresh approval. Children need no userApproval. Coding tools unlock after sealing.",
       promptSnippet: "exitcode_seal: validate the evaluator, seal the contract, record the baseline",
       parameters: Type.Object({
         node: Type.String({ description: "Draft node id (e.g. G1, G1.1)" }),
@@ -402,6 +415,8 @@ export default function (pi: ExtensionAPI) {
         goal: Type.String({ description: "Narrower child goal" }),
         originalRequest: Type.Optional(Type.String({ description: "Retained request (defaults to the parent's)" })),
         criteria: Type.Array(CriterionSchema),
+        intentAtoms: Type.Optional(IntentSchema),
+        ambiguities: Type.Optional(AmbiguitySchema),
         reason: Type.String({ description: "How this child advances the parent target" }),
         prerequisite: Type.Optional(Type.Boolean({ description: "True to request decomposition before the local repair threshold; requires prerequisiteArtifact" })),
         prerequisiteArtifact: Type.Optional(Type.String({ description: "Observable artifact the prerequisite produces" })),
@@ -417,6 +432,8 @@ export default function (pi: ExtensionAPI) {
           goal: params.goal,
           originalRequest: params.originalRequest,
           criteria: params.criteria,
+          intentAtoms: params.intentAtoms,
+          ambiguities: params.ambiguities,
           reason: params.reason,
           prerequisite: params.prerequisite,
           prerequisiteArtifact: params.prerequisiteArtifact,
@@ -496,6 +513,7 @@ export default function (pi: ExtensionAPI) {
       restoreDiscoveryTools();
       restoreExecutionTools();
     }
+    core.resumePreparation(core.makeIo(ctx.cwd));
     applyExposure();
     syncDiscoveryTools(ctx);
   });
@@ -558,6 +576,7 @@ export default function (pi: ExtensionAPI) {
     const leafId = stack[stack.length - 1];
     const leafStatus = (snap.nodes as any)?.[leafId]?.status;
     if (leafStatus !== "ACTIVE" && leafStatus !== "DRAFT") return undefined;
+    if (snap.phase === "CLARIFICATION") return undefined;
     // The human checkpoint is a review pause, not autonomous work.
     if (snap.awaitingApproval) return undefined;
     if (snap.expired) {

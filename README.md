@@ -1,239 +1,274 @@
-<div align="center">
+# ExitCode
 
-# exitcode
+ExitCode keeps long-running coding agents tied to a fixed definition of done.
+It validates acceptance checks before asking you to approve the plan.
+It then enforces that exact plan through fresh evaluation, bounded repair, and focused recursion.
 
-**A lean, long-running harness loop that stays on goal.**
+## Workflow
 
-[Why ExitCode](#why-exitcode) &bull; [Focused recursion](#keep-the-goal-fixed-and-the-work-focused) &bull;
-[Usage](#usage) &bull; [Guards](#what-keeps-the-loop-on-track) &bull; [Limits](#limits)
+```text
+Request -> Discovery -> optional Clarification -> EVALUATOR_PREPARATION
+        -> READY_FOR_APPROVAL -> Approval -> Seal -> Execution
+        -> fresh Evaluation -> Repair or child -> fresh root PASS
+```
 
-</div>
+1. Inspect the request, implementation, tests, and likely regressions.
+2. Declare materially distinct request outcomes and map them to observable criteria.
+3. Construct recipes and positive/negative fixture mutations.
+4. Prepare the evaluator inside independent candidate copies.
+5. Repair typed evaluator failures before asking for approval.
+6. Present the validated goal, criteria, assumptions, exclusions, and verification summary.
+7. Approve the exact validated plan or request changes.
+8. Implement and evaluate all sealed criteria fresh.
 
----
+Mechanical evaluator failures do not request another approval.
+A requested plan change requires preparation and review again.
+Preparation never approves, seals, changes the real candidate, or consumes implementation attempts.
+A passing baseline does not complete the goal.
+Only fresh supervisor evaluation can close it.
 
-ExitCode is a long-running harness loop for coding agents, implemented today as a Pi extension.
-It's intentionally lean adding only two anchors:
-**immutable acceptance contracts keep the destination fixed; recursive inner loops keep the
-next piece of work focused.**
-The loop works toward the approved goal until its checks pass or it reports a concrete blocker.
-
-## Why ExitCode
-
-Keeping an agent running is only half the problem.
-Over a long task, it can follow tangents, mistake activity for progress, or finish something
-other than what you asked for.
-More iterations do not help if the definition of done keeps moving.
-
-A Ralph-style "keep trying" loop is an appealing starting point because it stays out of the
-agent's way.
-ExitCode aims for that same light touch, but adds enough structure to keep repeated work tied
-to the original goal.
-It does not prescribe a separate planner, worker team, model, or tool stack.
-The aim is to work with the harness configuration you already use, not replace it with a fixed
-planning and execution system.
-The current integration supports Pi; this is not a claim of compatibility with every harness
-or custom tool.
-
-The added structure has three jobs:
-
-- **Keep the destination fixed.** You review an acceptance contract before implementation.
-  Once sealed, the agent cannot revise it to fit whatever it built.
-- **Keep the work focused.** When local repairs stall, one smaller child tackles a failing
-  parent requirement through the same loop.
-- **Keep completion grounded.** The supervisor runs the contract's checks fresh.
-  A completion message or a finished subtask is not enough.
-
-**Lean about how the agent works. Strict about what counts as done.**
-
-## Keep the goal fixed and the work focused
-
-The outer loop holds the approved goal and its acceptance contract.
-The inner loop works on the smallest useful next step without changing that destination.
-
-1. Inspect the project and draft observable acceptance criteria with executable checks.
-2. Review the root contract with the user.
-3. Validate the evaluator and seal the contract before implementation starts.
-4. Implement, evaluate, and repair within the run's budget.
-5. If a smaller unit is needed, run the same protocol for one child tied to a failing criterion.
-6. Rerun the parent after the child passes.
-
-For password reset, the parent might require expired tokens to leave passwords unchanged.
-A child can focus on storing and comparing token timestamps.
-Passing that child's checks does not prove the end-to-end reset flow rejects expired tokens.
-The parent evaluator still has to pass on the integrated code.
-
-**A child PASS closes the child. Only a fresh parent PASS closes the parent.**
-
-This is how recursion aims to help larger tasks: narrow the active problem without losing the
-larger goal's requirements.
-The agent can change its approach, but not the definition of success.
-Ancestor checks and checkpoints protect previously accepted progress as the work moves forward.
-
-Children need no separate user approval because they stay within the approved root contract.
-Each child targets one currently failing parent criterion and validates its own evaluator.
-Only one child is active at a time.
-Depth, attempts, and time are shared across the tree rather than reset for each child.
+The normal path needs one approval and no clarification turn.
+Ask a question only when there are multiple credible interpretations, a material effect on acceptance or compatibility, and no resolved repository convention or default.
+Group at most three questions and include the recommended default.
+A material unresolved question pauses the run in CLARIFICATION.
+READY_FOR_APPROVAL pauses automatic continuation and keeps coding tools locked.
+Silence and requests for changes are not approval.
 
 ## Usage
 
 ```bash
-pi --extension ./exitcode.ts
+pi --extension /absolute/path/to/ExitCode/exitcode.ts
 ```
 
-Run this from the repository to load the extension for one Pi invocation.
-To work in another checkout, start Pi there and pass the absolute path to `exitcode.ts`.
-For persistent loading, run `pi install .` from this repository.
-Requires a compatible [Pi installation](https://pi.dev).
-Pi supplies `typebox` and `@earendil-works/pi-coding-agent`; no separate `npm install` is needed.
+For persistent loading, run `pi install .` in this repository.
+Pi supplies `typebox` and its extension API.
+No production npm dependency is added.
+A compatible Pi installation and Node runtime are required.
 
-Inside Pi:
+**Executable evaluation requires Linux bubblewrap and usable unprivileged namespaces.**
+Install bubblewrap with your system package manager before using executable recipes.
+ExitCode never installs it or falls back to host execution.
+Built-in file and JSON recipes do not need bubblewrap.
+Unavailable isolation is a runner error, not evidence of a detected defect.
 
 ```text
 /exitcode Add password reset via emailed tokens
 ```
 
-The agent inspects the project and presents the original request, goal, requirements,
-assumptions, exclusions, verification approach, effective policy, and remaining time.
-Extension housekeeping and commit reminders do not replace your objective.
-Accept in plain English, such as "looks good, go ahead", or use `/exitcode approve`.
-You can also ask questions or request changes.
-A reply requesting changes does not approve the draft.
-Unclear replies require clarification, not inferred approval.
-
-Acceptance starts evaluator validation and autonomous work.
-If validation requires a revised root contract, you review it again.
-The loop pauses while root review is pending.
-Clarification pauses and reloads preserve discovery mode and the original goal.
-
 | Command | Purpose |
 | --- | --- |
-| `/exitcode approve` | Optional shortcut to approve the exact root draft and start work. |
-| `/exitcode status` | Show the contract, review, results, budgets, and next action. |
-| `/exitcode exit` | User cancellation without completing the goal or deleting contracts. |
-| `/exitcode resume` | Re-enter the on-disk run, including pending review. |
+| `/exitcode approve` | Approve and seal the exact validated plan. |
+| `/exitcode status` | Show policy, original request, commands, digests, evidence, metrics, and next action. |
+| `/exitcode exit` | Cancel enforcement without claiming success or deleting work. |
+| `/exitcode resume` | Resume on-disk work or a pending review. |
 
-While active, ExitCode adds six `exitcode_*` tools and a protocol prompt section to Pi.
-Only a fresh root PASS exits mode automatically.
-BLOCKED stops autonomous work but keeps enforcement on until you cancel.
-Outside mode, its tools are hidden and unreachable, it adds no protocol, and it blocks no calls.
-Contracts and state live under `<project>/.exitcode/`.
-Leaving or resuming mode does not reset the budget.
-Legacy unsealed root drafts must be revised and approved before use.
+Plain-English approval also works.
+The agent quotes your acceptance when calling `exitcode_seal`.
+The supervisor binds it to the prepared bundle, policy, and original clock.
+It does not authenticate the origin or semantic meaning of that quote.
 
-## What keeps the loop on track
+The adapter exposes six tools only during ExitCode mode.
+`exitcode_draft` automatically prepares root proposals and returns either typed repair diagnostics or a validated review.
+`exitcode_seal` seals a reviewed bundle without rerunning preparation.
+Stale candidate, environment, or evaluator evidence requires preparation and approval again.
+`exitcode_evaluate` runs sealed checks fresh.
+`exitcode_child` proposes one reduction of a failed parent criterion.
+`exitcode_block` reports a concrete blocker.
+`exitcode_status` exposes detailed mechanics.
+Only root PASS automatically exits mode.
+BLOCKED keeps enforcement on until user cancellation.
 
-The contract is the anchor, but it must be worth trusting.
-**Evaluator first means validating the definition of success before using it to judge code.**
-Human review checks intent.
-The fixed supervisor gate, E0, checks the evaluator.
-The sealed task checks then judge the implementation.
-These are different responsibilities, not an endless recursion of evaluators.
+## Recipes and discovery
 
-- **Review before implementation.** Approval binds to the exact root draft, including commands
-  and expectations, plus the effective policy, creation time, and shared deadline.
-  The approval digest is separate from the sealed evaluator-bundle digest.
-  Root sealing rejects missing or mismatched approval before E0 runs.
-  Every accepted root revision clears approval and requires a new review.
-- **Show that checks can detect defects.** E0 requires each behavioral check to pass on a
-  known-valid fixture and fail on every supplied known-invalid fixture.
-  It runs the actual check, not a separate command that merely declares a fixture valid.
-  A timeout or runner error does not count as detecting a defect.
-- **Check wiring and baseline.** Every check must reject an empty target.
-  E0 records the current candidate's results and rejects detected candidate mutation before
-  sealing.
-  Mutation rejection does not automatically restore the candidate.
-- **Protect the sealed goal.** Before sealing, only `read`, `grep`, `ls`, and the six ExitCode
-  tools are allowed.
-  Other tools are suspended and denied, including shell, `find`, `context`, `codemode`, custom
-  tools, and direct draft-file writes.
-  Submit contracts through `exitcode_draft` or `exitcode_child`.
-  Sealing restores the execution loadout, but guards still protect `.exitcode/` artifacts.
-  A changed sealed bundle blocks the node instead of redefining success.
-- **Verify progress and completion.** Evaluations run all criteria fresh.
-  Candidate changes make a recorded PASS stale.
-  Regressions trigger checkpoint restoration and reevaluation; the rejected attempt still counts.
-  A passing child reruns its parent rather than closing it by inference.
+The bounded initial recipe set is:
 
-Behavioral fixtures use `controls.accept.setup` and `controls.reject[].setup` to prepare
-independent candidate copies before `check.command` runs.
-Setup success is not the evaluator verdict.
-Copies exclude `.git`, `node_modules`, `.exitcode`, and symlinks.
-Fixtures and checkpoints share an 8 GiB logical-content cap.
-ExitCode checks the total before copying and reports the byte and file counts if it is too large.
-It does not honor `.gitignore`; build outputs and retained evidence remain included.
-Copies use independent copy-on-write files when supported and ordinary copies otherwise.
-Fixtures prefer the project filesystem but stay outside its Git ancestry.
-A permissions boundary falls back to the system temporary directory.
-Large ordinary copies and multiple checkpoints can still require substantial disk space.
-Fixture setup runs after copying, so deleting files in setup cannot fix a cap rejection.
-Provide required dependencies without writable links back to the real candidate.
-Legacy control `command` fields must become `setup` fields in a revised draft.
+| Kind | Parameters | Behavior |
+| --- | --- | --- |
+| `file_exists` | `path` | Require a regular file. |
+| `file_contains` | `path`, `value` | Require a nonempty literal substring. |
+| `file_not_contains` | `path`, `value` | Require a file without the literal substring. |
+| `json_value` | `path`, `pointer`, `value` | Compare a JSON pointer value. |
+| `existing_test` | `path`, `selector` | Run a discovered literal node:test name. |
+| `test_suite` | none | Run the discovered npm test script. |
+| `build_succeeds` | none | Run the discovered npm build script. |
+| `typecheck_succeeds` | none | Run the discovered npm typecheck script. |
+| `command_exit` | `command`, `args` | Run an executable basename and explicit arguments. |
+| `custom_command` | `command` | Run a visibly identified shell escape hatch inside isolation. |
 
-### Bounded, not endless
+Checks use `check.recipe` or legacy `check.command`, never both.
+`check.expect` can fix exit and stdout expectations.
+Discovery reads package scripts, conventional source/test roots, and literal Node test names without executing repository code.
+The capability manifest is content-keyed and cached.
+Dynamic test names are not discovered.
+Selectors must resolve to a discovered literal and execute at least one test.
+The initial script recipes support npm only.
+Missing file/JSON targets fail normally, including negative-content checks.
+Malformed JSON fails normally.
+Unsafe paths and malformed evaluator specs produce diagnostics.
+No HTTP, JSON Schema, or non-Node runner integration is included.
+
+```json
+{
+  "goal": "Finish the feature",
+  "intentAtoms": [
+    {"id": "I1", "outcome": "Feature returns the result", "criteria": ["C1"]},
+    {"id": "I2", "outcome": "Existing artifact remains", "criteria": ["C2"]}
+  ],
+  "criteria": [
+    {
+      "id": "C1",
+      "requirement": "Feature artifact contains the result",
+      "check": {"recipe": {"kind": "file_contains", "path": "result.txt", "value": "done"}},
+      "controls": {
+        "accept": {"mutations": [{"kind": "write_file", "path": "result.txt", "content": "done"}]},
+        "reject": [{"mutations": [{"kind": "write_file", "path": "result.txt", "content": "pending"}]}]
+      }
+    },
+    {
+      "id": "C2", "type": "regression",
+      "requirement": "Existing artifact remains present",
+      "check": {"recipe": {"kind": "file_exists", "path": "result.txt"}}
+    }
+  ]
+}
+```
+
+Fixture operations are `write_file`, `delete_file`, `replace_text`, `copy_fixture`, and `set_json_value`.
+Each fixture allows at most 32 operations.
+Writes are limited to 8 MiB per operation.
+Paths must be relative and cannot cross symlinks or supervisor directories.
+JSON pointer edits reject prototype-related keys.
+`replace_text` must make a change.
+`copy_fixture` copies another regular file within the candidate fixture.
+Legacy `setup` shell commands remain available inside isolation.
+A successful setup does not establish a valid evaluator.
+
+## Evaluator preparation
+
+E0 records seven explicit stages:
+
+1. **Intent:** Audit declared coverage, unknown mappings, duplicate criteria, and material ambiguities.
+2. **Lint:** Compile recipes and validate runners, selectors, confined paths, and external dependencies.
+3. **Discrimination:** Require PASS on the valid fixture and FAIL on every invalid fixture, not ERROR.
+4. **Adversarial:** Add bounded target deletion and incorrect-content mutations where recipes permit them.
+5. **Determinism:** Repeat independent valid fixtures and reject inconsistent outcomes.
+6. **Wiring:** Reject checks that pass against an empty target.
+7. **Baseline:** Record all current-candidate outcomes without completing the goal.
+
+Diagnostics contain `code`, `stage`, `criterionId`, `evidence`, `repairability`, and `recommendedRepair`.
+Examples include INTENT_UNCOVERED, TEST_SELECTOR_NOT_FOUND, REJECT_NOT_DISCRIMINATED, EMPTY_TARGET_PASS, NONDETERMINISTIC, and EXTERNAL_DEPENDENCY.
+Mechanical repair normalizes numeric timeouts and discovered runner selection.
+Other repairs are agent-authored evaluator revisions inside a bounded construction budget.
+The original clock and implementation counters never reset.
+Intent and evaluator digests are separate.
+Approval binds the exact validation evidence and candidate/environment identity as well as the semantic plan.
+
+### Semantic audit rubric
+
+The agent must review each criterion against these questions before submission.
+
+- Does every materially distinct requested outcome have a criterion mapping?
+- Is the requirement observable from user-visible behavior or an actual artifact?
+- Does it duplicate another criterion or merely restate the goal?
+- Is it an implementation preference rather than a required outcome?
+- Is an assumption being presented as a user requirement?
+- Can fixtures detect plausible defects beyond the author's example?
+- Does a repository convention resolve an ambiguity without asking the user?
+
+Declared coverage is mechanically testable.
+The choice and completeness of intent atoms remain judgment-dependent.
+ExitCode does not prove semantic equivalence or exhaustive intent capture.
+Finite adversarial mutations cannot prove the absence of every defect.
+
+## Isolation and preservation
+
+Every default executable probe uses a fail-closed bubblewrap runner.
+This includes custom shell, legacy setup, preparation, completion, and parent reruns.
+The runner exposes system runtime trees and an independent workspace, not host home, credentials, sockets, or the real candidate path.
+It clears inherited environment variables and mounts private `/proc`, `/dev`, and `/tmp`.
+It unshares network, process, IPC, user, and other namespaces, drops capabilities, and creates a new session.
+Each stream is capped at 64 KiB.
+Timeouts kill the runner process group and its private namespace processes.
+Fixtures can be writable for setup and builds but never alias real candidate files.
+Public sandbox commands use a read-only workspace by default.
+
+Snapshots use independent reflinks where supported and ordinary copies otherwise.
+No writable hard links are used.
+The logical candidate cap remains 8 GiB and includes ignored build outputs and retained evidence.
+Dependencies are independent copies for executable fixtures.
+Candidate identities hash full content, file modes, and symlink targets instead of sampling large files.
+Dependency identities participate in evaluator environment invalidation.
+Supervisor directories and Git metadata are not candidate content.
+Commands cannot infer the candidate's Git ancestry from the isolated workspace.
+Large fixtures and dependency copies can still consume substantial disk space.
+
+The extension itself is trusted code running with host permissions.
+Bubblewrap is a boundary for probes, not a claim against a compromised kernel or trusted extension.
+This runner is not a general-purpose hostile-workload service or CPU/memory quota manager.
+Agent coding tools after sealing remain host tools guarded by the existing supervisor protocol.
+
+## Focused recursion and budgets
+
+A child targets exactly one failed parent criterion.
+One child runs at a time.
+Passing a child reruns the parent; it never closes the parent by inference.
+Ancestor regressions trigger restoration and fresh reevaluation.
+Rejected implementation attempts still count.
+Fresh completion and boundary parent reruns bypass all preparation caches.
+Sealed contracts cannot be revised or weakened.
+A changed sealed digest blocks execution.
 
 | Root policy | Default |
 | --- | --- |
-| `localRepairs` | 2 changed-candidate attempts before a child is expected |
+| `localRepairs` | 2 changed-candidate attempts before ordinary decomposition |
 | `maxDepth` | 3 levels below the root |
 | `maxTotalAttempts` | 12 changed-candidate attempts across the tree |
-| `deadlineMinutes` | 60 minutes from root draft creation, including review time |
-| `evalTimeoutSeconds` | 120 seconds per check unless the check overrides it |
+| `deadlineMinutes` | 60 minutes from root creation, including review |
+| `evalTimeoutSeconds` | 120 seconds per executable check |
+| `evaluatorAttempts` | 6 preparation attempts per node |
 
-Policy overrides can be proposed at root creation.
-An initial root draft can correct its policy before first approval or evaluator work.
-Omitted policy fields retain their effective values.
-Every accepted root revision requires a complete fresh review.
-The policy locks permanently at first approval, including during E0 recovery.
-Children inherit that policy and cannot amend it.
-Rejected policy revisions leave the existing draft, approval, and limits unchanged.
+Initial policy corrections are allowed before preparation or approval.
+Preparation locks policy permanently, even when it fails.
+Children inherit effective limits.
+Revisions, reloads, resume, and children never reset time or counters.
+Construction failures use `evaluatorAttempts`, not implementation attempts or user reviews.
+Budget exhaustion reports EVALUATOR_UNBUILDABLE.
 
-The shared deadline still starts at root creation and includes human review time.
-A policy correction recomputes the deadline from that original timestamp.
-Revisions, reloads, resume, and child work never reset elapsed time or counters.
-An expired, never-approved draft can receive a larger policy only while still eligible.
-ExitCode rejects an expired approval before recording approval or running E0.
-Status reports the effective limits and an actionable correction or cancellation path.
-Legacy roots without policy-lock history keep fixed policies.
-Legacy unsealed drafts require a new full review and approval; sealed contracts remain usable.
-Each node gets at most two E0 proposals before becoming BLOCKED.
-Unchanged-candidate evaluations and boundary parent reruns do not consume implementation attempts.
-Early decomposition requires a declared prerequisite with an observable artifact.
-An identical blocked child cannot be retried on unchanged evidence.
+Legacy sealed bundles retain their acceptance contracts and fresh recursive evaluation.
+Unsealed legacy drafts cannot reuse old draft-only approval.
+They must prepare safely and obtain fresh validated-plan approval.
+Legacy shell drafts acquire an explicit criterion coverage map during migration.
+That map does not substitute for the agent's semantic audit.
+Interrupted preparation returns to a locked preparation phase on reload.
 
-## Limits
+## Instrumentation and benchmark
 
-This is a lean v1 workflow supervisor, not a sandbox or a guarantee of autonomous success.
+Status exposes evaluator proposals, preparation attempts, probe/shell executions, fixture counts/bytes, elapsed preparation time, diagnostic categories, review turns, cache hits, and peak concurrency.
+Token usage is explicitly unavailable unless the host supplies it.
+No token reduction claim is made.
 
-- **Long-running still depends on a live Pi session.** The adapter supplies at most three
-  continuation nudges per idle stretch, not an external scheduler.
-  Per-check timeouts are not hard deadlines for every activity or descendant process.
-- **Tool guards are not operating-system isolation.** The pre-seal allowlist denies unknown
-  agent tools, including nested calls.
-  Post-seal shell checks remain best-effort.
-  Guards do not constrain extension-internal execution or supervisor-run check commands.
-  The extension and its commands run with your operating-system permissions.
-- **Immutable contracts are not complete evaluator isolation.** Digest checks protect contract
-  data, not every script or dependency the checks invoke.
-  Fixture copies are not sandboxes; commands can access absolute paths and external services.
-  Candidate digests exclude dependency and supervisor directories and symlinks and sample files
-  larger than 8 MiB.
-- **Approval still trusts the agent.** For plain-English acceptance, the agent quotes your reply
-  when sealing.
-  The supervisor validates the draft and effective limits, not the meaning or origin of the quote.
-  This is not a user-only authorization boundary.
-- **Focus still requires judgment.** The original request is retained and shown in review.
-  ExitCode does not prove that a proposed goal is semantically equivalent to your request.
-  Finite fixtures cannot prove the contract captures all of your intent.
-  Useful child selection remains model-dependent.
-  Recursion uses one session, not isolated child contexts or parallel workers.
-  Scaling benefits are intended, not measured throughput or token savings.
+Run the reproducible benchmark:
 
----
+```bash
+node scripts/benchmark-evaluator.mjs
+./scripts/verify
+```
 
-<div align="center">
+The benchmark reports cold, warm, selective-repair, and fresh-evaluation counts and timings as JSON.
+One content-keyed base snapshot supports independent derivatives.
+At most four probes run concurrently.
+Unchanged built-in recipe evidence is reused during preparation.
+A changed criterion reruns only its affected probes.
+Candidate or environment changes invalidate the base and evidence.
+Reload discards in-memory preparation caches, not approved state or budgets.
+Final evaluation always runs fresh.
+Timing depends on the filesystem and hardware.
+The benchmark demonstrates operation-count savings, not a universal latency percentage.
 
-**Keep the destination fixed. Keep the next step focused.**
+## Remaining limits
 
-[Start a goal](#usage) &bull; [Understand the loop](#keep-the-goal-fixed-and-the-work-focused)
-
-</div>
+Long-running work still requires a live Pi session.
+The adapter sends at most three continuation nudges per idle stretch.
+There is no external scheduler, parallel worker pool, automatic semantic test writer, or universal repair engine.
+Useful criteria, ambiguity selection, and child decomposition remain model-dependent.
+Keep the original objective above extension housekeeping and commit reminders.

@@ -13,7 +13,9 @@
  */
 
 import { createHash, randomUUID } from "node:crypto";
-import { spawn } from "node:child_process";
+export { RECIPE_KINDS, MUTATION_KINDS } from "./exitcode-evaluator.mjs";
+import { sandboxCommand, candidateIdentity, evaluatorEnvironment, normalizeEvaluator, runRecipe, diagnostic, fileDigest, inventory } from "./exitcode-evaluator.mjs";
+import { prepareGate, emptyMetrics, addMetrics, copyCandidate, releasePreparation } from "./exitcode-preparation.mjs";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -28,6 +30,9 @@ export const MODE_ENTRY_TYPE = "exitcode-mode";
 /** Persisted node states. FAIL is a check result, not a node state. */
 export const NodeState = Object.freeze({
   DRAFT: "DRAFT",
+  EVALUATOR_PREPARATION: "EVALUATOR_PREPARATION",
+  READY_FOR_APPROVAL: "READY_FOR_APPROVAL",
+  CLARIFICATION: "CLARIFICATION",
   ACTIVE: "ACTIVE",
   PASS: "PASS",
   BLOCKED: "BLOCKED",
@@ -40,6 +45,7 @@ export const DEFAULT_POLICY = Object.freeze({
   maxTotalAttempts: 12,
   deadlineMinutes: 60,
   evalTimeoutSeconds: 120,
+  evaluatorAttempts: 6,
 });
 
 /** Evaluator-draft proposals (seal attempts) allowed per node. */
@@ -54,7 +60,7 @@ export const MAX_CHECKPOINTS_PER_NODE = 3;
 /** Snapshot size cap (logical bytes of file content, including build artifacts). */
 export const SNAPSHOT_MAX_BYTES = 8 * 1024 * 1024 * 1024;
 
-/** Files larger than this are digested by size + head/tail sample. */
+/** Legacy exported threshold; content hashing no longer samples files. */
 export const LARGE_FILE_BYTES = 8 * 1024 * 1024;
 
 /** Per-stream capture cap for executed checks. */
@@ -82,12 +88,13 @@ export const PROTOCOL_PROMPT = [
   "EXITCODE MODE - FIX SUCCESS / PURSUE SUCCESS / PROVE SUCCESS.",
   "FIX SUCCESS: Inspect the goal, architecture, tests, and likely regressions before implementation.",
   "Resolve known product ambiguity with the user and propose observable acceptance criteria with executable checks.",
-  "Present the complete root contract for review and wait for explicit user approval.",
-  "Any root draft revision requires fresh approval. Review the effective policy and remaining time too.",
+  "Submit recipes, confined fixtures, declared intent outcomes and ambiguity candidates to exitcode_draft. The supervisor safely prepares E0 before returning a validated plan. Repair typed evaluator failures before review; do not ask approval for invalid proposals.",
+  "Present the validated plan and wait for explicit user approval. READY_FOR_APPROVAL pauses autonomous continuation.",
+  "Repair evaluator proposals before review. Revisions after review require fresh validated-plan approval. Policy and remaining time are in status.",
   "Policy can change only before the first approval or evaluator work; revisions never reset elapsed time or counters.",
   "Keep the user's original objective above extension housekeeping and commit reminders. Never replace it with a commit-only goal.",
   `Before sealing, inspect only with ${DISCOVERY_TOOL_NAMES.join(", ")}. Submit contracts through ExitCode tools; all other agent tools are blocked.`,
-  "The supervisor validates the evaluator before sealing the contract.",
+  "The supervisor validates the evaluator before user review. Approval seals that exact validated bundle; stale preparation must be repeated.",
   "The sealed contract is fixed and cannot be weakened.",
   "PURSUE SUCCESS: Implement the approved goal. Use the sealed criteria to measure whether it has been achieved.",
   "Use evaluator failures as repair feedback and preserve previously passing behavior.",
@@ -242,8 +249,9 @@ function validateCheck(check, where, errors) {
     errors.push(`${where}: check must be an object with a command`);
     return;
   }
-  if (!nonEmptyString(check.command)) errors.push(`${where}: check.command must be a nonempty string`);
-  if (check.timeoutSeconds !== undefined && !(typeof check.timeoutSeconds === "number" && check.timeoutSeconds > 0)) {
+  if (!nonEmptyString(check.command) && !isRecord(check.recipe)) errors.push(`${where}: check.command or recipe must be supplied`);
+  if (check.command && check.recipe) errors.push(`${where}: choose command or recipe, not both`);
+  if (check.timeoutSeconds !== undefined && !(Number.isFinite(check.timeoutSeconds) && check.timeoutSeconds > 0)) {
     errors.push(`${where}: check.timeoutSeconds must be a positive number`);
   }
   validateExpect(check.expect, `${where}.check`, errors);
@@ -258,14 +266,14 @@ function validateControls(controls, where, errors, { required }) {
     errors.push(`${where}: controls must be an object`);
     return;
   }
-  if (!isRecord(controls.accept) || !nonEmptyString(controls.accept.setup)) {
+  if (!isRecord(controls.accept) || !(nonEmptyString(controls.accept.setup) || Array.isArray(controls.accept.mutations) && controls.accept.mutations.length > 0)) {
     errors.push(`${where}: controls.accept.setup must be a nonempty string`);
   }
   if (!Array.isArray(controls.reject) || controls.reject.length === 0) {
     errors.push(`${where}: controls.reject must be a nonempty array`);
   } else {
     controls.reject.forEach((entry, i) => {
-      if (!isRecord(entry) || !nonEmptyString(entry.setup)) {
+      if (!isRecord(entry) || !(nonEmptyString(entry.setup) || Array.isArray(entry.mutations) && entry.mutations.length > 0)) {
         errors.push(`${where}: controls.reject[${i}].setup must be a nonempty string`);
       }
     });
@@ -409,62 +417,14 @@ export function tailText(text, maxBytes = 4000) {
 }
 
 // ---------------------------------------------------------------------------
-// Command execution (injectable; default runs locally with a timeout)
+// Command execution (injectable; default is fail-closed bubblewrap isolation)
 // ---------------------------------------------------------------------------
 
 /**
  * Run one shell command. Resolves (never rejects on nonzero exit) to
  * { exit, stdout, stderr, timedOut, error?, durationMs, truncated }.
  */
-export function execCommand(command, { cwd, timeoutMs }) {
-  return new Promise((resolve) => {
-    const started = Date.now();
-    let child;
-    try {
-      child = spawn(command, { cwd, shell: true, stdio: ["ignore", "pipe", "pipe"] });
-    } catch (error) {
-      resolve({ exit: null, stdout: "", stderr: "", timedOut: false, error: String(error?.message ?? error), durationMs: 0 });
-      return;
-    }
-    let stdout = Buffer.alloc(0);
-    let stderr = Buffer.alloc(0);
-    let truncated = false;
-    const append = (buffer, chunk) => {
-      const next = Buffer.concat([buffer, chunk]);
-      if (next.length > EXEC_OUTPUT_MAX_BYTES) {
-        truncated = true;
-        return next.subarray(next.length - EXEC_OUTPUT_MAX_BYTES);
-      }
-      return next;
-    };
-    child.stdout.on("data", (chunk) => {
-      stdout = append(stdout, chunk);
-    });
-    child.stderr.on("data", (chunk) => {
-      stderr = append(stderr, chunk);
-    });
-    let done = false;
-    const finish = (result) => {
-      if (done) return;
-      done = true;
-      clearTimeout(timer);
-      resolve({ ...result, durationMs: Date.now() - started, truncated });
-    };
-    const timer = setTimeout(() => {
-      try {
-        child.kill("SIGKILL");
-      } catch {}
-      finish({ exit: null, stdout: stdout.toString("utf8"), stderr: stderr.toString("utf8"), timedOut: true });
-    }, timeoutMs);
-    timer.unref?.();
-    child.on("error", (error) => {
-      finish({ exit: null, stdout: stdout.toString("utf8"), stderr: stderr.toString("utf8"), timedOut: false, error: String(error?.message ?? error) });
-    });
-    child.on("close", (code) => {
-      finish({ exit: code ?? 0, stdout: stdout.toString("utf8"), stderr: stderr.toString("utf8"), timedOut: false });
-    });
-  });
-}
+export const execCommand = sandboxCommand;
 
 // ---------------------------------------------------------------------------
 // Checks and evaluation
@@ -481,7 +441,9 @@ export async function runCheck(criterion, exec, cwd, defaultTimeoutMs) {
   const timeoutMs = checkTimeoutMs(criterion, defaultTimeoutMs);
   let run;
   try {
-    run = await exec(criterion.check.command, { cwd, timeoutMs });
+    run = criterion.check.recipe
+      ? await runRecipe(criterion.check.recipe, {cwd, timeoutMs, exec})
+      : await exec(criterion.check.command, { cwd, timeoutMs });
   } catch (error) {
     return {
       criterionId: criterion.id,
@@ -554,32 +516,10 @@ function* walkFiles(dir, base = "") {
   }
 }
 
-function hashFile(full, size) {
-  if (size > LARGE_FILE_BYTES) {
-    const fd = fs.openSync(full, "r");
-    try {
-      const head = Buffer.alloc(64 * 1024);
-      const tail = Buffer.alloc(64 * 1024);
-      const headLen = fs.readSync(fd, head, 0, head.length, 0);
-      const tailStart = Math.max(0, size - tail.length);
-      const tailLen = fs.readSync(fd, tail, 0, tail.length, tailStart);
-      return sha256Hex(Buffer.concat([Buffer.from(`large:${size}:`), head.subarray(0, headLen), tail.subarray(0, tailLen)]));
-    } finally {
-      fs.closeSync(fd);
-    }
-  }
-  return sha256Hex(fs.readFileSync(full));
-}
+function hashFile(full) { return fileDigest(full); }
 
-/** Content digest of the working tree (ignores .git, node_modules, .exitcode). */
-export function digestTree(cwd) {
-  const parts = [];
-  for (const { rel, full } of walkFiles(cwd)) {
-    const size = fs.statSync(full).size;
-    parts.push(`${rel}:${size}:${hashFile(full, size)}`);
-  }
-  return sha256Hex(parts.join("\n"));
-}
+/** Full relevant candidate content identity, including modes and symlink targets. */
+export function digestTree(cwd) { return candidateIdentity(cwd); }
 
 export function envIdentity(cwd) {
   const env = { platform: os.platform(), node: process.version };
@@ -603,10 +543,10 @@ export function snapshotTree(cwd, destDir, { maxBytes = SNAPSHOT_MAX_BYTES, writ
     // Check logical size before copying any content, including on non-reflink filesystems.
     const entries = [];
     let totalBytes = 0;
-    for (const { rel, full } of walkFiles(cwd)) {
-      const size = fs.statSync(full).size;
+    for (const { rel, full, link } of inventory(cwd)) {
+      const size = link !== undefined ? 0 : fs.statSync(full).size;
       totalBytes += size;
-      entries.push({ rel, full, size });
+      entries.push({ rel, full, size, link });
     }
     if (totalBytes > maxBytes) {
       fs.rmSync(destDir, { recursive: true, force: true });
@@ -614,13 +554,15 @@ export function snapshotTree(cwd, destDir, { maxBytes = SNAPSHOT_MAX_BYTES, writ
     }
     fs.mkdirSync(destDir, { recursive: true });
     const files = [];
-    for (const { rel, full, size } of entries) {
+    for (const { rel, full, size, link } of entries) {
       const dest = path.join(destDir, rel);
       fs.mkdirSync(path.dirname(dest), { recursive: true });
+      if (link !== undefined) {fs.symlinkSync(link,dest);files.push({path:rel,link,bytes:0});continue;}
       // Reflinks are independent files; Node falls back to a normal copy when unsupported.
       fs.copyFileSync(full, dest, fs.constants.COPYFILE_FICLONE);
+      fs.chmodSync(dest,fs.statSync(full).mode & 0o777);
       if (fs.statSync(dest).size !== size) throw new Error(`file size changed while snapshotting ${rel}`);
-      files.push({ path: rel, bytes: size, sha: hashFile(dest, size) });
+      files.push({ path: rel, bytes: size, sha: hashFile(dest, size), mode: fs.statSync(full).mode & 0o777 });
     }
     const manifest = { version: 1, at: new Date().toISOString(), totalBytes, files };
     if (writeManifest) fs.writeFileSync(path.join(destDir, "manifest.json"), JSON.stringify(manifest, null, 2) + "\n");
@@ -636,7 +578,7 @@ export function restoreTree(cwd, snapDir, manifest) {
   const wanted = new Map((manifest?.files ?? []).map((f) => [f.path, f]));
   const restored = [];
   const removed = [];
-  for (const { rel, full } of walkFiles(cwd)) {
+  for (const { rel, full } of inventory(cwd)) {
     if (!wanted.has(rel)) {
       fs.rmSync(full, { force: true });
       removed.push(rel);
@@ -644,8 +586,15 @@ export function restoreTree(cwd, snapDir, manifest) {
   }
   for (const file of wanted.values()) {
     const dest = path.join(cwd, file.path);
-    fs.mkdirSync(path.dirname(dest), { recursive: true });
+    // Never follow an added symlink when restoring trusted checkpoint bytes.
+    let parent = path.dirname(dest);
+    const parents=[];
+    while(parent!==cwd&&parent.startsWith(cwd+path.sep)){parents.unshift(parent);parent=path.dirname(parent);}
+    for(const dir of parents){try{if(fs.lstatSync(dir).isSymbolicLink())fs.unlinkSync(dir);}catch(e){if(e.code!=="ENOENT")throw e;}fs.mkdirSync(dir,{recursive:true});}
+    try{if(fs.lstatSync(dest).isSymbolicLink())fs.unlinkSync(dest);}catch(e){if(e.code!=="ENOENT")throw e;}
+    if(file.link!==undefined){fs.rmSync(dest,{force:true,recursive:true});fs.symlinkSync(file.link,dest);restored.push(file.path);continue;}
     fs.copyFileSync(path.join(snapDir, file.path), dest, fs.constants.COPYFILE_FICLONE);
+    if(file.mode!==undefined)fs.chmodSync(dest,file.mode);
     restored.push(file.path);
   }
   pruneEmptyDirs(cwd);
@@ -690,7 +639,7 @@ async function runControlProbe(criterion, setup, deps) {
     if (!copy.ok) return { error: copy.reason };
     const prepared = await runCheck(
       { ...criterion, check: { ...criterion.check, command: setup, expect: { exit: 0 } } },
-      deps.exec, fixture, deps.defaultTimeoutMs,
+      (command, opts) => deps.exec(command,{...opts,writable:true}), fixture, deps.defaultTimeoutMs,
     );
     if (prepared.status !== "PASS") {
       return { error: `setup ${prepared.status}: ${prepared.reasons.join("; ")}` };
@@ -861,7 +810,7 @@ export function guardToolCall({ modeOn, leafStatus, cwd, toolName, input }) {
     if (DISCOVERY_TOOL_NAMES.includes(toolName)) return null;
     return {
       block: true,
-      reason: `exitcode: ${toolName} is blocked until the contract is sealed and ACTIVE (state ${leafStatus ?? "NO_CONTRACT"}). Inspect with ${DISCOVERY_TOOL_NAMES.join(", ")}. Use exitcode_draft or exitcode_child to submit contracts and exitcode_status for the required next action. The supervisor runs evaluator probes during sealing.`,
+      reason: `exitcode: ${toolName} is blocked until the contract is sealed and ACTIVE (state ${leafStatus ?? "NO_CONTRACT"}). Inspect with ${DISCOVERY_TOOL_NAMES.join(", ")}. Use exitcode_draft or exitcode_child to submit contracts and exitcode_status for the required next action. The supervisor runs isolated evaluator probes during preparation.`,
     };
   }
 
@@ -1032,6 +981,7 @@ function mergePolicy(overrides, base = DEFAULT_POLICY) {
   for (const [key, value] of Object.entries(overrides)) {
     if (!Object.hasOwn(DEFAULT_POLICY, key)) return { ok: false, error: `unknown policy key ${key}` };
     if (!Number.isFinite(value) || !(value > 0)) return { ok: false, error: `policy.${key} must be a positive finite number` };
+    if (["evaluatorAttempts", "maxTotalAttempts", "maxDepth", "localRepairs"].includes(key) && !Number.isInteger(value)) return {ok:false,error:`policy.${key} must be an integer`};
     policy[key] = value;
   }
   return { ok: true, policy };
@@ -1050,7 +1000,7 @@ function policyEditable(root, node) {
 /** Bind separately stored effective limits and the original clock to review. */
 function rootReviewDigest(root, draft) {
   return sha256Hex(stableStringify({ draft, policy: root.policy,
-    createdAt: root.createdAt, deadlineAt: root.deadlineAt }));
+    createdAt: root.createdAt, deadlineAt: root.deadlineAt, validatedBundleDigest: root.validatedBundleDigest }));
 }
 
 function policyStatus(root, node, nowMs) {
@@ -1098,7 +1048,7 @@ export function draftNode(io, args) {
   if (!nonEmptyString(goal)) return { ok: false, errors: ["goal must be a nonempty string"] };
   if (!Array.isArray(criteria) || criteria.length === 0) return { ok: false, errors: ["criteria must be a nonempty array"] };
   if (args.revise) return reviseDraft(io, index, args);
-  const withIds = assignCriterionIds(criteria);
+  const withIds = normalizeEvaluator({criteria:assignCriterionIds(criteria)},args.policy?.evalTimeoutSeconds??DEFAULT_POLICY.evalTimeoutSeconds).draft.criteria;
 
   if (args.parentId) {
     if (args.policy !== undefined) return { ok: false, errors: ["children inherit the root policy and cannot override it"] };
@@ -1136,6 +1086,8 @@ export function draftNode(io, args) {
       originalRequest: nonEmptyString(originalRequest) ? originalRequest.trim() : parentBundle.contract.originalRequest,
       parent: { id: args.parentId, targets: [args.target] },
       criteria: withIds,
+    ...(args.intentAtoms !== undefined ? {intentAtoms: args.intentAtoms} : {}),
+    ...(args.ambiguities !== undefined ? {ambiguities: args.ambiguities} : {}),
     };
     const validation = validateStructure(draft, {
       parent: parentBundle,
@@ -1157,6 +1109,8 @@ export function draftNode(io, args) {
       prerequisiteArtifact: args.prerequisiteArtifact?.trim(),
       depth: depthOf(id),
       status: NodeState.DRAFT,
+      phase: "EVALUATOR_PREPARATION",
+      evaluatorMetrics: {...emptyMetrics(), evaluatorProposals:1},
       attempts: 0,
       sealAttempts: 0,
       lastResult: null,
@@ -1199,6 +1153,8 @@ export function draftNode(io, args) {
     originalRequest: nonEmptyString(originalRequest) ? originalRequest.trim() : goal.trim(),
     parent: null,
     criteria: withIds,
+    ...(args.intentAtoms !== undefined ? {intentAtoms: args.intentAtoms} : {}),
+    ...(args.ambiguities !== undefined ? {ambiguities: args.ambiguities} : {}),
     ...(args.assumptions !== undefined ? { assumptions: args.assumptions } : {}),
     ...(args.exclusions !== undefined ? { exclusions: args.exclusions } : {}),
     ...(args.verification !== undefined ? { verification: args.verification } : {}),
@@ -1233,6 +1189,8 @@ export function draftNode(io, args) {
     goalDigest: fingerprintGoal(goal),
     depth: 0,
     status: NodeState.DRAFT,
+      phase: "EVALUATOR_PREPARATION",
+      evaluatorMetrics: {...emptyMetrics(), evaluatorProposals:1},
     attempts: 0,
     sealAttempts: 0,
     lastResult: null,
@@ -1242,7 +1200,7 @@ export function draftNode(io, args) {
   });
   const node = loadNodeState(io, id);
   return { ok: true, id, rootId: id, draft, warnings: [], ...policyStatus(root, node, nowMs),
-    review: rootReviewText(draft, root, nowMs), next: nextAction(root, node, draft, nowMs) };
+    next: nextAction(root, node, draft, nowMs) };
 }
 
 /** Overwrite an existing DRAFT (revision does not consume a seal proposal). */
@@ -1254,7 +1212,7 @@ function reviseDraft(io, index, args) {
   if (!root || node.rootId !== root.id || root.status !== NodeState.ACTIVE) {
     return { ok: false, errors: [`${node.id} does not belong to the active root`] };
   }
-  const withIds = assignCriterionIds(args.criteria);
+  const withIds = normalizeEvaluator({criteria:assignCriterionIds(args.criteria)},root.policy.evalTimeoutSeconds??DEFAULT_POLICY.evalTimeoutSeconds).draft.criteria;
   const previous = readJson(draftFile(io.cwd, node.id))?.draft;
   const warnings = [];
   const nowMs = io.nowMs();
@@ -1303,6 +1261,8 @@ function reviseDraft(io, index, args) {
         : (previous?.originalRequest ?? parentBundle?.contract.originalRequest ?? args.goal.trim()),
       parent: { id: node.parentId, targets: [node.target] },
       criteria: withIds,
+    ...(args.intentAtoms !== undefined ? {intentAtoms: args.intentAtoms} : {}),
+    ...(args.ambiguities !== undefined ? {ambiguities: args.ambiguities} : {}),
     };
     validation = validateStructure(draft, {
       parent: parentBundle,
@@ -1321,26 +1281,33 @@ function reviseDraft(io, index, args) {
       originalRequest: previous?.originalRequest ?? (nonEmptyString(args.originalRequest) ? args.originalRequest.trim() : args.goal.trim()),
       parent: null,
       criteria: withIds,
+    ...(args.intentAtoms !== undefined ? {intentAtoms: args.intentAtoms} : {}),
+    ...(args.ambiguities !== undefined ? {ambiguities: args.ambiguities} : {}),
     };
-    for (const key of ["assumptions", "exclusions", "verification"]) {
+    for (const key of ["assumptions", "exclusions", "verification", "intentAtoms", "ambiguities"]) {
       const value = args[key] !== undefined ? args[key] : previous?.[key];
       if (value !== undefined) draft[key] = value;
     }
     validation = validateStructure(draft, { policy: effectivePolicy });
   }
   if (!validation.ok) return { ok: false, errors: validation.errors };
+  node.phase = "EVALUATOR_PREPARATION";
+  delete node.prepared;
+  node.evaluatorMetrics ??= emptyMetrics();
+  node.evaluatorMetrics.evaluatorProposals++;
+  saveNodeState(io,node);
   writeJsonAtomic(draftFile(io.cwd, node.id), { draft });
   if (!node.parentId) {
     root.policy = effectivePolicy;
     root.deadlineAt = effectiveDeadline;
     root.policyLocked = !editable;
     delete root.approval;
+    delete root.validatedBundleDigest;
     root.reviewDigest = rootReviewDigest(root, draft);
     saveRoot(io, root);
   }
   return { ok: true, id: node.id, rootId: root.id, revised: true, draft, warnings,
     ...policyStatus(root, node, nowMs),
-    ...(!node.parentId ? { review: rootReviewText(draft, root, nowMs) } : {}),
     next: nextAction(root, node, draft, nowMs) };
 }
 
@@ -1373,6 +1340,8 @@ export function approveRoot(io, { userReply } = {}) {
   if (!root || root.status !== NodeState.ACTIVE || node?.status !== NodeState.DRAFT) {
     return { ok: false, errors: ["no DRAFT root to approve"] };
   }
+  if (isExpired(root,io.nowMs())) return expiredDraftResult(root,node,readJson(draftFile(io.cwd,root.id))?.draft,io.nowMs());
+  if (node.phase !== "READY_FOR_APPROVAL" || !preparationMatches(io, node)) return {ok:false, errors:["root evaluator must be prepared and validated before approval; candidate or environment may have changed"]};
   const draft = readJson(draftFile(io.cwd, root.id))?.draft;
   if (!draft) return { ok: false, errors: [`draft for ${root.id} is missing`] };
   if (root.reviewDigest !== rootReviewDigest(root, draft)) {
@@ -1391,32 +1360,73 @@ export function approveRoot(io, { userReply } = {}) {
 
 /** Human acceptance layer; executable checks stay in the same draft. */
 export function rootReviewText(draft, root, nowMs = Date.now()) {
-  const expired = isExpired(root, nowMs);
-  const lines = [expired ? "Root verification contract unavailable: shared deadline expired." : "Root verification contract ready.",
-    "", "Original user request", draft.originalRequest, "", "Goal", draft.goal, "", "I will consider this complete when:"];
+  if (isExpired(root, nowMs)) return "Validated plan unavailable: shared deadline expired.";
+  const lines = ["Validated plan", "", "Goal", draft.goal, "", "Success means"];
   for (const criterion of draft.criteria) lines.push(`${criterion.id}: ${criterion.requirement}`);
   for (const key of ["assumptions", "exclusions"]) {
     lines.push("", key === "assumptions" ? "Assumptions" : "Exclusions");
-    lines.push(...(draft[key]?.length ? draft[key].map((entry) => `- ${entry}`) : ["- None stated."]));
+    lines.push(...(draft[key]?.length ? draft[key].map(x=>`- ${x}`) : ["- None stated."]));
   }
-  lines.push("", "Verification", draft.verification ??
-    "Each criterion has an executable check. Behavioral checks must pass valid fixtures, reject invalid fixtures, and reject an empty target. Regression checks must continue to pass.",
-    "", "Effective root policy",
-    ...Object.entries(root.policy).map(([key, value]) => `${key}: ${value}`),
-    `Shared deadline: ${new Date(root.deadlineAt).toISOString()} (from root creation, including review time).`,
-    `Remaining time: ${Math.max(0, (root.deadlineAt - nowMs) / 60000).toFixed(2)} minutes${expired ? " (EXPIRED)" : ""}.`,
-    root.policyLocked === false
-      ? "Policy may change only while this is an initial, never-approved draft with no evaluator work."
-      : "Policy is locked for this run.",
-    "Policy locks at first approval or evaluator work. Revisions never reset elapsed time or counters.");
-  lines.push("", ...(expired
-    ? ["Do not approve an expired contract. Amend an eligible initial policy and review again, or cancel with /exitcode exit and start a fresh root."]
-    : ["Reply in plain English to accept (for example 'looks good, go ahead') or request changes. Cancel with /exitcode exit."]),
-    "The agent interprets your reply; /exitcode approve is an optional shortcut.",
-    "Approval freezes this exact root draft, effective policy, and shared deadline. Any revision requires fresh approval.",
-    "After approval, ExitCode runs E0 and works autonomously until the root passes or reaches a blocker.",
-    "Children need no separate approval and cannot weaken the approved root criteria.");
+  lines.push("", "Verification", draft.verification ?? "Validated positive, negative, empty-target, repeatability and baseline checks. Finite fixtures do not prove semantic equivalence.",
+    "", "Approve this plan, or tell me what to change. /exitcode status shows policy and evaluator evidence. /exitcode exit cancels.");
   return lines.join("\n");
+}
+
+function intentDigestOf(draft) {
+  return sha256Hex(stableStringify({goal:draft.goal,originalRequest:draft.originalRequest,criteria:draft.criteria.map(c=>({id:c.id,requirement:c.requirement,type:c.type??'behavior'})),assumptions:draft.assumptions,exclusions:draft.exclusions,intentAtoms:draft.intentAtoms,ambiguities:draft.ambiguities}));
+}
+function evaluatorDigestOf(draft) { return sha256Hex(stableStringify(draft.criteria.map(c=>({id:c.id,check:c.check,controls:c.controls})))); }
+function preparationMatches(io,node) {
+  const draft=readJson(draftFile(io.cwd,node.id))?.draft,p=node.prepared;
+  const root=loadRoot(io,node.rootId);
+  return Boolean(p && draft && (node.parentId ? node.preparedDigest : root.validatedBundleDigest)===sha256Hex(stableStringify(p)) && p.draftDigest===sha256Hex(stableStringify(draft)) && p.candidateDigest===digestTree(io.cwd) && stableStringify(p.environment)===stableStringify(evaluatorEnvironment(io.cwd)));
+}
+
+/** Safe evaluator preparation is separate from human approval and execution. */
+export async function prepareNode(io, nodeId = null) {
+  const index=loadIndex(io.cwd),root=index.activeRootId?loadRoot(io,index.activeRootId):null;
+  const node=root?loadNodeState(io,nodeId??leafOf(root)):null;
+  if(!root||!node||node.rootId!==root.id||node.status!==NodeState.DRAFT)return {ok:false,errors:["no editable DRAFT evaluator"]};
+  const stored=readJson(draftFile(io.cwd,node.id));if(!stored?.draft)return {ok:false,errors:["missing draft"]};
+  if(isExpired(root,io.nowMs()))return expiredDraftResult(root,node,stored.draft,io.nowMs());
+  if(node.preparing)return {ok:false,errors:["evaluator preparation already in progress"]};
+  node.evaluatorMetrics??=emptyMetrics();
+  if(node.evaluatorMetrics.e0Attempts >= (root.policy.evaluatorAttempts??DEFAULT_POLICY.evaluatorAttempts))return blockNode(io,node.id,{reason:"evaluator preparation budget exhausted",code:"EVALUATOR_UNBUILDABLE"});
+  const normalized=normalizeEvaluator(stored.draft,root.policy.evalTimeoutSeconds??DEFAULT_POLICY.evalTimeoutSeconds);
+  let draft=normalized.draft;
+  const repairs=normalized.repairs;
+  // Legacy shell drafts have no coverage map. Make migration explicit in evidence.
+  if(!draft.intentAtoms && (node.parentId || draft.criteria.every(c=>c.check.command))){
+    draft.intentAtoms=draft.criteria.map(c=>({id:`legacy-${c.id}`,outcome:c.requirement,criteria:[c.id]}));
+    repairs.push({repair:"Migrated legacy declared coverage; semantic audit remains the agent's responsibility"});
+  }
+  writeJsonAtomic(draftFile(io.cwd,node.id),{draft});
+  root.policyLocked=true;if(!node.parentId){delete root.approval;delete root.validatedBundleDigest;root.reviewDigest=rootReviewDigest(root,draft);}saveRoot(io,root);
+  node.phase="EVALUATOR_PREPARATION";node.preparing=true;node.evaluatorMetrics.e0Attempts++;delete node.prepared;saveNodeState(io,node);
+  const draftDigest=sha256Hex(stableStringify(draft)), reviewDigest=root.reviewDigest, environment=evaluatorEnvironment(io.cwd);let result;
+  try{
+    const parentBundle=node.parentId?loadBundle(io,node.parentId):null;
+    const validation=validateStructure(draft,{policy:root.policy,parent:parentBundle,parentDepth:node.parentId?depthOf(node.parentId):-1,parentLastResult:node.parentId?loadNodeState(io,node.parentId)?.lastResult:null});
+    if(!validation.ok)result={ok:false,errors:validation.errors,diagnostics:validation.errors.map(e=>diagnostic('INVALID_STRUCTURE','lint',null,e,'Correct evaluator structure')),stages:[],metrics:{...emptyMetrics(),e0Attempts:1}};
+    else result=await prepareGate(draft,{cwd:io.cwd,exec:io.exec,runCheck,defaultTimeoutMs:defaultTimeoutMs(root),environment,maxBytes:SNAPSHOT_MAX_BYTES,candidateDigest:digestTree(io.cwd)});
+  }catch(e){result={ok:false,errors:[e.message],diagnostics:[diagnostic('PREPARATION_FAILED','baseline',null,e.message,'Correct evaluator inputs')],stages:[],metrics:{...emptyMetrics(),e0Attempts:1}};}
+  if(result.ok && stableStringify(environment)!==stableStringify(evaluatorEnvironment(io.cwd))){result.ok=false;result.diagnostics.push(diagnostic('ENVIRONMENT_CHANGED','baseline',node.id,'Environment changed during preparation','Reprepare against a stable environment'));result.errors.push('Environment changed during preparation');}
+  if(result.ok && isExpired(root,io.nowMs())){result.ok=false;result.diagnostics.push(diagnostic('DEADLINE_EXCEEDED','baseline',node.id,'Deadline elapsed during preparation','Cancel and start a new run'));result.errors.push('shared deadline exceeded');}
+  const current=loadNodeState(io,node.id),currentRoot=loadRoot(io,root.id),currentDraft=readJson(draftFile(io.cwd,node.id))?.draft;
+  if(currentRoot.status!==NodeState.ACTIVE||currentRoot.reviewDigest!==reviewDigest||(!node.parentId && rootReviewDigest(currentRoot,currentDraft)!==reviewDigest)||current.status!==NodeState.DRAFT||sha256Hex(stableStringify(currentDraft))!==draftDigest){
+    delete current.preparing;saveNodeState(io,current);
+    return {ok:false,errors:["contract changed during preparation"],diagnostics:[diagnostic('CONTRACT_CHANGED','baseline',node.id,'Concurrent revision','Reprepare current draft')]};
+  }
+  delete current.preparing;addMetrics(current.evaluatorMetrics,{...result.metrics,e0Attempts:0});current.diagnostics=result.diagnostics;current.repairs=repairs;
+  if(result.ok && !isExpired(currentRoot,io.nowMs())){
+    current.phase="READY_FOR_APPROVAL";
+    current.prepared={draftDigest,candidateDigest:digestTree(io.cwd),environment:evaluatorEnvironment(io.cwd),intentDigest:intentDigestOf(draft),evaluatorDigest:evaluatorDigestOf(draft),stages:result.stages,baseline:result.baseline,capabilities:result.capabilities};
+    if(!node.parentId){currentRoot.validatedBundleDigest=sha256Hex(stableStringify(current.prepared));currentRoot.reviewDigest=rootReviewDigest(currentRoot,draft);saveRoot(io,currentRoot);}
+    current.preparedDigest=sha256Hex(stableStringify(current.prepared));
+    if(!node.parentId){current.evaluatorMetrics.reviewTurns++;result.review=rootReviewText(draft,currentRoot,io.nowMs());}
+  }else current.phase=result.questions?.length?"CLARIFICATION":"EVALUATOR_PREPARATION";
+  saveNodeState(io,current);
+  return {...result,id:node.id,phase:current.phase,repairs,next:nextAction(currentRoot,current,draft,io.nowMs())};
 }
 
 // --- seal ----------------------------------------------------------------
@@ -1449,92 +1459,39 @@ export async function sealNode(io, nodeId, { userApproval } = {}) {
     };
   }
 
-  const nowMs = io.nowMs();
-  if (isExpired(root, nowMs)) {
-    return blockNode(io, nodeId, { reason: "shared deadline exceeded during drafting", code: "BUDGET_EXHAUSTED" });
+  if (isExpired(root,io.nowMs())) return blockNode(io,nodeId,{reason:"shared deadline exceeded during drafting",code:"BUDGET_EXHAUSTED"});
+  if (node.parentId && !preparationMatches(io,node)) {
+    const prepared=await prepareNode(io,nodeId);
+    if(!prepared.ok)return prepared;
+    Object.assign(node,loadNodeState(io,nodeId));
   }
-  node.sealAttempts += 1;
-  if (node.sealAttempts > MAX_DRAFT_PROPOSALS) {
-    saveNodeState(io, node);
-    return blockNode(io, nodeId, { reason: `evaluator draft budget exhausted (${MAX_DRAFT_PROPOSALS} proposals)`, code: "EVALUATOR_UNBUILDABLE" });
-  }
-
-  // Persist the E0 proposal before asynchronous probes can overlap a revision.
-  saveNodeState(io, node);
-  let parentBundle = null;
-  let parentResult = null;
-  if (node.parentId) {
-    parentBundle = loadBundle(io, node.parentId);
-    const parentState = loadNodeState(io, node.parentId);
-    parentResult = parentState?.lastResult ?? (parentBundle ? resultFromBaseline(parentBundle) : null);
-  }
-  const validation = validateStructure(draft, {
-    parent: parentBundle,
-    parentDepth: node.parentId ? depthOf(node.parentId) : -1,
-    parentLastResult: parentResult,
-    policy: root.policy,
-  });
-
-  const candidateDigest = digestTree(io.cwd);
-  const wiringDir = fs.mkdtempSync(path.join(os.tmpdir(), `exitcode-wiring-${nodeId.replace(/\./g, "_")}-`));
-  let gate;
-  try {
-    gate = await runGate(draft, validation, {
-      exec: io.exec,
-      cwd: io.cwd,
-      wiringDir,
-      candidateDigest,
-      env: envIdentity(io.cwd),
-      defaultTimeoutMs: defaultTimeoutMs(root),
-    });
-  } finally {
-    fs.rmSync(wiringDir, { recursive: true, force: true });
-  }
-
-  if (!node.parentId) {
-    const currentRoot = loadRoot(io, root.id);
-    const currentDraft = readJson(draftFile(io.cwd, nodeId))?.draft;
-    if (currentRoot?.status !== NodeState.ACTIVE || currentRoot.reviewDigest !== root.reviewDigest ||
-        loadNodeState(io, nodeId)?.status !== NodeState.DRAFT ||
-        !approvalMatches(currentRoot, draft) || !approvalMatches(currentRoot, currentDraft)) {
-      return { ok: false, errors: ["root contract or approval changed during E0; review and approve again"],
-        next: "revise with exitcode_draft and wait for the user to accept or request revisions" };
-    }
-  }
-
-  if (!gate.ok) {
-    saveNodeState(io, node);
-    const left = MAX_DRAFT_PROPOSALS - node.sealAttempts;
-    if (left <= 0) {
-      return blockNode(io, nodeId, { reason: `no valid evaluator after ${MAX_DRAFT_PROPOSALS} proposals: ${gate.errors.join("; ")}`, code: "EVALUATOR_UNBUILDABLE" });
-    }
-    const tool = node.parentId ? "exitcode_child" : "exitcode_draft";
-    return { ok: false, errors: gate.errors, sealAttemptsLeft: left, next: `revise with ${tool} (revise:"${nodeId}") then ${node.parentId ? "exitcode_seal" : "present the entire contract and wait for the user to accept or request revisions"}` };
-  }
-
-  writeJsonAtomic(sealedFile(io.cwd, nodeId), gate.bundle);
-  node.status = NodeState.ACTIVE;
-  node.lastResult = resultFromBaseline(gate.bundle);
-  node.lastCandidateDigest = candidateDigest;
-  const snap = takeCheckpoint(io, node, "seal");
-  const warnings = snap.ok ? [] : [snap.warning];
-  saveNodeState(io, node);
-
-  if (gate.bundle.baseline.allPass) {
-    const cascade = await closePassCascade(io, index, root, nodeId);
-    return { ok: true, sealed: nodeId, alreadySatisfied: true, baseline: formatVector(gate.bundle.baseline.outcomes), warnings, cascade };
-  }
-  return { ok: true, sealed: nodeId, baseline: formatVector(gate.bundle.baseline.outcomes), warnings, next: nextAction(root, node, null, io.nowMs()) };
+  if(!preparationMatches(io,node))return {ok:false,errors:["validated bundle is stale; prepare again before approval"]};
+  const prepared=node.prepared;
+  const validatedDraft=readJson(draftFile(io.cwd,nodeId)).draft;
+  const bundle={version:1,contract:validatedDraft,digest:sha256Hex(stableStringify(validatedDraft)),env:prepared.environment,candidateDigest:prepared.candidateDigest,sealedAt:new Date().toISOString(),baseline:prepared.baseline,intentDigest:prepared.intentDigest,evaluatorDigest:prepared.evaluatorDigest,validation:prepared.stages};
+  writeJsonAtomic(sealedFile(io.cwd,nodeId),bundle);
+  node.status=NodeState.ACTIVE;node.phase="EXECUTION";node.sealAttempts++;
+  node.lastResult=resultFromBaseline(bundle);node.lastCandidateDigest=bundle.candidateDigest;
+  const snap=takeCheckpoint(io,node,"seal");saveNodeState(io,node);releasePreparation(io.cwd);
+  return {ok:true,sealed:nodeId,baseline:formatVector(bundle.baseline.outcomes),warnings:snap.ok?[]:[snap.warning],next:nextAction(root,node,null,io.nowMs())};
 }
 
 // --- evaluate ------------------------------------------------------------
 
 async function freshEvaluate(io, bundle, candidateDigest, timeoutMs) {
   const outcomes = [];
+  const metrics=emptyMetrics();
   for (const criterion of bundle.contract.criteria) {
-    outcomes.push(await runCheck(criterion, io.exec, io.cwd, timeoutMs));
+    const fixture=fs.mkdtempSync(path.join(os.tmpdir(),"exitcode-fresh-"));
+    try {
+      metrics.fixtureBytes+=copyCandidate(io.cwd,fixture,SNAPSHOT_MAX_BYTES);metrics.fixtureCopies++;
+      if(fs.existsSync(path.join(io.cwd,"node_modules")))fs.cpSync(path.join(io.cwd,"node_modules"),path.join(fixture,"node_modules"),{recursive:true});
+      metrics.probeExecutions++;
+      outcomes.push(await runCheck(criterion,async(command,opts)=>{metrics.shellExecutions++;return io.exec(command,opts);},fixture,timeoutMs));
+    } finally {fs.rmSync(fixture,{recursive:true,force:true});}
   }
   return {
+    metrics,
     runId: newRunId(),
     bundleDigest: bundle.digest,
     candidateDigest,
@@ -1827,7 +1784,9 @@ export function nextAction(root, node, draft = null, nowMs = Date.now()) {
         ? `shared deadline exceeded; revise ${node.id} with a larger finite policy and present the entire contract again, or the user can cancel with /exitcode exit`
         : "shared deadline exceeded; the user must cancel with /exitcode exit and start a fresh root with fresh review";
     }
-    if (!node.parentId && !approvalMatches(root, draft)) return "present the root contract and wait for the user to accept or request revisions (or /exitcode exit)";
+    if (node.parentId) return `seal ${node.id} with exitcode_seal (prepares the child evaluator first)`;
+    if (node.phase !== "READY_FOR_APPROVAL") return `prepare or repair ${node.id} evaluator before user review`;
+    if (!node.parentId && !approvalMatches(root,draft)) return "present the validated plan and wait for explicit approval";
     return `seal ${node.id} with exitcode_seal`;
   }
   if (node.status !== NodeState.ACTIVE) return `${node.id} is ${node.status}`;
@@ -1861,7 +1820,7 @@ export function statusSnapshot(io) {
   const leaf = leafId ? loadNodeState(io, leafId) : null;
   const rootNode = loadNodeState(io, root.id);
   const rootDraft = rootNode?.status === NodeState.DRAFT ? readJson(draftFile(io.cwd, root.id))?.draft : null;
-  const awaitingApproval = rootNode?.status === NodeState.DRAFT && !approvalMatches(root, rootDraft);
+  const awaitingApproval = rootNode?.status === NodeState.DRAFT && rootNode.phase === "READY_FOR_APPROVAL" && !approvalMatches(root, rootDraft);
   return {
     active: true,
     root: root.id,
@@ -1873,7 +1832,15 @@ export function statusSnapshot(io) {
     ...policyStatus(root, rootNode, io.nowMs()),
     approval: root.approval ?? null,
     awaitingApproval,
-    review: rootDraft ? rootReviewText(rootDraft, root, io.nowMs()) : null,
+    phase: leaf?.phase ?? (leaf?.status === NodeState.DRAFT ? "EVALUATOR_PREPARATION" : "EXECUTION"),
+    intentDigest: rootDraft ? intentDigestOf(rootDraft) : loadBundle(io,root.id)?.intentDigest,
+    evaluatorDigest: rootDraft ? evaluatorDigestOf(rootDraft) : loadBundle(io,root.id)?.evaluatorDigest,
+    evaluatorMetrics: rootNode?.evaluatorMetrics ?? emptyMetrics(),
+    diagnostics: leaf?.diagnostics ?? [],
+    evaluatorEvidence: rootNode?.prepared ?? null,
+    originalRequest: rootDraft?.originalRequest ?? loadBundle(io,root.id)?.contract.originalRequest,
+    contract: rootDraft ?? loadBundle(io,root.id)?.contract,
+    review: awaitingApproval ? rootReviewText(rootDraft, root, io.nowMs()) : null,
     next: leaf ? nextAction(root, leaf, leaf.id === root.id ? rootDraft : null, io.nowMs()) : "none",
   };
 }
@@ -1889,6 +1856,7 @@ export function statusText(io) {
   lines.push(`  budget: ${snap.consumedAttempts}/${snap.maxTotalAttempts} attempts, deadline ${snap.deadlineAt}${snap.expired ? " (EXPIRED)" : ""}`);
   lines.push(`  effective policy: ${JSON.stringify(snap.policy)}`);
   lines.push(`  remaining: ${(snap.remainingMs / 60000).toFixed(2)} minutes; policy ${snap.policyEditable ? "editable before first approval" : "locked"}`);
+  lines.push(`  phase: ${snap.phase}`, `  evaluator metrics: ${JSON.stringify(snap.evaluatorMetrics)}`, `  intent digest: ${snap.intentDigest}`, `  evaluator digest: ${snap.evaluatorDigest}`, `  diagnostics: ${JSON.stringify(snap.diagnostics)}`, `  evaluator evidence: ${JSON.stringify(snap.evaluatorEvidence)}`, `  contract: ${JSON.stringify(snap.contract)}`);
   lines.push(`  next: ${snap.next}`);
   if (snap.review) lines.push("", snap.review);
   return lines.join("\n");
@@ -1900,4 +1868,10 @@ export function terminalStale(io, rootId) {
   if (!root || root.status !== NodeState.PASS) return { stale: false };
   const current = digestTree(io.cwd);
   return { stale: current !== root.outcome?.candidateDigest, recorded: root.outcome?.candidateDigest, current };
+}
+
+/** Interrupted preparation never restores approval or unlocks coding. */
+export function resumePreparation(io) {
+  const index=loadIndex(io.cwd), root=index.activeRootId?loadRoot(io,index.activeRootId):null;
+  for(const id of root?.stack??[]){const node=loadNodeState(io,id);if(node?.preparing){delete node.preparing;node.phase="EVALUATOR_PREPARATION";delete node.prepared;saveNodeState(io,node);}}
 }

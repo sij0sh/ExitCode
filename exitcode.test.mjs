@@ -14,6 +14,7 @@ import {
   allPass,
   assignCriterionIds,
   approveRoot,
+  prepareNode,
   draftFile,
   rootReviewText,
   blockNode,
@@ -140,6 +141,7 @@ async function sealedRoot(dir, exec, nowRef, criteria = ROOT_CRITERIA) {
   const { io } = testIo(dir, exec, nowRef);
   const draft = draftNode(io, { goal: "Add the thing", criteria });
   assert.equal(draft.ok, true);
+  assert.equal((await prepareNode(io)).ok, true);
   assert.equal(approveRoot(io).ok, true);
   const seal = await sealNode(io, draft.id);
   assert.equal(seal.ok, true);
@@ -437,12 +439,13 @@ test("seal: fixtures and checkpoints accept trees above the old 64 MiB cap", asy
   });
   const drafted = draftNode(io, { goal: "Large candidate", criteria: ROOT_CRITERIA });
   assert.equal(drafted.ok, true);
+  assert.equal((await prepareNode(io)).ok, true);
   assert.equal(approveRoot(io).ok, true);
   const sealed = await sealNode(io, drafted.id);
   assert.equal(sealed.ok, true, JSON.stringify(sealed));
   assert.deepEqual(sealed.warnings, []);
   assert.equal(digestTree(dir), before);
-  assert.equal(new Set(fixtures).size, 2);
+  assert.equal(new Set(fixtures).size, 3);
   assert.equal(fixtures.every((fixture) => !fs.existsSync(fixture)), true);
   const node = loadNodeState(io, drafted.id);
   assert.equal(node.checkpoints.length, 1);
@@ -614,33 +617,14 @@ test("runGate: true/false verdict commands do not establish discrimination", asy
   assert.ok(gate.errors.some((e) => e.includes("reject control setup FAIL")));
 });
 
-test("seal: real candidate mutations during controls, wiring, or baseline prevent sealing", async () => {
+test("prepare: candidate mutations prevent review and sealing", async (t) => {
   for (const phase of ["controls", "wiring", "baseline"]) {
-    const dir = tempProject();
-    const exec = fileExec(dir, { checks: standardChecks });
-    const wrapped = async (command, opts) => {
-      const result = await exec(command, opts);
-      if ((phase === "controls" && command === "reject:C1") ||
-          (phase === "wiring" && command === "check:c1" && fs.readdirSync(opts.cwd).length === 0) ||
-          (phase === "baseline" && opts.cwd === dir)) {
-        fs.writeFileSync(path.join(dir, "feature.txt"), "candidate changed\n");
-      }
-      return result;
-    };
-    const { io } = testIo(dir, wrapped);
-    assert.equal(draftNode(io, { goal: "g", criteria: ROOT_CRITERIA }).ok, true);
-    assert.equal(approveRoot(io).ok, true);
-    const seal = await sealNode(io, "G1");
-    assert.equal(seal.ok, false, phase);
-    assert.ok(seal.errors.includes("candidate mutated during evaluator validation"));
-    assert.equal(loadBundle(io, "G1"), null);
-    const node = loadNodeState(io, "G1");
-    assert.equal(node.status, NodeState.DRAFT);
-    assert.equal(node.checkpoints.length, 0);
-    assert.equal(exec.calls.some((c) => c.cwd === dir), phase === "baseline");
-    for (const call of exec.calls.filter((c) => c.cwd !== dir)) {
-      assert.equal(fs.existsSync(call.cwd), false);
-    }
+    const dir=tempProject();t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
+    const exec=fileExec(dir,{checks:standardChecks});let changed=false;
+    const wrapped=async(command,opts)=>{const result=await exec(command,opts);
+      if(!changed && (phase==="controls"&&command==="reject:C1" || phase==="wiring"&&fs.readdirSync(opts.cwd).length===0 || phase==="baseline"&&command==="check:reg"&&fs.existsSync(path.join(opts.cwd,"feature.txt")))) {changed=true;fs.writeFileSync(path.join(dir,"feature.txt"),"changed");}return result;};
+    const io=makeIo(dir,{exec:wrapped});draftNode(io,{goal:"g",criteria:ROOT_CRITERIA});
+    const p=await prepareNode(io);assert.equal(p.ok,false);assert.ok(p.diagnostics.some(d=>d.code==='CANDIDATE_MUTATED'));assert.equal(p.review,undefined);assert.equal(approveRoot(io).ok,false);assert.equal(loadBundle(io,"G1"),null);assert.equal(exec.calls.some(c=>c.cwd===dir),false);
   }
 });
 
@@ -655,6 +639,7 @@ test("draft + seal: root becomes ACTIVE with a recorded baseline", async () => {
   const draft = draftNode(io, { goal: "Add the thing", criteria: ROOT_CRITERIA });
   assert.equal(draft.ok, true);
   assert.equal(draft.id, "G1");
+  assert.equal((await prepareNode(io)).ok, true);
   assert.equal(approveRoot(io).ok, true);
   const seal = await sealNode(io, "G1");
   assert.equal(seal.ok, true);
@@ -663,7 +648,7 @@ test("draft + seal: root becomes ACTIVE with a recorded baseline", async () => {
   assert.ok(loadBundle(io, "G1").digest);
 });
 
-test("draft: second root draft suggests revise instead of proliferating nodes", async () => {
+test("draft: second root draft suggests revise instead of proliferating nodes", () => {
   const dir = tempProject();
   const { io } = testIo(dir, fileExec(dir, { checks: standardChecks }));
   assert.equal(draftNode(io, { goal: "g", criteria: ROOT_CRITERIA }).ok, true);
@@ -683,54 +668,16 @@ test("draft: sealed root blocks a new root until terminal", async () => {
   assert.ok(again.errors.some((e) => e.includes("still ACTIVE")));
 });
 
-test("seal: gate failure consumes a proposal; revise + seal succeeds", async () => {
-  const dir = tempProject();
-  const nowRef = { now: Date.now() };
-  // The reject setup makes a valid fixture at first, then behaves after revise.
-  let rejectPasses = true;
-  const exec = fileExec(dir, {
-    checks: standardChecks,
-    rejects: {},
-  });
-  const wrapped = async (command, opts) => {
-    if (command === "reject:C1" && rejectPasses) {
-      fs.writeFileSync(path.join(opts.cwd, "feature.txt"), "done\n");
-      return { exit: 0, stdout: "", stderr: "", timedOut: false };
-    }
-    return exec(command, opts);
-  };
-  const { io } = testIo(dir, wrapped, nowRef);
-  assert.equal(draftNode(io, { goal: "g", criteria: ROOT_CRITERIA }).ok, true);
-  assert.equal(approveRoot(io).ok, true);
-  const first = await sealNode(io, "G1");
-  assert.equal(first.ok, false);
-  assert.equal(first.sealAttemptsLeft, MAX_DRAFT_PROPOSALS - 1);
-  assert.ok(first.next.includes('revise:"G1"'));
-  rejectPasses = false;
-  const revised = draftNode(io, { goal: "g", criteria: ROOT_CRITERIA, revise: "G1" });
-  assert.equal(revised.ok, true);
-  assert.equal(revised.revised, true);
-  assert.equal(approveRoot(io).ok, true);
-  const second = await sealNode(io, "G1");
-  assert.equal(second.ok, true);
-  assert.equal(loadNodeState(io, "G1").sealAttempts, 2);
+test("prepare: gate failure consumes evaluator budget; repair precedes first approval", async (t) => {
+ const dir=tempProject();t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));const exec=fileExec(dir,{checks:standardChecks});let bad=true;
+ const io=makeIo(dir,{exec:async(command,opts)=>{if(bad&&command==='reject:C1'){fs.writeFileSync(path.join(opts.cwd,'feature.txt'),'done');return {exit:0};}return exec(command,opts);}});
+ draftNode(io,{goal:'g',criteria:ROOT_CRITERIA});assert.equal((await prepareNode(io)).ok,false);assert.equal(approveRoot(io).ok,false);assert.equal(loadNodeState(io,'G1').sealAttempts,0);assert.equal(loadNodeState(io,'G1').evaluatorMetrics.e0Attempts,1);
+ bad=false;draftNode(io,{goal:'g',criteria:ROOT_CRITERIA,revise:'G1'});assert.equal((await prepareNode(io)).ok,true);assert.equal(approveRoot(io).ok,true);assert.equal((await sealNode(io,'G1')).ok,true);assert.equal(loadNodeState(io,'G1').sealAttempts,1);
 });
 
-test("seal: exhausting proposals BLOCKEDs the node as EVALUATOR_UNBUILDABLE", async () => {
-  const dir = tempProject();
-  const nowRef = { now: Date.now() };
-  const exec = fileExec(dir, { checks: standardChecks, accepts: { "accept:C1": { content: "todo\n" } } });
-  const { io } = testIo(dir, exec, nowRef);
-  assert.equal(draftNode(io, { goal: "g", criteria: ROOT_CRITERIA }).ok, true);
-  assert.equal(approveRoot(io).ok, true);
-  const first = await sealNode(io, "G1");
-  assert.equal(first.ok, false);
-  const second = await sealNode(io, "G1");
-  assert.equal(second.ok, true);
-  assert.equal(second.status, NodeState.BLOCKED);
-  assert.equal(loadNodeState(io, "G1").blockedCode, "EVALUATOR_UNBUILDABLE");
-  assert.deepEqual(second.terminal, { root: "G1", status: NodeState.BLOCKED, outcome: second.terminal.outcome });
-  assert.equal(loadRoot(io, "G1").status, NodeState.BLOCKED);
+test("prepare: exhausting evaluator attempts BLOCKEDs without implementation attempts", async (t) => {
+ const dir=tempProject();t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));const io=makeIo(dir,{exec:fileExec(dir,{checks:standardChecks,accepts:{'accept:C1':{content:'todo'}}})});draftNode(io,{goal:'g',criteria:ROOT_CRITERIA,policy:{evaluatorAttempts:2}});
+ assert.equal((await prepareNode(io)).ok,false);assert.equal((await prepareNode(io)).ok,false);const result=await prepareNode(io);assert.equal(result.terminal.status,'BLOCKED');assert.equal(loadNodeState(io,'G1').blockedCode,'EVALUATOR_UNBUILDABLE');assert.equal(loadRoot(io,'G1').consumedAttempts,0);
 });
 
 test("policy: rejected initial scope can amend every limit after expiry without resetting time", async (t) => {
@@ -748,7 +695,7 @@ test("policy: rejected initial scope can amend every limit after expiry without 
   assert.equal(statusSnapshot(io).expired, true);
   assert.doesNotMatch(statusSnapshot(io).next, /wait for the user to accept/);
   assert.match(statusSnapshot(io).next, /larger finite policy/);
-  assert.match(statusSnapshot(io).review, /Do not approve an expired contract/);
+  assert.equal(statusSnapshot(io).review, null);
   const rootBefore = loadRoot(io, "G1");
   assert.equal(approveRoot(io).ok, false);
   const unapprovedSeal = await sealNode(io, "G1");
@@ -763,23 +710,25 @@ test("policy: rejected initial scope can amend every limit after expiry without 
   const revised = draftNode(io, { revise: "G1", goal: "Implementation", criteria: ROOT_CRITERIA,
     originalRequest: "Extension housekeeping", policy: proposedPolicy });
   assert.equal(revised.ok, true);
-  assert.deepEqual(revised.policy, proposedPolicy);
+  assert.deepEqual(revised.policy, {...DEFAULT_POLICY,...proposedPolicy});
   assert.deepEqual(revised.warnings, []);
   assert.equal(revised.draft.originalRequest, "Complete the implementation");
   assert.equal(revised.createdAt, createdAt);
   assert.equal(revised.deadlineAt, "2026-10-08T06:02:15.029Z");
   assert.equal(revised.remainingMs, createdAt + 480 * 60000 - nowRef.now);
   assert.equal(revised.policyEditable, true);
-  assert.deepEqual(loadNodeState(io, "G1"), beforeNode);
+  assert.equal(loadNodeState(io,"G1").evaluatorMetrics.evaluatorProposals,beforeNode.evaluatorMetrics.evaluatorProposals+1);
+  assert.equal(loadNodeState(io,"G1").attempts,beforeNode.attempts);
   assert.equal(loadRoot(io, "G1").consumedAttempts, 0);
   assert.equal(exec.calls.length, 0);
-  for (const [key, value] of Object.entries(proposedPolicy)) assert.ok(revised.review.includes(`${key}: ${value}`));
-  assert.match(revised.review, /Remaining time: 449\.74 minutes/);
-  assert.deepEqual(statusSnapshot(io).policy, proposedPolicy);
+  assert.equal(revised.review,undefined);
+  assert.equal(revised.remainingMs,449.74225*60000);
+  assert.deepEqual(statusSnapshot(io).policy, {...DEFAULT_POLICY,...proposedPolicy});
   const noReset = draftNode(io, { revise: "G1", goal: "Clarified implementation", criteria: ROOT_CRITERIA });
   assert.equal(noReset.deadlineAt, revised.deadlineAt);
-  assert.deepEqual(noReset.policy, proposedPolicy);
+  assert.deepEqual(noReset.policy, {...DEFAULT_POLICY,...proposedPolicy});
   assert.equal((await sealNode(io, "G1")).ok, false, "amendment still needs fresh approval");
+  assert.equal((await prepareNode(io)).ok,true);
   assert.equal((await sealNode(io, "G1", { userApproval: "Approve the revised scope and limits" })).sealed, "G1");
   assert.equal(loadRoot(io, "G1").policyLocked, true);
   assert.equal(loadNodeState(io, "G1").sealAttempts, 1);
@@ -792,7 +741,9 @@ test("policy: an approved expired root cannot revise or revive its budget", asyn
   const exec = fileExec(dir, { checks: standardChecks });
   const { io, nowRef } = testIo(dir, exec);
   draftNode(io, { goal: "g", criteria: ROOT_CRITERIA });
+  await prepareNode(io);
   approveRoot(io);
+  exec.calls.length=0;
   const before = loadRoot(io, "G1");
   nowRef.now = before.deadlineAt;
   assert.equal(draftNode(io, { revise: "G1", goal: "New scope", criteria: ROOT_CRITERIA }).ok, false);
@@ -840,7 +791,7 @@ test("policy: partial corrections retain effective values and invalid revisions 
   assert.deepEqual(files.map((file) => fs.readFileSync(file, "utf8")), before);
 });
 
-test("policy: a correction whose deadline is already past is rejected without replacing usable limits", (t) => {
+test("policy: a correction whose deadline is already past is rejected without replacing usable limits", async (t) => {
   const dir = tempProject();
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const { io, nowRef } = testIo(dir, fileExec(dir, { checks: standardChecks }));
@@ -853,6 +804,7 @@ test("policy: a correction whose deadline is already past is rejected without re
   assert.equal(result.expired, false, "returned limits are the unchanged effective policy");
   assert.deepEqual(result.policy, before.policy);
   assert.deepEqual(loadRoot(io, "G1"), before);
+  assert.equal((await prepareNode(io)).ok, true);
   assert.equal(approveRoot(io).ok, true);
 });
 
@@ -862,7 +814,9 @@ test("policy: first approval locks limits across revision and fresh IO before E0
   const exec = fileExec(dir, { checks: standardChecks });
   const { io, nowRef } = testIo(dir, exec);
   draftNode(io, { goal: "g", criteria: ROOT_CRITERIA });
+  assert.equal((await prepareNode(io)).ok, true);
   assert.equal(approveRoot(io).ok, true);
+  exec.calls.length=0;
   const deadlineAt = loadRoot(io, "G1").deadlineAt;
   const approved = loadRoot(io, "G1");
   const rejected = draftNode(io, { revise: "G1", goal: "Rejected scope", criteria: ROOT_CRITERIA, policy: { deadlineMinutes: 480 } });
@@ -883,6 +837,7 @@ test("policy: first approval locks limits across revision and fresh IO before E0
   assert.equal(exec.calls.length, 0);
   assert.equal(loadRoot(fresh, "G1").deadlineAt, deadlineAt);
   assert.equal((await sealNode(fresh, "G1")).ok, false);
+  assert.equal((await prepareNode(fresh)).ok, true);
   assert.equal(approveRoot(fresh).ok, true);
   assert.equal((await sealNode(fresh, "G1")).sealed, "G1");
 });
@@ -902,18 +857,20 @@ test("policy: failed E0 and cleared approval never reopen policy editing", async
   const { io } = testIo(dir, wrapped);
   draftNode(io, { goal: "g", criteria: ROOT_CRITERIA });
   const deadlineAt = loadRoot(io, "G1").deadlineAt;
+  assert.equal((await prepareNode(io)).ok,false);
   assert.equal((await sealNode(io, "G1", { userApproval: "Proceed" })).ok, false);
-  assert.equal(loadNodeState(io, "G1").sealAttempts, 1);
+  assert.equal(loadNodeState(io, "G1").sealAttempts, 0);
   assert.equal(draftNode(io, { revise: "G1", goal: "g", criteria: ROOT_CRITERIA }).ok, true);
   const fresh = makeIo(dir, { exec: wrapped });
   assert.equal(loadRoot(fresh, "G1").approval, undefined);
   assert.equal(draftNode(fresh, { revise: "G1", goal: "g", criteria: ROOT_CRITERIA, policy: { deadlineMinutes: 480 } }).ok, false);
-  assert.equal(loadNodeState(fresh, "G1").sealAttempts, 1);
+  assert.equal(loadNodeState(fresh, "G1").sealAttempts, 0);
   assert.equal(loadRoot(fresh, "G1").deadlineAt, deadlineAt);
   badFixture = false;
   assert.equal((await sealNode(fresh, "G1")).ok, false);
+  assert.equal((await prepareNode(fresh)).ok,true);
   assert.equal((await sealNode(fresh, "G1", { userApproval: "Approve the recovered evaluator" })).sealed, "G1");
-  assert.equal(loadNodeState(fresh, "G1").sealAttempts, 2);
+  assert.equal(loadNodeState(fresh, "G1").sealAttempts, 1);
   assert.equal(loadRoot(fresh, "G1").consumedAttempts, 0);
 });
 
@@ -930,7 +887,7 @@ test("policy: legacy drafts stay fixed and their draft-only approvals require fr
   legacy.approval = { digest: legacy.reviewDigest, approvedBy: "user", at: new Date().toISOString() };
   fs.writeFileSync(file, JSON.stringify(legacy));
   assert.equal(statusSnapshot(io).policyEditable, false);
-  assert.equal(statusSnapshot(io).awaitingApproval, true);
+  assert.equal(statusSnapshot(io).awaitingApproval, false);
   assert.equal(approveRoot(io).ok, false);
   assert.equal((await sealNode(io, "G1")).ok, false);
   assert.equal(exec.calls.length, 0);
@@ -939,6 +896,7 @@ test("policy: legacy drafts stay fixed and their draft-only approvals require fr
   assert.equal(draftNode(io, { revise: "G1", goal: "g", criteria: ROOT_CRITERIA }).ok, true);
   assert.equal(loadRoot(io, "G1").policyLocked, true);
   assert.equal(loadRoot(io, "G1").approval, undefined);
+  assert.equal((await prepareNode(io)).ok,true);
   assert.equal((await sealNode(io, "G1", { userApproval: "Approve the full contract and limits" })).sealed, "G1");
 });
 
@@ -1003,7 +961,9 @@ test("policy: review and approval bind every limit and the shared clock", async 
     fs.writeFileSync(file, JSON.stringify(mutated));
     assert.equal(approveRoot(io).ok, false, `${key} before approval`);
     fs.writeFileSync(file, JSON.stringify(before));
-    assert.equal(approveRoot(io).ok, true);
+    assert.equal((await prepareNode(io)).ok, true);
+  assert.equal(approveRoot(io).ok, true);
+  exec.calls.length=0;
     const approved = loadRoot(io, "G1");
     if (key in DEFAULT_POLICY) approved.policy[key] = value;
     else approved[key] = value;
@@ -1033,11 +993,11 @@ test("policy: changes during E0 cannot seal a stale approval", async (t) => {
     return exec(command, opts);
   } });
   draftNode(io, { goal: "g", criteria: ROOT_CRITERIA });
-  const result = await sealNode(io, "G1", { userApproval: "Proceed" });
+  const result = await prepareNode(io);
   assert.equal(result.ok, false);
-  assert.match(result.errors[0], /changed during E0/);
+  assert.match(result.errors[0], /changed during preparation/);
   assert.equal(loadBundle(io, "G1"), null);
-  assert.equal(loadNodeState(io, "G1").sealAttempts, 1);
+  assert.equal(loadNodeState(io, "G1").sealAttempts, 0);
 });
 
 test("policy: children inherit corrected limits and cannot amend or reset them", async (t) => {
@@ -1047,6 +1007,7 @@ test("policy: children inherit corrected limits and cannot amend or reset them",
   const io = makeIo(dir, { exec });
   draftNode(io, { goal: "g", criteria: ROOT_CRITERIA });
   draftNode(io, { revise: "G1", goal: "g", criteria: ROOT_CRITERIA, policy: { maxDepth: 1, deadlineMinutes: 480, evalTimeoutSeconds: 900 } });
+  assert.equal((await prepareNode(io)).ok,true);
   assert.equal((await sealNode(io, "G1", { userApproval: "Proceed" })).sealed, "G1");
   const before = loadRoot(io, "G1");
   const parentDigest = loadBundle(io, "G1").digest;
@@ -1073,7 +1034,7 @@ test("approval: unapproved roots never run E0 or consume seal proposals", async 
   const exec = fileExec(dir, { checks: standardChecks });
   const { io } = testIo(dir, exec);
   const draft = draftNode(io, { goal: "g", criteria: ROOT_CRITERIA });
-  assert.match(draft.next, /user to accept or request revisions/);
+  assert.match(draft.next, /prepare or repair/);
   for (let n = 0; n < MAX_DRAFT_PROPOSALS + 1; n++) {
     const result = await sealNode(io, "G1");
     assert.equal(result.ok, false);
@@ -1091,17 +1052,18 @@ test("approval: exact draft, policy, clock, and user metadata survive a fresh IO
   const exec = fileExec(dir, { checks: standardChecks });
   const { io } = testIo(dir, exec, nowRef);
   const draft = draftNode(io, { goal: "g", criteria: ROOT_CRITERIA });
+  await prepareNode(io);
+  const preparedDraft=JSON.parse(fs.readFileSync(draftFile(dir,"G1"),"utf8")).draft;
   const approved = approveRoot(io);
   assert.deepEqual(approved.approval, {
-    digest: sha256Hex(stableStringify({ draft: draft.draft, policy: DEFAULT_POLICY,
-      createdAt: nowRef.now, deadlineAt: nowRef.now + DEFAULT_POLICY.deadlineMinutes * 60000 })),
+    digest: loadRoot(io,"G1").reviewDigest,
     at: new Date(nowRef.now).toISOString(), approvedBy: "user",
   });
   const fresh = makeIo(dir, { exec });
   assert.equal(statusSnapshot(fresh).awaitingApproval, false);
   assert.match(statusSnapshot(fresh).next, /seal G1/);
   assert.equal((await sealNode(fresh, "G1")).ok, true);
-  assert.equal(loadBundle(fresh, "G1").digest, sha256Hex(stableStringify(draft.draft)));
+  assert.equal(loadBundle(fresh,"G1").digest,sha256Hex(stableStringify(preparedDraft)));
   assert.notEqual(loadBundle(fresh, "G1").digest, approved.approval.digest);
   assert.equal(approveRoot(fresh).ok, false);
 });
@@ -1112,12 +1074,14 @@ test("approval: sealing records a conversational reply against the exact root dr
   const { io } = testIo(dir, exec);
   const draft = draftNode(io, { goal: "g", criteria: ROOT_CRITERIA });
   const reply = "Looks good, go ahead.";
+  await prepareNode(io);
+  const preparedDraft=JSON.parse(fs.readFileSync(draftFile(dir,"G1"),"utf8")).draft;
   assert.equal((await sealNode(io, "G1", { userApproval: reply })).ok, true);
   const approval = loadRoot(io, "G1").approval;
   assert.equal(approval.userReply, reply);
   assert.equal(approval.approvedBy, "user");
   assert.equal(approval.digest, loadRoot(io, "G1").reviewDigest);
-  assert.equal(loadBundle(io, "G1").digest, sha256Hex(stableStringify(draft.draft)));
+  assert.equal(loadBundle(io,"G1").digest,sha256Hex(stableStringify(preparedDraft)));
   assert.deepEqual(loadRoot(makeIo(dir), "G1").approval, approval);
 });
 
@@ -1142,7 +1106,9 @@ test("approval: every accepted root revision invalidates approval and retains re
   const { io } = testIo(dir, exec);
   draftNode(io, { goal: "g", criteria: ROOT_CRITERIA, assumptions: ["Existing policy"],
     exclusions: ["No redesign"], verification: "Run behavior and regression tests." });
+  assert.equal((await prepareNode(io)).ok, true);
   assert.equal(approveRoot(io).ok, true);
+  exec.calls.length=0;
   const invalid = draftNode(io, { goal: "g", criteria: [], revise: "G1" });
   assert.equal(invalid.ok, false);
   assert.ok(loadRoot(io, "G1").approval);
@@ -1150,12 +1116,14 @@ test("approval: every accepted root revision invalidates approval and retains re
   const revised = draftNode(io, { goal: "g", criteria: ROOT_CRITERIA, revise: "G1" });
   assert.equal(revised.ok, true);
   assert.equal(loadRoot(io, "G1").approval, undefined);
-  assert.match(revised.next, /user to accept or request revisions/);
+  assert.match(revised.next, /prepare or repair/);
   assert.deepEqual(revised.draft.assumptions, ["Existing policy"]);
   assert.match(rootReviewText(revised.draft, loadRoot(io, "G1")), /No redesign/);
   assert.equal((await sealNode(io, "G1")).ok, false);
   assert.equal(exec.calls.length, 0);
+  assert.equal((await prepareNode(io)).ok, true);
   assert.equal(approveRoot(io).ok, true);
+  exec.calls.length=0;
   assert.equal((await sealNode(io, "G1")).ok, true);
 });
 
@@ -1171,7 +1139,9 @@ test("approval: semantic or evaluator edits on disk cannot reuse approval", asyn
     const exec = fileExec(dir, { checks: standardChecks });
     const { io } = testIo(dir, exec);
     draftNode(io, { goal: "g", criteria: ROOT_CRITERIA });
-    assert.equal(approveRoot(io).ok, true);
+    assert.equal((await prepareNode(io)).ok, true);
+  assert.equal(approveRoot(io).ok, true);
+  exec.calls.length=0;
     const file = draftFile(dir, "G1");
     const stored = JSON.parse(fs.readFileSync(file, "utf8"));
     mutate(stored.draft);
@@ -1199,13 +1169,13 @@ test("approval: root revision during asynchronous E0 cannot seal stale intent", 
     return exec(command, opts);
   } });
   draftNode(io, { goal: "g", criteria: ROOT_CRITERIA });
-  const result = await sealNode(io, "G1", { userApproval: "Proceed." });
+  const result = await prepareNode(io);
   assert.equal(result.ok, false);
-  assert.match(result.errors[0], /changed during E0/);
+  assert.match(result.errors[0], /changed during preparation/);
   assert.equal(loadBundle(io, "G1"), null);
   assert.equal(loadRoot(io, "G1").approval, undefined);
   assert.equal(loadNodeState(io, "G1").status, "DRAFT");
-  assert.equal(loadNodeState(io, "G1").sealAttempts, 1);
+  assert.equal(loadNodeState(io, "G1").sealAttempts, 0);
   assert.equal(JSON.parse(fs.readFileSync(draftFile(dir, "G1"), "utf8")).draft.goal, "new goal");
 });
 
@@ -1247,6 +1217,7 @@ test("approval: legacy drafts fail closed and must be revised before approval", 
   assert.equal((await sealNode(io, "G1")).ok, false);
   assert.equal((await sealNode(io, "G1", { userApproval: "Proceed." })).ok, false);
   assert.equal(draftNode(io, { goal: "g", criteria: ROOT_CRITERIA, revise: "G1" }).ok, true);
+  assert.equal((await prepareNode(io)).ok, true);
   assert.equal(approveRoot(io).ok, true);
 });
 
@@ -1255,7 +1226,7 @@ test("review: acceptance layer omits shell mechanics and validates optional fiel
     verification: "Test positive, negative, and regression cases." });
   const review = rootReviewText(draft, { policy: DEFAULT_POLICY, deadlineAt: Date.now() + 60000 });
   for (const text of [draft.goal, ...draft.criteria.map((c) => c.requirement), ...draft.assumptions,
-    ...draft.exclusions, draft.verification, "Reply in plain English", "optional shortcut", "Children need no separate approval"]) {
+    ...draft.exclusions, draft.verification, "Approve this plan", "/exitcode status", "/exitcode exit"]) {
     assert.ok(review.includes(text), text);
   }
   assert.ok(!review.includes("check:c1"));
@@ -1290,6 +1261,7 @@ test("evaluate: attempt budget exhaustion BLOCKEDs the node", async () => {
   const nowRef = { now: Date.now() };
   const { io } = testIo(dir, fileExec(dir, { checks: standardChecks }), nowRef);
   assert.equal(draftNode(io, { goal: "g", criteria: ROOT_CRITERIA, policy: { maxTotalAttempts: 1 } }).ok, true);
+  assert.equal((await prepareNode(io)).ok, true);
   assert.equal(approveRoot(io).ok, true);
   assert.equal((await sealNode(io, "G1")).ok, true);
   fs.writeFileSync(path.join(dir, "feature.txt"), "v2\n");
@@ -1306,6 +1278,7 @@ test("evaluate: ALL PASS closes the root with the candidate identity", async () 
   const nowRef = { now: Date.now() };
   const { io } = testIo(dir, exec, nowRef);
   assert.equal(draftNode(io, { goal: "g", criteria: ROOT_CRITERIA }).ok, true);
+  assert.equal((await prepareNode(io)).ok, true);
   assert.equal(approveRoot(io).ok, true);
   assert.equal((await sealNode(io, "G1")).ok, true);
   fs.writeFileSync(path.join(dir, "feature.txt"), "done\n");
@@ -1324,6 +1297,7 @@ test("evaluate: deadline expiry BLOCKEDs changed-tree work", async () => {
   const nowRef = { now: Date.now() };
   const { io } = testIo(dir, fileExec(dir, { checks: standardChecks }), nowRef);
   assert.equal(draftNode(io, { goal: "g", criteria: ROOT_CRITERIA, policy: { deadlineMinutes: 30 } }).ok, true);
+  assert.equal((await prepareNode(io)).ok, true);
   assert.equal(approveRoot(io).ok, true);
   assert.equal((await sealNode(io, "G1")).ok, true);
   nowRef.now += 31 * 60 * 1000;
@@ -1339,6 +1313,7 @@ test("evaluate: sealed-bundle tampering BLOCKEDs instead of trusting edits", asy
   const nowRef = { now: Date.now() };
   const { io } = testIo(dir, exec, nowRef);
   assert.equal(draftNode(io, { goal: "g", criteria: ROOT_CRITERIA }).ok, true);
+  assert.equal((await prepareNode(io)).ok, true);
   assert.equal(approveRoot(io).ok, true);
   assert.equal((await sealNode(io, "G1")).ok, true);
   const sealedFile = path.join(dir, ".exitcode", "contracts", "G1.sealed.json");
@@ -1364,6 +1339,7 @@ test("child: early decomposition needs a prerequisite; targets must fail", async
   const nowRef = { now: Date.now() };
   const { io } = testIo(dir, exec, nowRef);
   assert.equal(draftNode(io, { goal: "g", criteria: ROOT_CRITERIA }).ok, true);
+  assert.equal((await prepareNode(io)).ok, true);
   assert.equal(approveRoot(io).ok, true);
   assert.equal((await sealNode(io, "G1")).ok, true);
   const early = draftNode(io, { parentId: "G1", target: "C1", goal: "sub", criteria: childCriteria(), reason: "helps" });
@@ -1389,6 +1365,7 @@ test("child: PASS reruns the parent but cannot close a failing parent", async ()
   const nowRef = { now: Date.now() };
   const { io } = testIo(dir, exec, nowRef);
   assert.equal(draftNode(io, { goal: "g", criteria: ROOT_CRITERIA }).ok, true);
+  assert.equal((await prepareNode(io)).ok, true);
   assert.equal(approveRoot(io).ok, true);
   assert.equal((await sealNode(io, "G1")).ok, true);
   const child = draftNode(io, {
@@ -1413,6 +1390,7 @@ test("child: PASS that fixes the parent cascades to root PASS", async () => {
   const nowRef = { now: Date.now() };
   const { io } = testIo(dir, exec, nowRef);
   assert.equal(draftNode(io, { goal: "g", criteria: ROOT_CRITERIA }).ok, true);
+  assert.equal((await prepareNode(io)).ok, true);
   assert.equal(approveRoot(io).ok, true);
   assert.equal((await sealNode(io, "G1")).ok, true);
   assert.equal(draftNode(io, {
@@ -1433,6 +1411,7 @@ test("child: one active child; identical repeats rejected on unchanged evidence"
   const nowRef = { now: Date.now() };
   const { io } = testIo(dir, exec, nowRef);
   assert.equal(draftNode(io, { goal: "g", criteria: ROOT_CRITERIA }).ok, true);
+  assert.equal((await prepareNode(io)).ok, true);
   assert.equal(approveRoot(io).ok, true);
   assert.equal((await sealNode(io, "G1")).ok, true);
   const first = draftNode(io, {
@@ -1468,6 +1447,7 @@ test("child: depth limit enforced (maxDepth 1 allows G1.1, rejects G1.1.1)", asy
   const nowRef = { now: Date.now() };
   const { io } = testIo(dir, fileExec(dir, { checks: standardChecks }), nowRef);
   assert.equal(draftNode(io, { goal: "g", criteria: ROOT_CRITERIA, policy: { maxDepth: 1 } }).ok, true);
+  assert.equal((await prepareNode(io)).ok, true);
   assert.equal(approveRoot(io).ok, true);
   assert.equal((await sealNode(io, "G1")).ok, true);
   assert.equal(draftNode(io, {
@@ -1493,6 +1473,7 @@ test("evaluate: own-vector regression restores the last accepted candidate", asy
   const nowRef = { now: Date.now() };
   const { io } = testIo(dir, exec, nowRef);
   assert.equal(draftNode(io, { goal: "g", criteria: ROOT_CRITERIA }).ok, true);
+  assert.equal((await prepareNode(io)).ok, true);
   assert.equal(approveRoot(io).ok, true);
   assert.equal((await sealNode(io, "G1")).ok, true);
   fs.writeFileSync(path.join(dir, "feature.txt"), "done BROKE\n");
@@ -1510,6 +1491,7 @@ test("block: child BLOCKED restores the pre-child candidate and reruns parent", 
   const nowRef = { now: Date.now() };
   const { io } = testIo(dir, exec, nowRef);
   assert.equal(draftNode(io, { goal: "g", criteria: ROOT_CRITERIA }).ok, true);
+  assert.equal((await prepareNode(io)).ok, true);
   assert.equal(approveRoot(io).ok, true);
   assert.equal((await sealNode(io, "G1")).ok, true);
   assert.equal(draftNode(io, {
@@ -1534,6 +1516,7 @@ test("cascade: child work that regresses an ancestor is reverted and BLOCKED", a
   const nowRef = { now: Date.now() };
   const { io } = testIo(dir, exec, nowRef);
   assert.equal(draftNode(io, { goal: "g", criteria: ROOT_CRITERIA }).ok, true);
+  assert.equal((await prepareNode(io)).ok, true);
   assert.equal(approveRoot(io).ok, true);
   assert.equal((await sealNode(io, "G1")).ok, true); // C1=FAIL C2=PASS
   assert.equal(draftNode(io, {
@@ -1550,13 +1533,13 @@ test("cascade: child work that regresses an ancestor is reverted and BLOCKED", a
   }).ok, true);
   const seal = await sealNode(io, "G1.1.1");
   assert.equal(seal.ok, true);
-  assert.equal(seal.alreadySatisfied, true);
-  assert.ok(seal.cascade.events.some((e) => e.includes("reverted and BLOCKED")));
-  assert.equal(loadNodeState(io, "G1.1.1").status, NodeState.BLOCKED);
+  const completed=await evaluateNode(io,"G1.1.1");
+  assert.deepEqual(completed.ancestorRegression,{ancestor:"G1",criteria:["C2"],restored:true});
+  assert.equal(loadNodeState(io, "G1.1.1").status, NodeState.ACTIVE);
   assert.equal(fs.existsSync(path.join(dir, "gc.txt")), false);
   assert.equal(fs.readFileSync(path.join(dir, "feature.txt"), "utf8"), "todo\n");
   assert.equal(formatVector(loadNodeState(io, "G1").lastResult.outcomes), "C1=FAIL C2=PASS");
-  assert.deepEqual(loadRoot(io, "G1").stack, ["G1", "G1.1"]);
+  assert.deepEqual(loadRoot(io, "G1").stack, ["G1", "G1.1", "G1.1.1"]);
 });
 
 // ---------------------------------------------------------------------------
@@ -1569,6 +1552,7 @@ test("terminalStale: source changes after PASS invalidate the result", async () 
   const nowRef = { now: Date.now() };
   const { io } = testIo(dir, exec, nowRef);
   assert.equal(draftNode(io, { goal: "g", criteria: ROOT_CRITERIA }).ok, true);
+  assert.equal((await prepareNode(io)).ok, true);
   assert.equal(approveRoot(io).ok, true);
   assert.equal((await sealNode(io, "G1")).ok, true);
   fs.writeFileSync(path.join(dir, "feature.txt"), "done\n");
@@ -1584,6 +1568,7 @@ test("evaluate: terminal child reports stale when the tree moved on", async () =
   const nowRef = { now: Date.now() };
   const { io } = testIo(dir, exec, nowRef);
   assert.equal(draftNode(io, { goal: "g", criteria: ROOT_CRITERIA }).ok, true);
+  assert.equal((await prepareNode(io)).ok, true);
   assert.equal(approveRoot(io).ok, true);
   assert.equal((await sealNode(io, "G1")).ok, true);
   assert.equal(draftNode(io, {
@@ -1663,6 +1648,7 @@ test("checkpoints: rolling cap keeps pre-child checkpoints of live children", as
   const nowRef = { now: Date.now() };
   const { io } = testIo(dir, exec, nowRef);
   assert.equal(draftNode(io, { goal: "g", criteria: ROOT_CRITERIA }).ok, true);
+  assert.equal((await prepareNode(io)).ok, true);
   assert.equal(approveRoot(io).ok, true);
   assert.equal((await sealNode(io, "G1")).ok, true);
   assert.equal(draftNode(io, {
@@ -1690,7 +1676,7 @@ test("checkpoints: rolling cap keeps pre-child checkpoints of live children", as
 
 test("protocol: separates the approved goal, recursive repair, and proof of success", () => {
   for (const text of ["FIX SUCCESS", "PURSUE SUCCESS", "PROVE SUCCESS", "wait for explicit user approval",
-    "Any root draft revision requires fresh approval", "sealed contract is fixed and cannot be weakened",
+    "Revisions after review require fresh validated-plan approval", "sealed contract is fixed and cannot be weakened",
     "Implement the approved goal", "Use the sealed criteria to measure", "preserve previously passing behavior",
     "Decompose only when the supervisor permits it", "temporary reduction of its parent problem",
     "needs no user approval", "cannot change ancestor contracts", "Evaluate after meaningful changes",
@@ -1707,7 +1693,7 @@ test("guardToolCall: invisible when mode is off", () => {
   assert.equal(guardToolCall({ modeOn: false, leafStatus: null, cwd: dir, toolName: "bash", input: { command: "rm -rf /" } }), null);
 });
 
-test("guardToolCall: unsealed states allow only discovery and exact supervisor tools", () => {
+test("guardToolCall: unsealed states allow only discovery and exact supervisor tools", async () => {
   const dir = tempProject();
   for (const leafStatus of [null, "NO_CONTRACT", "DRAFT", "BLOCKED", "PASS", "UNKNOWN"]) {
     for (const toolName of ["read", "grep", "ls", "exitcode_status", "exitcode_draft",
@@ -1776,8 +1762,9 @@ test("status and nextAction track the loop position", async () => {
   assert.equal(draftNode(io, { goal: "g", criteria: ROOT_CRITERIA }).ok, true);
   let snap = statusSnapshot(io);
   assert.equal(snap.active, true);
-  assert.equal(snap.awaitingApproval, true);
-  assert.ok(snap.next.includes("user to accept or request revisions"));
+  assert.equal(snap.awaitingApproval, false);
+  assert.ok(snap.next.includes("prepare or repair"));
+  assert.equal((await prepareNode(io)).ok, true);
   assert.equal(approveRoot(io).ok, true);
   assert.equal((await sealNode(io, "G1")).ok, true);
   snap = statusSnapshot(io);
