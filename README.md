@@ -14,8 +14,8 @@ Request -> Discovery -> optional Clarification -> EVALUATOR_PREPARATION
 
 1. Inspect the request, implementation, tests, and likely regressions.
 2. Declare materially distinct request outcomes and map them to observable criteria.
-3. Construct recipes and positive/negative fixture mutations.
-4. Prepare the evaluator inside independent candidate copies.
+3. Reuse relevant repository tests before constructing focused checks and positive/negative fixtures.
+4. Independently review outcomes and challenge the evaluator with sham implementations inside candidate copies.
 5. Repair typed evaluator failures before asking for approval.
 6. Present the validated goal, criteria, assumptions, exclusions, and verification summary.
 7. Approve the exact validated plan or request changes.
@@ -111,7 +111,7 @@ No HTTP, JSON Schema, or non-Node runner integration is included.
 {
   "goal": "Finish the feature",
   "intentAtoms": [
-    {"id": "I1", "outcome": "Feature returns the result", "criteria": ["C1"]},
+    {"id": "I1", "outcome": "The requested result artifact contains done", "criteria": ["C1"]},
     {"id": "I2", "outcome": "Existing artifact remains", "criteria": ["C2"]}
   ],
   "criteria": [
@@ -145,15 +145,49 @@ A successful setup does not establish a valid evaluator.
 
 ## Evaluator preparation
 
-E0 records seven explicit stages:
+E0 retains its mechanical checks and adds two semantic review phases and sham probes.
 
 1. **Intent:** Audit declared coverage, unknown mappings, duplicate criteria, and material ambiguities.
 2. **Lint:** Compile recipes and validate runners, selectors, confined paths, and external dependencies.
-3. **Discrimination:** Require PASS on the valid fixture and FAIL on every invalid fixture, not ERROR.
-4. **Adversarial:** Add bounded target deletion and incorrect-content mutations where recipes permit them.
-5. **Determinism:** Repeat independent valid fixtures and reject inconsistent outcomes.
-6. **Wiring:** Reject checks that pass against an empty target.
-7. **Baseline:** Record all current-candidate outcomes without completing the goal.
+3. **Independent derivation:** Derive material request outcomes, expected observations, near-miss concepts, critical negatives, regression risks, and test reuse opportunities.
+4. **Independent assessment:** Compare the proposed checks to that fixed derivation and materialize the near-misses against post-setup valid fixtures.
+5. **Discrimination:** Require PASS on the valid fixture and FAIL on every authored invalid fixture, not ERROR.
+6. **Sham challenge:** Require FAIL on one or two independently derived incomplete implementations per non-structural behavioral criterion.
+7. **Adversarial:** Retain bounded recipe-target deletion and incorrect-content probes as secondary wiring evidence.
+8. **Determinism and wiring:** Repeat independent valid fixtures and reject inconsistent outcomes or empty-target PASS.
+9. **Baseline:** Record all current-candidate outcomes without completing the goal.
+
+A sham can preserve exports while removing persistence, hardcode a result, or bypass a guard.
+The near-miss concepts come from the request and criterion requirements before the reviewer sees authored checks or controls.
+The second phase receives bounded repository context, checks, controls, and valid-fixture source content.
+Each sham starts from an independent valid fixture and uses the existing confined mutation operations.
+Shams cannot edit conventional test files or runner selection.
+A surviving sham rejects the evaluator.
+An unchanged fixture, failed setup, unsafe mutation, timeout, or runner ERROR is not successful challenge evidence.
+
+A behavior must be observed through its state or effects, not merely file or symbol existence.
+Literal artifact requirements such as including LICENSE can use structural evidence with an explicit justification.
+Material negative cases and relevant regression mappings are required when the request or architecture implies them.
+The reviewer checks semantic overlap and unnecessary test duplication.
+It prefers existing relevant tests, then focused tests in the existing framework, then standard recipes, then custom commands.
+Review findings produce repair diagnostics rather than silently rewriting criteria.
+The internal coverage and risk evidence is available in status, not added as a routine user-facing matrix.
+
+### Model calls and bounds
+
+New root and child preparation uses the currently selected Pi model through `ctx.modelRegistry.streamSimple()`.
+It makes at most two separate, tool-free calls per preparation.
+Each call has a 30-second cancellation/time bound and an 8192-token output limit.
+Provider errors, invalid JSON, malformed or missing review evidence, and cancellation prevent approval.
+There is no host-execution or heuristic fallback and no automatic provider retry.
+Review source context is limited to 64 files, 12 KiB per file, and 96 KiB total per repository view.
+Hidden paths, credential-named files, binary files, and symlink targets are excluded from source context.
+Large contracts exceeding the adapter input bound require a narrower evaluator.
+Repository context can be incomplete; the reviewer must report insufficient evidence rather than assume success.
+Model calls add cost and latency even when mechanical probe evidence is cached.
+Nested model usage is reported in tool results and accumulated in preparation metrics.
+Core integrations must supply an independent `io.review(input, {signal})` callback.
+Tests and benchmarks use explicitly injected deterministic reviewers, not a production bypass.
 
 Diagnostics contain `code`, `stage`, `criterionId`, `evidence`, `repairability`, and `recommendedRepair`.
 Examples include INTENT_UNCOVERED, TEST_SELECTOR_NOT_FOUND, REJECT_NOT_DISCRIMINATED, EMPTY_TARGET_PASS, NONDETERMINISTIC, and EXTERNAL_DEPENDENCY.
@@ -163,22 +197,12 @@ The original clock and implementation counters never reset.
 Intent and evaluator digests are separate.
 Approval binds the exact validation evidence and candidate/environment identity as well as the semantic plan.
 
-### Semantic audit rubric
+### Semantic limits
 
-The agent must review each criterion against these questions before submission.
-
-- Does every materially distinct requested outcome have a criterion mapping?
-- Is the requirement observable from user-visible behavior or an actual artifact?
-- Does it duplicate another criterion or merely restate the goal?
-- Is it an implementation preference rather than a required outcome?
-- Is an assumption being presented as a user requirement?
-- Can fixtures detect plausible defects beyond the author's example?
-- Does a repository convention resolve an ambiguity without asking the user?
-
-Declared coverage is mechanically testable.
-The choice and completeness of intent atoms remain judgment-dependent.
-ExitCode does not prove semantic equivalence or exhaustive intent capture.
-Finite adversarial mutations cannot prove the absence of every defect.
+Independent review reduces correlated evaluator-author mistakes but is still model judgment.
+The same selected model can repeat its earlier blind spots in a separate call.
+Finite sham tests cannot prove semantic equivalence, exhaustive intent capture, or the absence of every defect.
+Review and execution strengthen the evidence; they do not turn approval into a formal proof.
 
 ## Isolation and preservation
 
@@ -238,13 +262,16 @@ Legacy sealed bundles retain their acceptance contracts and fresh recursive eval
 Unsealed legacy drafts cannot reuse old draft-only approval.
 They must prepare safely and obtain fresh validated-plan approval.
 Legacy shell drafts acquire an explicit criterion coverage map during migration.
-That map does not substitute for the agent's semantic audit.
+That map does not substitute for independent review.
+Newly prepared drafts and children must pass the stronger gate.
+Already-sealed bundles do not require new model review and keep their exact acceptance contracts.
 Interrupted preparation returns to a locked preparation phase on reload.
 
 ## Instrumentation and benchmark
 
 Status exposes evaluator proposals, preparation attempts, probe/shell executions, fixture counts/bytes, elapsed preparation time, diagnostic categories, review turns, cache hits, and peak concurrency.
-Token usage is explicitly unavailable unless the host supplies it.
+Model usage is available for Pi review calls.
+Other integrations report usage only when their host supplies it.
 No token reduction claim is made.
 
 Run the reproducible benchmark:
@@ -258,7 +285,8 @@ The benchmark reports cold, warm, selective-repair, and fresh-evaluation counts 
 One content-keyed base snapshot supports independent derivatives.
 At most four probes run concurrently.
 Unchanged built-in recipe evidence is reused during preparation.
-A changed criterion reruns only its affected probes.
+A changed criterion reruns its affected mechanical probes.
+Independent review runs again and any changed sham materialization gets its own probe key.
 Candidate or environment changes invalidate the base and evidence.
 Reload discards in-memory preparation caches, not approved state or budgets.
 Final evaluation always runs fresh.
@@ -269,6 +297,6 @@ The benchmark demonstrates operation-count savings, not a universal latency perc
 
 Long-running work still requires a live Pi session.
 The adapter sends at most three continuation nudges per idle stretch.
-There is no external scheduler, parallel worker pool, automatic semantic test writer, or universal repair engine.
+There is no external scheduler, parallel worker pool, exhaustive semantic test writer, or universal repair engine.
 Useful criteria, ambiguity selection, and child decomposition remain model-dependent.
 Keep the original objective above extension housekeeping and commit reminders.

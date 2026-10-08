@@ -4,11 +4,13 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { makeIo, draftNode, prepareNode, approveRoot, sealNode, evaluateNode, loadNodeState } from '../exitcode-core.mjs';
 
+import { structuralReview } from '../test/structural-review.mjs';
+
 const cwd=fs.mkdtempSync(path.join(os.tmpdir(),'exitcode-benchmark-'));
 const behavior=(id,file)=>({id,requirement:`Complete ${file}`,check:{recipe:{kind:'file_contains',path:file,value:'done'}},controls:{accept:{mutations:[{kind:'write_file',path:file,content:'done'}]},reject:[{mutations:[{kind:'write_file',path:file,content:'pending'}]}]}});
 try {
   for(const file of ['a','b'])fs.writeFileSync(path.join(cwd,file),'pending');
-  const io=makeIo(cwd),criteria=[behavior('C1','a'),behavior('C2','b'),{id:'C3',requirement:'Keep a',type:'regression',check:{recipe:{kind:'file_exists',path:'a'}}}];
+  const io=makeIo(cwd,{review:structuralReview}),criteria=[behavior('C1','a'),behavior('C2','b'),{id:'C3',requirement:'Keep a',type:'regression',check:{recipe:{kind:'file_exists',path:'a'}}}];
   const args={goal:'Complete both artifacts',criteria,intentAtoms:criteria.map(c=>({id:`I-${c.id}`,outcome:c.requirement,criteria:[c.id]})),policy:{evaluatorAttempts:6}};
   const draft=draftNode(io,args);if(!draft.ok)throw new Error(JSON.stringify(draft));
   const cold=await prepareNode(io,draft.id),warm=await prepareNode(io,draft.id);

@@ -101,7 +101,7 @@ type ToolDef = {
   execute: (
     toolCallId: string,
     params: any,
-    signal: unknown,
+    signal: AbortSignal | undefined,
     onUpdate: unknown,
     ctx: ExtensionToolContext,
   ) => Promise<{ content: Array<{ type: "text"; text: string }>; details: unknown; isError?: boolean }>;
@@ -133,6 +133,33 @@ function cascadeLines(cascade: { events?: string[]; terminal?: { root: string; s
   const lines = [...(cascade.events ?? [])];
   if (cascade.terminal) lines.push(`terminal: root ${cascade.terminal.root} ${cascade.terminal.status}`);
   return lines;
+}
+
+// Each operation owns its usage and cancellation. No background model calls or retries.
+function reviewIo(ctx: ExtensionContext, signal?: AbortSignal) {
+  const usage = { input:0,output:0,cacheRead:0,cacheWrite:0,totalTokens:0,
+    cost:{input:0,output:0,cacheRead:0,cacheWrite:0,total:0} };
+  const io = core.makeIo(ctx.cwd, { signal: signal ?? ctx.signal, reviewUsage:usage,
+    review: async (input: any, options: {signal:AbortSignal}) => {
+      if (!ctx.model || !ctx.modelRegistry?.streamSimple) throw new Error("selected review model unavailable");
+      const encoded=JSON.stringify(input);
+      if(encoded.length>2*1024*1024)throw new Error("review input exceeds bounded context; reduce evaluator scope");
+      const result=await ctx.modelRegistry.streamSimple(ctx.model, {
+        systemPrompt:core.reviewPrompt(input.phase),
+        messages:[{role:"user",content:encoded,timestamp:Date.now()}],
+      }, {maxTokens:core.REVIEW_MAX_TOKENS,signal:options.signal}).result();
+      // Provider errors can still carry billable usage.
+      for(const k of ["input","output","cacheRead","cacheWrite","totalTokens"] as const)
+        usage[k]+=result.usage?.[k] ?? 0;
+      for(const k of ["input","output","cacheRead","cacheWrite","total"] as const)
+        usage.cost[k]+=result.usage?.cost?.[k] ?? 0;
+      if(result.stopReason!=="stop")throw new Error(result.errorMessage ?? `review stopped: ${result.stopReason}`);
+      const text=result.content.filter(b=>b.type==="text").map(b=>b.text).join("");
+      if(text.length>512*1024)throw new Error("review output exceeds bounded response");
+      return JSON.parse(text);
+    },
+  });
+  return io;
 }
 
 export default function (pi: ExtensionAPI) {
@@ -259,15 +286,15 @@ export default function (pi: ExtensionAPI) {
     }
   };
 
-  const sealContract = async (nodeId: string, ctx: ExtensionContext, userApproval?: string) => {
-    const io = core.makeIo(ctx.cwd);
+  const sealContract = async (nodeId: string, ctx: ExtensionContext, userApproval?: string, signal?: AbortSignal) => {
+    const io = reviewIo(ctx,signal);
     const result = await core.sealNode(io, nodeId, { userApproval });
     maybeAutoExit(result.cascade ?? result, ctx);
     syncDiscoveryTools(ctx);
     if (!result.ok && !result.events) {
       const lines = [`seal rejected:`, errLines(result)];
       if (typeof result.sealAttemptsLeft === "number") lines.push(`seal proposals left: ${result.sealAttemptsLeft}`);
-      return textResult(lines.join("\n"), result, true);
+      return {...textResult(lines.join("\n"), result, true),usage:io.reviewUsage};
     }
     const lines = result.sealed
       ? [`sealed ${result.sealed}. baseline: ${result.baseline}`]
@@ -276,7 +303,7 @@ export default function (pi: ExtensionAPI) {
     lines.push(...cascadeLines(result.cascade));
     if (result.next) lines.push(`next: ${result.next}`);
     if (result.terminal) lines.push(`terminal: root ${result.terminal.root} ${result.terminal.status}`);
-    return textResult(withWarnings(lines, result.warnings).join("\n"), result);
+    return {...textResult(withWarnings(lines, result.warnings).join("\n"), result),usage:io.reviewUsage};
   };
 
   const defs: ToolDef[] = [
@@ -321,7 +348,7 @@ export default function (pi: ExtensionAPI) {
       execute: async (_id, params, _signal, _onUpdate, ctx) => {
         assertMode();
         rt.nudges = 0;
-        const io = core.makeIo(ctx.cwd);
+        const io = reviewIo(ctx,_signal);
         if (rt.rootId && !core.statusSnapshot(io).active) {
           return textResult("draft rejected:\n- the previous root is terminal or missing; the user must cancel with /exitcode exit before starting a new goal", { ok: false }, true);
         }
@@ -344,8 +371,8 @@ export default function (pi: ExtensionAPI) {
         syncDiscoveryTools(ctx);
         const prepared = await core.prepareNode(io,result.id);
         syncDiscoveryTools(ctx);
-        if (!prepared.ok) return textResult(`Evaluator preparation needs repair:\n${errLines(prepared)}${prepared.questions?.length ? '\nClarification: '+JSON.stringify(prepared.questions) : ''}`,prepared,true);
-        return textResult(prepared.review,prepared);
+        if (!prepared.ok) return {...textResult(`Evaluator preparation needs repair:\n${errLines(prepared)}${prepared.questions?.length ? '\nClarification: '+JSON.stringify(prepared.questions) : ''}`,prepared,true),usage:io.reviewUsage};
+        return {...textResult(prepared.review,prepared),usage:io.reviewUsage};
       },
     },
     {
@@ -365,7 +392,7 @@ export default function (pi: ExtensionAPI) {
       execute: async (_id, params, _signal, _onUpdate, ctx) => {
         assertMode();
         rt.nudges = 0;
-        return sealContract(params.node, ctx, params.userApproval);
+        return sealContract(params.node, ctx, params.userApproval,_signal);
       },
     },
     {

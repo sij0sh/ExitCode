@@ -33,7 +33,7 @@ import {
   loadBundle,
   loadNodeState,
   loadRoot,
-  makeIo,
+  makeIo as hostMakeIo,
   matchesExpect,
   nextAction,
   resolveModeFromBranch,
@@ -52,6 +52,9 @@ import {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+import { structuralReview } from './test/structural-review.mjs';
+const makeIo = (cwd,overrides={}) => hostMakeIo(cwd,{review:structuralReview,...overrides});
 
 const behavior = (id, cmd) => ({
   id,
@@ -445,7 +448,7 @@ test("seal: fixtures and checkpoints accept trees above the old 64 MiB cap", asy
   assert.equal(sealed.ok, true, JSON.stringify(sealed));
   assert.deepEqual(sealed.warnings, []);
   assert.equal(digestTree(dir), before);
-  assert.equal(new Set(fixtures).size, 3);
+  assert.equal(new Set(fixtures).size, 4);
   assert.equal(fixtures.every((fixture) => !fs.existsSync(fixture)), true);
   const node = loadNodeState(io, drafted.id);
   assert.equal(node.checkpoints.length, 1);

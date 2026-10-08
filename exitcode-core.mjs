@@ -1408,7 +1408,7 @@ export async function prepareNode(io, nodeId = null) {
     const parentBundle=node.parentId?loadBundle(io,node.parentId):null;
     const validation=validateStructure(draft,{policy:root.policy,parent:parentBundle,parentDepth:node.parentId?depthOf(node.parentId):-1,parentLastResult:node.parentId?loadNodeState(io,node.parentId)?.lastResult:null});
     if(!validation.ok)result={ok:false,errors:validation.errors,diagnostics:validation.errors.map(e=>diagnostic('INVALID_STRUCTURE','lint',null,e,'Correct evaluator structure')),stages:[],metrics:{...emptyMetrics(),e0Attempts:1}};
-    else result=await prepareGate(draft,{cwd:io.cwd,exec:io.exec,runCheck,defaultTimeoutMs:defaultTimeoutMs(root),environment,maxBytes:SNAPSHOT_MAX_BYTES,candidateDigest:digestTree(io.cwd)});
+    else result=await prepareGate({...draft,...(parentBundle?{parentRequirement:parentBundle.contract.criteria.find(c=>c.id===node.target)?.requirement}: {})},{cwd:io.cwd,exec:io.exec,runCheck,defaultTimeoutMs:defaultTimeoutMs(root),environment,maxBytes:SNAPSHOT_MAX_BYTES,candidateDigest:digestTree(io.cwd),review:io.review,signal:io.signal,reviewTimeoutMs:io.reviewTimeoutMs});
   }catch(e){result={ok:false,errors:[e.message],diagnostics:[diagnostic('PREPARATION_FAILED','baseline',null,e.message,'Correct evaluator inputs')],stages:[],metrics:{...emptyMetrics(),e0Attempts:1}};}
   if(result.ok && stableStringify(environment)!==stableStringify(evaluatorEnvironment(io.cwd))){result.ok=false;result.diagnostics.push(diagnostic('ENVIRONMENT_CHANGED','baseline',node.id,'Environment changed during preparation','Reprepare against a stable environment'));result.errors.push('Environment changed during preparation');}
   if(result.ok && isExpired(root,io.nowMs())){result.ok=false;result.diagnostics.push(diagnostic('DEADLINE_EXCEEDED','baseline',node.id,'Deadline elapsed during preparation','Cancel and start a new run'));result.errors.push('shared deadline exceeded');}
@@ -1417,6 +1417,7 @@ export async function prepareNode(io, nodeId = null) {
     delete current.preparing;saveNodeState(io,current);
     return {ok:false,errors:["contract changed during preparation"],diagnostics:[diagnostic('CONTRACT_CHANGED','baseline',node.id,'Concurrent revision','Reprepare current draft')]};
   }
+  if(io.reviewUsage)result.metrics.tokenUsage={available:true,...io.reviewUsage};
   delete current.preparing;addMetrics(current.evaluatorMetrics,{...result.metrics,e0Attempts:0});current.diagnostics=result.diagnostics;current.repairs=repairs;
   if(result.ok && !isExpired(currentRoot,io.nowMs())){
     current.phase="READY_FOR_APPROVAL";
@@ -1875,3 +1876,5 @@ export function resumePreparation(io) {
   const index=loadIndex(io.cwd), root=index.activeRootId?loadRoot(io,index.activeRootId):null;
   for(const id of root?.stack??[]){const node=loadNodeState(io,id);if(node?.preparing){delete node.preparing;node.phase="EVALUATOR_PREPARATION";delete node.prepared;saveNodeState(io,node);}}
 }
+
+export { reviewPrompt, REVIEW_TIMEOUT_MS, REVIEW_MAX_TOKENS } from './exitcode-quality.mjs';

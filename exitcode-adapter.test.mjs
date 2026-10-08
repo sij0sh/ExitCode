@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { stripTypeScriptTypes } from "node:module";
 import { test } from "node:test";
 import * as core from "./exitcode-core.mjs";
+import { structuralRegistry } from "./test/structural-review.mjs";
 
 // Exercise the actual adapter without requiring Pi's host-provided packages.
 // Schema constructors are inert here; the supervisor validates draft behavior.
@@ -50,7 +51,7 @@ function harness(t, content = "todo\n", initialTools = ["read", "write", "bash"]
     sendMessage: (message, options) => messages.push({ ...message, ...options }),
   };
   const ctx = {
-    cwd, hasUI: false, mode: "print", isIdle: () => idle,
+    cwd, hasUI: false, mode: "print", model:{id:"test-model",provider:"test"},modelRegistry:structuralRegistry(), isIdle: () => idle,
     ui: { notify: (content, type) => notifications.push({ content, type }) },
     sessionManager: { getBranch: () => entries },
   };
@@ -723,4 +724,43 @@ test("adapter: exhausted evaluator construction remains restricted", async t=>{
  await h.tool('exitcode_draft',{goal:'g',criteria:broken,revise:'G1'});
  await h.tool('exitcode_draft',{goal:'g',criteria:broken,revise:'G1'});
  assert.equal(core.loadRoot(core.makeIo(h.cwd),'G1').status,'BLOCKED');assertRestricted(h);assert.equal(await h.events.get('agent_before_settle')({},h.ctx),undefined);assert.equal(core.resolveModeFromBranch(h.entries).on,true);
+});
+
+
+// Real selected-model boundary, including billable failures and operation cancellation.
+import { reviewRegistry } from './test/adapter-review-cases.mjs';
+for(const mode of ['success','error','invalid-json','malformed','length','missing-model','cancel'])test(`adapter: independent review ${mode}`,async t=>{
+  const h=harness(t),registry=reviewRegistry(mode);h.ctx.modelRegistry=registry;
+  if(mode==='missing-model')h.ctx.model=undefined;
+  await h.command('Write literal done into feature.txt and preserve the artifact');
+  const controller=new AbortController();
+  if(mode==='cancel')setTimeout(()=>controller.abort(),20);
+  const result=await h.tools.get('exitcode_draft').execute('review-call',{
+    goal:'Literal artifact',criteria,intentAtoms:criteria.map(c=>({id:c.id,outcome:c.requirement,criteria:[c.id]})),
+  },controller.signal,()=>{},h.ctx);
+  for(const c of registry.calls){
+    assert.equal(c.model,h.ctx.model);assert.ok(c.options.signal instanceof AbortSignal);
+    assert.ok(c.options.maxTokens>0&&c.options.maxTokens<=8192);assert.ok(!c.context.tools?.length);
+  }
+  if(registry.calls.length){
+    const first=registry.calls[0];assert.equal(first.input.phase,'derive');
+    assert.equal(first.input.originalRequest,'Write literal done into feature.txt and preserve the artifact');
+    assert.ok(!JSON.stringify(first.input).includes('controls'));assert.ok(!JSON.stringify(first.input).includes('grep -qx'));
+  }
+  if(mode==='success'){
+    assert.equal(registry.calls.length,2);assert.equal(result.isError,undefined);
+    assert.equal(result.usage.input,22);assert.equal(result.usage.output,14);
+    assert.equal(core.loadNodeState(core.makeIo(h.cwd),'G1').evaluatorMetrics.tokenUsage.input,22);
+    assert.equal(core.statusSnapshot(core.makeIo(h.cwd)).awaitingApproval,true);
+    assert.equal(await h.events.get('agent_before_settle')({},h.ctx),undefined);
+    // Repeated preparation uses new review calls even if artifact probes are cached.
+    const revised=await h.tool('exitcode_draft',{goal:'Literal artifact',criteria,revise:'G1'});
+    assert.equal(revised.usage.input,22);assert.equal(registry.calls.length,4);
+    assert.equal(core.loadNodeState(core.makeIo(h.cwd),'G1').evaluatorMetrics.tokenUsage.input,44);
+  }else{
+    assert.equal(result.isError,true);assert.equal(core.statusSnapshot(core.makeIo(h.cwd)).awaitingApproval,false);
+    assert.equal(core.approveRoot(core.makeIo(h.cwd)).ok,false);assertRestricted(h);
+    if(['error','invalid-json','malformed','length'].includes(mode))assert.equal(result.usage.input,11);
+    if(mode==='cancel')assert.equal(registry.calls[0].options.signal.aborted,true);
+  }
 });

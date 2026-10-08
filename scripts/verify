@@ -4,6 +4,9 @@ cd "$(dirname "$0")/.."
 node --check exitcode-core.mjs
 node --check exitcode-evaluator.mjs
 node --check exitcode-preparation.mjs
+node --check exitcode-quality.mjs
+node --check exitcode-semantic.test.mjs
+node --check exitcode-adapter.test.mjs
 node --check exitcode-evaluator-quality.test.mjs
 node --check scripts/benchmark-evaluator.mjs
 node --check exitcode.ts

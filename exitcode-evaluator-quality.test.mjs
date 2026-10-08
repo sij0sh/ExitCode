@@ -4,6 +4,8 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { test } from 'node:test';
 import * as core from './exitcode-core.mjs';
+import { structuralReview } from './test/structural-review.mjs';
+const makeIo=(cwd,overrides={})=>core.makeIo(cwd,{review:structuralReview,...overrides});
 import { applyMutations, auditIntent, candidateIdentity, compileRecipe, runRecipe, sandboxCommand, scanCapabilities } from './exitcode-evaluator.mjs';
 import { releasePreparation } from './exitcode-preparation.mjs';
 
@@ -17,14 +19,14 @@ function criteria(){return [{id:'C1',requirement:'Feature is done',check:{recipe
 function args(cs=criteria()){return {goal:'Complete feature',criteria:cs,intentAtoms:cs.map(c=>({id:'I'+c.id,outcome:c.requirement,criteria:[c.id]}))};}
 
 test('evaluator-quality: overfitted reject fixture never reaches review',async t=>{
-  const cwd=project(t),io=core.makeIo(cwd),cs=criteria();cs[0].controls.reject[0].mutations[0].content='done';
+  const cwd=project(t),io=makeIo(cwd),cs=criteria();cs[0].controls.reject[0].mutations[0].content='done';
   const d=core.draftNode(io,args(cs));assert.ok(d.ok);const p=await core.prepareNode(io,d.id);
   assert.equal(p.ok,false);assert.ok(p.diagnostics.some(d=>d.code==='REJECT_NOT_DISCRIMINATED'));assert.equal(p.review,undefined);assert.equal(core.statusSnapshot(io).awaitingApproval,false);assert.equal(core.approveRoot(io).ok,false);
   assert.equal(core.draftNode(io,{...args(),revise:d.id}).ok,true);assert.equal((await core.prepareNode(io,d.id)).ok,true);assert.equal(core.statusSnapshot(io).consumedAttempts,0);
 });
 
 test('evaluator-quality: false-positive evaluator fails independent adversarial deletion',async t=>{
-  const cwd=project(t),io=core.makeIo(cwd),cs=criteria();cs[0].check.recipe={kind:'file_not_contains',path:'feature',value:'bad'};cs[0].controls.reject[0].mutations[0].content='bad';
+  const cwd=project(t),io=makeIo(cwd),cs=criteria();cs[0].check.recipe={kind:'file_not_contains',path:'feature',value:'bad'};cs[0].controls.reject[0].mutations[0].content='bad';
   core.draftNode(io,args(cs));const p=await core.prepareNode(io,'G1');assert.equal(p.ok,true);
   const empty=fs.mkdtempSync(path.join(os.tmpdir(),'quality-empty-'));try{assert.equal((await runRecipe(cs[0].check.recipe,{cwd:empty})).exit,1);}finally{fs.rmSync(empty,{recursive:true,force:true});}
   assert.ok(p.stages.find(s=>s.stage==='adversarial').probes.length>=2);
@@ -37,7 +39,7 @@ test('evaluator-quality: uncovered intent and duplicate criteria rejected',()=>{
 });
 
 test('evaluator-quality: material ambiguity pauses once and minor choices do not',async t=>{
-  const cwd=project(t),io=core.makeIo(cwd);
+  const cwd=project(t),io=makeIo(cwd);
   const ambiguity={question:'Compatibility?',plausibleAnswers:['Keep','Break'],recommendedDefault:'Keep',whyMaterial:'Changes compatibility',affectedCriteria:['C1'],unresolved:true};
   core.draftNode(io,{...args(),ambiguities:[ambiguity]});const p=await core.prepareNode(io,'G1');assert.equal(p.phase,'CLARIFICATION');assert.equal(p.questions.length,1);assert.equal(p.review,undefined);
   for(const patch of [{unresolved:false},{plausibleAnswers:['Keep']},{whyMaterial:''},{affectedCriteria:[]}])assert.equal(auditIntent({...args(),ambiguities:[{...ambiguity,...patch}]}).questions.length,0);
@@ -66,11 +68,11 @@ test('evaluator-quality: unsafe paths symlinks and JSON prototype keys rejected'
 
 test('evaluator-quality: external dependencies are typed pre-review failures',async t=>{
   const cwd=project(t),cs=criteria();cs[0].check={command:'curl https://example.com'};
-  const io=core.makeIo(cwd);core.draftNode(io,args(cs));const p=await core.prepareNode(io,'G1');assert.equal(p.ok,false);assert.ok(p.diagnostics.some(d=>d.code==='EXTERNAL_DEPENDENCY'));assert.equal(p.review,undefined);
+  const io=makeIo(cwd);core.draftNode(io,args(cs));const p=await core.prepareNode(io,'G1');assert.equal(p.ok,false);assert.ok(p.diagnostics.some(d=>d.code==='EXTERNAL_DEPENDENCY'));assert.equal(p.review,undefined);
 });
 
 test('evaluator-quality: inconsistent probe results fail determinism',async t=>{
-  const cwd=project(t);let n=0;const io=core.makeIo(cwd,{exec:async(_cmd,{cwd:fixture,writable})=>{
+  const cwd=project(t);let n=0;const io=makeIo(cwd,{exec:async(_cmd,{cwd:fixture,writable})=>{
     if(writable)return {exit:0,stdout:'',stderr:'',timedOut:false};
     const feature=fs.existsSync(path.join(fixture,'feature'))?fs.readFileSync(path.join(fixture,'feature'),'utf8'):'';
     return {exit:feature.includes('done')?0:1,stdout:feature.includes('done')?String(++n):'',stderr:'',timedOut:false};
@@ -78,7 +80,7 @@ test('evaluator-quality: inconsistent probe results fail determinism',async t=>{
 });
 
 test('evaluator-quality: evaluator budget is separate and shared clock never resets',async t=>{
-  const cwd=project(t),io=core.makeIo(cwd),cs=criteria();cs[0].controls.reject[0].mutations[0].content='done';core.draftNode(io,{...args(cs),policy:{evaluatorAttempts:2}});
+  const cwd=project(t),io=makeIo(cwd),cs=criteria();cs[0].controls.reject[0].mutations[0].content='done';core.draftNode(io,{...args(cs),policy:{evaluatorAttempts:2}});
   const root=core.loadRoot(io,'G1');await core.prepareNode(io,'G1');await core.prepareNode(io,'G1');const b=await core.prepareNode(io,'G1');assert.equal(b.terminal.status,'BLOCKED');assert.equal(core.loadRoot(io,'G1').consumedAttempts,0);assert.equal(core.loadRoot(io,'G1').deadlineAt,root.deadlineAt);
 });
 
@@ -90,7 +92,7 @@ test('evaluator-quality: full-content identity catches middle bytes modes and sy
 });
 
 test('evaluator-quality: stale candidate environment and bundle evidence invalidate approval',async t=>{
-  const cwd=project(t),io=core.makeIo(cwd);core.draftNode(io,args());assert.equal((await core.prepareNode(io,'G1')).ok,true);
+  const cwd=project(t),io=makeIo(cwd);core.draftNode(io,args());assert.equal((await core.prepareNode(io,'G1')).ok,true);
   fs.mkdirSync(path.join(cwd,'node_modules'));fs.writeFileSync(path.join(cwd,'node_modules','dependency'),'changed');assert.equal(core.approveRoot(io).ok,false);
   assert.equal((await core.prepareNode(io,'G1')).ok,true);const node=core.loadNodeState(io,'G1');node.prepared.baseline.allPass=true;core.saveNodeState(io,node);assert.equal(core.approveRoot(io).ok,false);
 });
@@ -107,7 +109,7 @@ test('evaluator-quality: isolation hides host paths env network and host process
 });
 
 test('evaluator-quality: fresh evaluation bypasses preparation cache and seal never completes',async t=>{
-  const cwd=project(t),io=core.makeIo(cwd);fs.writeFileSync(path.join(cwd,'feature'),'done');core.draftNode(io,args());await core.prepareNode(io,'G1');await core.prepareNode(io,'G1');assert.equal(core.approveRoot(io).ok,true);await core.sealNode(io,'G1');assert.equal(core.loadRoot(io,'G1').status,'ACTIVE');
+  const cwd=project(t),io=makeIo(cwd);fs.writeFileSync(path.join(cwd,'feature'),'done');core.draftNode(io,args());await core.prepareNode(io,'G1');await core.prepareNode(io,'G1');assert.equal(core.approveRoot(io).ok,true);await core.sealNode(io,'G1');assert.equal(core.loadRoot(io,'G1').status,'ACTIVE');
   await core.evaluateNode(io);assert.equal(core.loadRoot(io,'G1').status,'PASS');assert.ok(core.loadNodeState(io,'G1').lastResult.metrics.probeExecutions>0);
 });
 
@@ -115,7 +117,7 @@ test('evaluator-quality: fresh evaluation bypasses preparation cache and seal ne
 test('evaluator-quality: build and Node test recipes may write only their copied fixture',async t=>{
   const cwd=project(t);fs.writeFileSync(path.join(cwd,'package.json'),JSON.stringify({scripts:{build:'node -e "require(\'fs\').writeFileSync(\'built\',\'yes\')"'}}));
   fs.writeFileSync(path.join(cwd,'writes.test.mjs'),"import {test} from 'node:test';import {writeFileSync} from 'node:fs';test('writes output',()=>writeFileSync('test-output','ok')); ");
-  assert.equal((await runRecipe({kind:'build_succeeds'},{cwd})).exit,0);
+  const built=await runRecipe({kind:'build_succeeds'},{cwd});assert.equal(built.exit,0,JSON.stringify(built));
   assert.equal((await runRecipe({kind:'existing_test',path:'writes.test.mjs',selector:'writes output'},{cwd})).exit,0);
 });
 
@@ -128,6 +130,6 @@ test('evaluator-quality: checkpoints restore modes and symlinks without writing 
 });
 
 test('evaluator-quality: numeric timeout normalization and interrupted budgets are persistent',async t=>{
-  const cwd=project(t),io=core.makeIo(cwd),cs=criteria();cs[0].check.timeoutSeconds='3';assert.equal(core.draftNode(io,args(cs)).ok,true);assert.equal((await core.prepareNode(io)).ok,true);
+  const cwd=project(t),io=makeIo(cwd),cs=criteria();cs[0].check.timeoutSeconds='3';assert.equal(core.draftNode(io,args(cs)).ok,true);assert.equal((await core.prepareNode(io)).ok,true);
   const node=core.loadNodeState(io,'G1'),attempts=node.evaluatorMetrics.e0Attempts;node.preparing=true;core.saveNodeState(io,node);core.resumePreparation(io);assert.equal(core.loadNodeState(io,'G1').phase,'EVALUATOR_PREPARATION');assert.equal(core.loadNodeState(io,'G1').evaluatorMetrics.e0Attempts,attempts);assert.equal(core.approveRoot(io).ok,false);
 });
