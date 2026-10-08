@@ -7,19 +7,20 @@ It then enforces that exact plan through fresh evaluation, bounded repair, and f
 ## Workflow
 
 ```text
-Request -> Discovery -> optional Clarification -> EVALUATOR_PREPARATION
-        -> READY_FOR_APPROVAL -> Approval -> Seal -> Execution
-        -> fresh Evaluation -> Repair or child -> fresh root PASS
+Request -> Discovery -> EVALUATOR_PREPARATION -> READY_FOR_APPROVAL
+        -> Approval -> Seal -> Execution -> fresh Evaluation
+        -> Repair or child -> fresh root PASS
 ```
 
 1. Inspect the request, implementation, tests, and likely regressions.
-2. Declare materially distinct request outcomes and map them to observable criteria.
-3. Reuse relevant repository tests before constructing focused checks and positive/negative fixtures.
-4. Independently review outcomes and challenge the evaluator with sham implementations inside candidate copies.
-5. Repair typed evaluator failures before asking for approval.
-6. Present the validated goal, criteria, assumptions, exclusions, and verification summary.
-7. Approve the exact validated plan or request changes.
-8. Implement and evaluate all sealed criteria fresh.
+2. Submit the smallest observable contract: a goal, a few criteria with checks, and any assumptions or exclusions.
+3. ExitCode independently derives the request's outcomes, validates the checks, and challenges them with sham implementations inside candidate copies.
+4. Repair typed evaluator failures before asking for approval.
+5. Present the validated plan; ExitCode generates its verification summary from the evidence.
+6. Approve the exact validated plan or request changes.
+7. Implement and evaluate all sealed criteria fresh.
+
+A pre-seal evaluator describes evidence; it must not encode a second implementation of the goal.
 
 Mechanical evaluator failures do not request another approval.
 A requested plan change requires preparation and review again.
@@ -28,9 +29,8 @@ A passing baseline does not complete the goal.
 Only fresh supervisor evaluation can close it.
 
 The normal path needs one approval and no clarification turn.
-Ask a question only when there are multiple credible interpretations, a material effect on acceptance or compatibility, and no resolved repository convention or default.
-Group at most three questions and include the recommended default.
-A material unresolved question pauses the run in CLARIFICATION.
+Ask a question in conversation, before drafting, only when ambiguity materially changes success and no repository convention or default resolves it.
+Clarification is not part of the contract schema.
 READY_FOR_APPROVAL pauses automatic continuation; the candidate stays read-only until sealing.
 Silence and requests for changes are not approval.
 
@@ -58,7 +58,7 @@ Unavailable isolation is a runner error, not evidence of a detected defect.
 | Command | Purpose |
 | --- | --- |
 | `/exitcode approve` | Approve and seal the exact validated plan. |
-| `/exitcode status` | Show policy, original request, commands, digests, evidence, metrics, and next action. |
+| `/exitcode status [evidence]` | Show phase, criteria, budgets, diagnostics, and next action; `evidence` adds the full contract, E0 evidence, digests, and metrics. |
 | `/exitcode exit` | Cancel enforcement without claiming success or deleting work. |
 | `/exitcode resume [Gid]` | Resume the same root, pending review, or saved operation, even while mode is on. |
 | `/exitcode resume minutes=N attempts=N evaluators=N` | Record explicit positive execution or evaluator-construction grants and resume. |
@@ -78,7 +78,9 @@ Stale candidate, environment, or evaluator evidence requires preparation and app
 `exitcode_child` proposes one reduction of a failed parent criterion.
 `exitcode_block` preserves a concrete blocker as a resumable root pause.
 Only a genuinely declined child path uses `NO_PATH` to withdraw child edits and rerun its ancestors.
-`exitcode_status` exposes detailed mechanics.
+`exitcode_status` shows operational state; `detail: "evidence"` adds full mechanics for debugging.
+Each agent turn receives only the five-sentence protocol and a status summary capped at 4 KiB.
+That summary never includes checks, controls, evaluator evidence, or metrics.
 Only root PASS automatically exits mode.
 PAUSED and legacy BLOCKED roots keep enforcement on until user cancellation.
 
@@ -146,28 +148,36 @@ No HTTP, JSON Schema, or non-Node runner integration is included.
 ```json
 {
   "goal": "Finish the feature",
-  "intentAtoms": [
-    {"id": "I1", "outcome": "The requested result artifact contains done", "criteria": ["C1"]},
-    {"id": "I2", "outcome": "Existing artifact remains", "criteria": ["C2"]}
-  ],
   "criteria": [
     {
-      "id": "C1",
       "requirement": "Feature artifact contains the result",
-      "check": {"recipe": {"kind": "file_contains", "path": "result.txt", "value": "done"}},
-      "controls": {
-        "accept": {"mutations": [{"kind": "write_file", "path": "result.txt", "content": "done"}]},
-        "reject": [{"mutations": [{"kind": "write_file", "path": "result.txt", "content": "pending"}]}]
-      }
+      "check": {"recipe": {"kind": "file_contains", "path": "result.txt", "value": "done"}}
     },
     {
-      "id": "C2", "type": "regression",
-      "requirement": "Existing artifact remains present",
-      "check": {"recipe": {"kind": "file_exists", "path": "result.txt"}}
+      "type": "regression",
+      "requirement": "Existing profile behavior still passes",
+      "check": {"recipe": {"kind": "existing_test", "path": "profile.test.mjs", "selector": "profile artifact remains"}}
     }
   ]
 }
 ```
+
+### Positive witnesses and controls
+
+Controls are optional.
+A control is a minimal witness that the check can discriminate, not a reference implementation of the feature.
+
+| Check | Positive witness | Negative evidence |
+| --- | --- | --- |
+| Built-in file/JSON recipe | Generated by ExitCode | Generated deletion, wrong-content, and invalid-JSON probes |
+| Check already passing on the candidate | The unmodified candidate | Independently derived shams |
+| New behavioral check | Author-supplied `controls.accept` | Independently derived shams |
+
+Supply `controls.reject` only when no independent near-miss can challenge a check.
+A behavior criterion without any negative evidence reports NEGATIVE_EVIDENCE_MISSING.
+A check that cannot pass on the candidate without a witness reports POSITIVE_WITNESS_REQUIRED.
+EVALUATOR_OVERBUILT rejects a control over 64 KiB, touching more than 16 files, with more than 4 KiB of shell setup, or repeating the same substantial body across criteria.
+Prefer an existing test, narrow the criterion, or shrink the witness.
 
 Fixture operations are `write_file`, `delete_file`, `replace_text`, `copy_fixture`, and `set_json_value`.
 Each fixture allows at most 32 operations.
@@ -181,28 +191,23 @@ A successful setup does not establish a valid evaluator.
 
 ## Evaluator preparation
 
-E0 retains its mechanical checks and adds two semantic review phases and sham probes.
+E0 has four conceptual stages.
 
-1. **Intent:** Audit declared coverage, unknown mappings, duplicate criteria, and material ambiguities.
-2. **Lint:** Compile recipes and validate runners, selectors, confined paths, and external dependencies.
-3. **Independent derivation:** Derive material request outcomes, expected observations, near-miss concepts, critical negatives, regression risks, and test reuse opportunities.
-4. **Independent assessment:** Compare the proposed checks to that fixed derivation and materialize the near-misses against post-setup valid fixtures.
-5. **Discrimination:** Require PASS on the valid fixture and FAIL on every authored invalid fixture, not ERROR.
-6. **Sham challenge:** Require FAIL on one or two independently derived incomplete implementations per non-structural behavioral criterion.
-7. **Adversarial:** Retain bounded recipe-target deletion and incorrect-content probes as secondary wiring evidence.
-8. **Determinism and wiring:** Repeat independent valid fixtures and reject inconsistent outcomes or empty-target PASS.
-9. **Baseline:** Record all current-candidate outcomes without completing the goal.
+1. **Understand:** Without seeing any checks, independently derive the request's material outcomes, observations, near-misses, critical negatives, and regression risks. Independent derivation is the only source of intent coverage.
+2. **Compile:** Reject duplicate and overbuilt criteria, then validate recipes, runners, selectors, confined paths, frozen assets, and external dependencies.
+3. **Challenge:** Assess the checks against the fixed derivation. Each check must PASS its positive witness and FAIL authored rejects, generated built-in negatives, and one or two independently materialized shams, never ERROR. Witnesses are repeated for determinism, and an empty project must not PASS.
+4. **Baseline:** Run the real candidate, confirm candidate and environment integrity, and package the evidence without completing the goal.
 
 A sham can preserve exports while removing persistence, hardcode a result, or bypass a guard.
 The near-miss concepts come from the request and criterion requirements before the reviewer sees authored checks or controls.
-The second phase receives bounded repository context, checks, controls, and valid-fixture source content.
+The second phase receives bounded repository context, checks, controls, and only the files each positive witness changed.
 Each sham starts from an independent valid fixture and uses the existing confined mutation operations.
 Shams cannot edit conventional test files or runner selection.
 A surviving sham rejects the evaluator.
 An unchanged fixture, failed setup, unsafe mutation, timeout, or runner ERROR is not successful challenge evidence.
 
 A behavior must be observed through its state or effects, not merely file or symbol existence.
-Literal artifact requirements such as including LICENSE can use structural evidence with an explicit justification.
+Literal artifact requirements such as including LICENSE can use structural evidence.
 Material negative cases and relevant regression mappings are required when the request or architecture implies them.
 The reviewer checks semantic overlap and unnecessary test duplication.
 It prefers existing relevant tests, then focused tests in the existing framework, then standard recipes, then custom commands.
@@ -240,12 +245,12 @@ This flag does not grant installation, network, credentials, or external authori
 ### Model calls and bounds
 
 New root and child preparation uses the currently selected Pi model and session thinking level through `ctx.modelRegistry.streamSimple()`.
-It makes two separate semantic review phases per successful preparation.
-Each call starts with a fresh context containing only the phase's review prompt, its input, and one `submit_review` tool carrying that phase's JSON schema with preferred strict sampling; the response is validated against the schema locally before acceptance.
+It makes two separate, tool-free semantic review phases per successful preparation.
+Each call starts with a fresh context containing only the phase's review prompt and input, not the session history.
 Changing the session model or thinking level applies to subsequent review calls without separate reviewer configuration.
 Initial model review has no ExitCode wall-clock ceiling.
-Each response retains a 32768-token output limit and a 512 KiB response cap.
-Assessment criteria are truncated past 64 KiB total, and a length-truncated phase with more than one behavior criterion is retried once per chunk before failing.
+Reviews are compact structured judgments: each response is capped at 4096 output tokens and 64 KiB, prose fields are clipped to 300 characters, and the supervisor numbers near-misses.
+Oversized output is invalid rather than chunked.
 Tool updates report phase and elapsed progress.
 Cancellation still aborts the call.
 Child review after sealing shares the original execution deadline.
@@ -265,7 +270,7 @@ Core integrations must supply an independent `io.review(input, {signal})` callba
 Tests and benchmarks use explicitly injected deterministic reviewers, not a production bypass.
 
 Diagnostics contain `code`, `stage`, `criterionId`, `evidence`, `repairability`, and `recommendedRepair`.
-Examples include INTENT_UNCOVERED, TEST_SELECTOR_NOT_FOUND, REJECT_NOT_DISCRIMINATED, EMPTY_TARGET_PASS, NONDETERMINISTIC, and EXTERNAL_DEPENDENCY.
+Examples include INTENT_UNCOVERED, EVALUATOR_OVERBUILT, POSITIVE_WITNESS_REQUIRED, SHAM_SURVIVED, REJECT_NOT_DISCRIMINATED, EMPTY_TARGET_PASS, NONDETERMINISTIC, and EXTERNAL_DEPENDENCY.
 Mechanical repair normalizes numeric timeouts and discovered runner selection.
 Other repairs are agent-authored evaluator revisions inside a bounded construction budget.
 The sealed execution start and implementation counters never reset.
@@ -337,7 +342,7 @@ Initial operational-policy corrections are allowed before first approval.
 Changing a draft or its policy invalidates affected preparation and approval.
 Approval locks policy even if an unsealed contract is later revised.
 Children inherit effective limits.
-Initial discovery, clarification, model review, executable E0, and human approval spend no execution time.
+Initial discovery, model review, executable E0, and human approval spend no execution time.
 Initial executables retain the preparation watchdog to stop hung processes.
 After sealing, child preparation, evaluation, restoration, retries, and ancestor reruns share the root deadline.
 A free unchanged-candidate rerun still needs time and fresh complete evidence.
@@ -386,6 +391,8 @@ Run the reproducible benchmark:
 node scripts/benchmark-evaluator.mjs
 ./scripts/verify
 ```
+
+The test suite is organized around the product invariants in [INVARIANTS.md](INVARIANTS.md).
 
 The benchmark reports cold, warm, selective-repair, and fresh-evaluation counts and timings as JSON.
 One content-keyed base snapshot supports independent derivatives.

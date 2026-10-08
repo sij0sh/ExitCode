@@ -1,16 +1,8 @@
 #!/bin/sh
 set -eu
 cd "$(dirname "$0")/.."
-node --check exitcode-operation.mjs
-node --check exitcode-recovery.test.mjs
-node --check exitcode-core.mjs
-node --check exitcode-evaluator.mjs
-node --check exitcode-preparation.mjs
-node --check exitcode-quality.mjs
-node --check exitcode-semantic.test.mjs
-node --check exitcode-adapter.test.mjs
-node --check exitcode-evaluator-quality.test.mjs
-node --check scripts/benchmark-evaluator.mjs
-node --check exitcode.ts
-node --check exitcode.test.mjs
+for file in exitcode-operation.mjs exitcode-core.mjs exitcode-evaluator.mjs exitcode-preparation.mjs exitcode-quality.mjs \
+  exitcode.ts scripts/benchmark-evaluator.mjs ./*.test.mjs test/*.mjs; do
+  node --check "$file"
+done
 npm test

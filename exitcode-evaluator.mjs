@@ -8,6 +8,8 @@ import { ensureRunning, operationError, operationSignal, stopReason } from './ex
 
 export const RECIPE_KINDS = Object.freeze(['file_exists', 'file_contains', 'file_not_contains', 'json_value', 'existing_test', 'test_suite', 'build_succeeds', 'typecheck_succeeds', 'command_exit', 'custom_command']);
 export const MUTATION_KINDS = Object.freeze(['write_file', 'delete_file', 'replace_text', 'copy_fixture', 'set_json_value']);
+/** Recipes the supervisor can evaluate, witness, and challenge without executing candidate code. */
+export const BUILTIN_RECIPES = Object.freeze(['file_exists', 'file_contains', 'file_not_contains', 'json_value']);
 const RESERVED = new Set(['.exitcode', '.git', '.pi']);
 const OMIT = new Set(['.exitcode', '.git', 'node_modules']);
 const CANDIDATE_OMIT = new Set(['.exitcode', '.git']);
@@ -56,11 +58,7 @@ export function inventory(cwd, { dependencies = false, signal, deadlineAt, nowMs
 export function fileDigest(file, {signal,deadlineAt,nowMs=Date.now}={}) {
   ensureRunning(signal,deadlineAt,nowMs);
   const hash = createHash('sha256'); const fd = fs.openSync(file, 'r');
-  try {
-    const buf = Buffer.alloc(Math.max(1, Math.min(fs.fstatSync(fd).size, 1024 * 1024)));
-    let n;
-    while ((n = fs.readSync(fd, buf, 0, buf.length, null))) {ensureRunning(signal,deadlineAt,nowMs);hash.update(buf.subarray(0,n));}
-  }
+  try { const buf = Buffer.alloc(1024 * 1024); let n; while ((n = fs.readSync(fd, buf, 0, buf.length, null))) {ensureRunning(signal,deadlineAt,nowMs);hash.update(buf.subarray(0,n));} }
   finally { fs.closeSync(fd); }
   return hash.digest('hex');
 }
@@ -263,38 +261,58 @@ export async function sandboxCommand(command, {cwd,timeoutMs = 900000,bwrapPath 
   });
 }
 
-// Production fingerprints the host runtime afresh at every environment boundary.
-export function fingerprintRuntime(options) {
+export function evaluatorEnvironment(cwd,options) {
   const runtime = [process.execPath,'/usr/bin/bwrap','/bin/sh'].map(p=>{try{return {path:p,digest:fileDigest(fs.realpathSync(p),options)};}catch(e){if(['CANCELLED','DEADLINE_EXCEEDED','CHECK_TIMEOUT'].includes(e.code))throw e;return {path:p,error:e.code};}});
   const npm = npmRuntime();
   return {platform:os.platform(),release:os.release(),arch:os.arch(),node:process.version,runtime,
-    npm:fs.existsSync(npm)?candidateIdentity(npm,options):null,runnerVersion:1};
+    npm:fs.existsSync(npm)?candidateIdentity(npm,options):null,
+    dependencies:fs.existsSync(path.join(cwd,'node_modules'))?digest(inventory(path.join(cwd,'node_modules'),{...options,dependencies:true}).map(({rel,sha,mode,link})=>({rel,sha,mode,link}))):null,
+    runnerVersion:1};
 }
 
-export function evaluatorEnvironment(cwd,{fingerprintRuntime:getRuntime=fingerprintRuntime,...options}={}) {
-  ensureRunning(options.signal,options.deadlineAt,options.nowMs);
-  const runtime=getRuntime(options);
-  ensureRunning(options.signal,options.deadlineAt,options.nowMs);
-  return {...runtime,
-    dependencies:fs.existsSync(path.join(cwd,'node_modules'))?digest(inventory(path.join(cwd,'node_modules'),{...options,dependencies:true}).map(({rel,sha,mode,link})=>({rel,sha,mode,link}))):null};
-}
-
-export function auditIntent({criteria = [],intentAtoms = [],ambiguities = []}) {
-  const diagnostics=[],ids=new Set(criteria.map(c=>c.id)),seen=new Set();
-  const add=(code,evidence,id=null)=>diagnostics.push(diagnostic(code,'intent',id,evidence,'Correct the declared outcome coverage or criterion before review'));
-  for(const c of criteria){const norm=c.requirement?.trim().replace(/\s+/g,' ').toLowerCase();if(seen.has(norm))add('DUPLICATE_CRITERION',c.requirement,c.id);seen.add(norm);}
-  if(!Array.isArray(intentAtoms)||!intentAtoms.length)add('INTENT_UNCOVERED','Declare materially distinct request outcomes');
-  const atomIds=new Set();
-  for(const atom of intentAtoms){
-    if(!atom.id||atomIds.has(atom.id)||typeof atom.outcome!=='string'||!atom.outcome.trim())add('INTENT_UNCOVERED','Invalid or duplicate intent atom');atomIds.add(atom.id);
-    if(!Array.isArray(atom.criteria)||!atom.criteria.length||atom.criteria.some(c=>!ids.has(c)))add('INTENT_UNCOVERED',`${atom.id}: missing or unknown criterion mapping`);
+/** Deterministic preflight only. Intent coverage is derived independently by semantic review. */
+export function auditCriteria(criteria = []) {
+  const diagnostics=[],seen=new Set();
+  for(const c of criteria){
+    const norm=c.requirement?.trim().replace(/\s+/g,' ').toLowerCase();
+    if(seen.has(norm))diagnostics.push(diagnostic('DUPLICATE_CRITERION','intent',c.id,c.requirement,'Merge criteria that restate the same outcome'));
+    seen.add(norm);
   }
-  const questions=(Array.isArray(ambiguities)?ambiguities:[]).filter(a=>a.unresolved===true&&typeof a.question==='string'&&a.question.trim()&&new Set(a.plausibleAnswers?.filter(x=>typeof x==='string'&&x.trim())).size>1&&typeof a.whyMaterial==='string'&&a.whyMaterial.trim()&&a.affectedCriteria?.length&&a.affectedCriteria.every(c=>ids.has(c))).slice(0,3);
-  return {ok:diagnostics.length===0,diagnostics,questions,coverage:intentAtoms.map(a=>({intentId:a.id,criteria:a.criteria}))};
+  return diagnostics;
+}
+
+/**
+ * A minimal positive witness: authored, supervisor-generated for built-in
+ * recipes, or else the unmodified candidate (null control).
+ */
+export function positiveWitness(criterion) {
+  if (criterion.controls?.accept) return {source:'author',control:criterion.controls.accept};
+  const r=criterion.check.recipe;
+  if (!BUILTIN_RECIPES.includes(r?.kind)) return {source:'baseline',control:null};
+  const content = r.kind==='file_contains' ? r.value : r.kind==='json_value' ? JSON.stringify(pointerParts(r.pointer).reduceRight((v,k)=>({[k]:v}),r.value)) : '';
+  return {source:'generated',control:{mutations:[{kind:'write_file',path:r.path,content}]}};
+}
+
+// Pre-seal controls describe evidence; they must not encode a second implementation.
+const OVERBUILT = Object.freeze({controlBytes:64*1024, files:16, setupBytes:4*1024, repeatedBytes:8*1024});
+const OVERBUILT_REPAIR = 'A control is a minimal witness that the check can discriminate, not a reference implementation. Prefer an existing test, omit controls, narrow the criterion, or shrink the witness';
+function overbuilt(draft) {
+  const diagnostics=[],seen=new Map();
+  for(const c of draft.criteria){
+    for(const control of [c.controls?.accept,...(c.controls?.reject??[])].filter(Boolean)){
+      const bytes=Buffer.byteLength(stable(control)),files=new Set((control.mutations??[]).map(m=>m.path)).size,setup=Buffer.byteLength(control.setup??'');
+      if(bytes>OVERBUILT.controlBytes||files>OVERBUILT.files||setup>OVERBUILT.setupBytes)
+        diagnostics.push(diagnostic('EVALUATOR_OVERBUILT','lint',c.id,`control is ${bytes} bytes across ${files} files with ${setup} bytes of setup`,OVERBUILT_REPAIR));
+      if(bytes>OVERBUILT.repeatedBytes){const key=digest(control);seen.set(key,[...(seen.get(key)??[]),c.id]);}
+    }
+  }
+  for(const ids of seen.values())if(new Set(ids).size>1)
+    diagnostics.push(diagnostic('EVALUATOR_OVERBUILT','lint',ids[1],`the same substantial control is repeated in ${[...new Set(ids)].join(', ')}`,OVERBUILT_REPAIR));
+  return diagnostics;
 }
 
 export function lintEvaluators(draft, cwd, capabilities) {
-  const diagnostics=[];
+  const diagnostics=overbuilt(draft);
   for(const c of draft.criteria){
     const recipe=c.check.recipe;
     try {
@@ -303,10 +321,10 @@ export function lintEvaluators(draft, cwd, capabilities) {
     }catch(e){const code=e.message.split(':')[0];diagnostics.push(diagnostic(['RUNNER_NOT_FOUND','CHECK_TARGET_MISSING','TEST_SELECTOR_NOT_FOUND'].includes(code)?code:e.message.startsWith('command_exit requires')?'INVALID_SPEC':'UNSAFE_COMMAND','lint',c.id,e.message,'Use a discovered runner, literal selector, and confined fixture paths'));}
     const command=recipe?.command??c.check.command??'';
     if(/https?:\/\/|\b(?:curl|wget|ssh|nc|sudo)\b/.test(command))diagnostics.push(diagnostic('EXTERNAL_DEPENDENCY','lint',c.id,'External or privileged command','Use local deterministic evidence'));
-    if(recipe?.path&&['file_exists','file_contains','file_not_contains','json_value'].includes(recipe.kind)){
+    if(recipe?.path&&BUILTIN_RECIPES.includes(recipe.kind)&&c.controls?.accept?.mutations){
       const present=fs.existsSync(safePath(cwd,recipe.path));
-      const supplied=c.controls?.accept?.mutations?.some(m=>m.path===recipe.path&&['write_file','copy_fixture'].includes(m.kind));
-      if(!present&&!supplied)diagnostics.push(diagnostic('CHECK_TARGET_MISSING','lint',c.id,recipe.path,'Supply the target in the valid fixture'));
+      const supplied=c.controls.accept.mutations.some(m=>m.path===recipe.path&&['write_file','copy_fixture'].includes(m.kind));
+      if(!present&&!supplied)diagnostics.push(diagnostic('CHECK_TARGET_MISSING','lint',c.id,recipe.path,'Supply the target in the positive witness, or omit controls'));
     }
   }
   return diagnostics;

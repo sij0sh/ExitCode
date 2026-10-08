@@ -55,9 +55,12 @@ const FixtureSchema = Type.Object({
   mutations: Type.Optional(Type.Array(MutationSchema, {minItems:1,maxItems:32})),
   reason: Type.Optional(Type.String()),
 });
-const ControlsSchema = Type.Object({accept:FixtureSchema,reject:Type.Array(FixtureSchema,{minItems:1})});
-const IntentSchema = Type.Array(Type.Object({id:Type.String(),outcome:Type.String(),criteria:Type.Array(Type.String())}));
-const AmbiguitySchema = Type.Array(Type.Object({question:Type.String(),plausibleAnswers:Type.Array(Type.String()),recommendedDefault:Type.Optional(Type.String()),whyMaterial:Type.String(),affectedCriteria:Type.Array(Type.String()),confidence:Type.Optional(Type.Number()),unresolved:Type.Boolean()}));
+const ControlsSchema = Type.Object({
+  accept: Type.Optional(FixtureSchema),
+  reject: Type.Optional(Type.Array(FixtureSchema, {minItems:1})),
+}, {description:"Usually omit. A control is a minimal witness that the check can discriminate, not a reference implementation. " +
+  "Built-in file recipes and checks that already pass need none; supply accept only when the check cannot pass on the current candidate. " +
+  "ExitCode derives independent negatives."});
 
 const CriterionSchema = Type.Object({
   id: Type.Optional(Type.String({ description: "Suggested id (supervisor assigns C1..Cn when omitted)" })),
@@ -68,7 +71,6 @@ const CriterionSchema = Type.Object({
 });
 
 const PolicySchema = Type.Object({
-  evaluatorAttempts: Type.Optional(Type.Number({description:"Separate evaluator construction budget (default 6)"})),
   localRepairs: Type.Optional(Type.Number({ description: "Local repair attempts before ordinary child decomposition is permitted (default 2)" })),
   maxDepth: Type.Optional(Type.Number({ description: "Recursion depth below the root (default 3)" })),
   maxTotalAttempts: Type.Optional(Type.Number({ description: "Implementation attempts across the tree (default 12)" })),
@@ -80,10 +82,7 @@ const PolicySchema = Type.Object({
 const EXITCODE_NAMESPACE = {
   name: "exitcode",
   description: "Tools for contract review, implementation feedback, and recursive verification.",
-  instructions:
-    "Use exitcode_status for the active contract, results, budgets, and next action. " +
-    "Use exitcode_draft for root review, exitcode_seal for evaluator validation, exitcode_evaluate for fresh results, " +
-    "exitcode_child for a narrower subproblem, and exitcode_block for a concrete blocker.",
+  instructions: "Follow each tool result's next action.",
 };
 
 type Runtime = {
@@ -147,16 +146,10 @@ function reviewIo(ctx: ExtensionContext, signal?: AbortSignal, onProgress?: (pro
     review: async (input: any, options: {signal:AbortSignal}) => {
       if (!ctx.model || !ctx.modelRegistry?.streamSimple) throw new Error("selected review model unavailable");
       const encoded=JSON.stringify(input);
-      if(encoded.length>core.REVIEW_INPUT_BYTES)throw new Error("review input exceeds bounded context; reduce evaluator scope");
-      const schema=core.reviewSchema(input.phase);
-      // Prefer provider-side constrained sampling where supported; the local
-      // schema check below remains the binding gate on every provider.
-      const tools=schema?[{name:"submit_review",description:"Submit the independent review object.",
-        parameters:Type.Unsafe(schema),constrainedSampling:{type:"json_schema",strict:"prefer"} as const}]:undefined;
+      if(encoded.length>2*1024*1024)throw new Error("review input exceeds bounded context; reduce evaluator scope");
       const result=await ctx.modelRegistry.streamSimple(ctx.model, {
         systemPrompt:core.reviewPrompt(input.phase),
         messages:[{role:"user",content:encoded,timestamp:Date.now()}],
-        ...(tools?{tools}:{}),
       }, {reasoning:ctx.thinkingLevel,maxTokens:core.REVIEW_MAX_TOKENS,signal:options.signal}).result();
       // Provider errors can still carry billable usage.
       if(result.usage)usage.available=true;
@@ -164,22 +157,10 @@ function reviewIo(ctx: ExtensionContext, signal?: AbortSignal, onProgress?: (pro
         usage[k]+=result.usage?.[k] ?? 0;
       for(const k of ["input","output","cacheRead","cacheWrite","total"] as const)
         usage.cost[k]+=result.usage?.cost?.[k] ?? 0;
-      if(result.stopReason==="length")throw Object.assign(new Error("review stopped: length"),{code:"REVIEW_RESPONSE_INVALID",lengthTruncated:true});
-      if(result.stopReason!=="stop"&&result.stopReason!=="toolUse")throw Object.assign(new Error(result.errorMessage ?? `review stopped: ${result.stopReason}`),result.stopReason==="aborted"?{code:"CANCELLED"}:{});
-      const call=(result.content as any[]).find(b=>b.type==="toolCall"&&b.name==="submit_review");
-      let candidate:any;
-      if(call)candidate=call.arguments;
-      else{
-        const text=result.content.filter(b=>b.type==="text").map(b=>(b as any).text).join("");
-        if(!text)throw Object.assign(new Error("review response missing"),{code:"REVIEW_RESPONSE_INVALID"});
-        candidate=JSON.parse(text);
-      }
-      if(JSON.stringify(candidate).length>core.REVIEW_RESPONSE_BYTES)throw Object.assign(new Error("review output exceeds bounded response"),{code:"REVIEW_RESPONSE_INVALID",lengthTruncated:true});
-      if(schema){
-        const errors=core.validateReviewSchema(input.phase,candidate);
-        if(errors.length)throw Object.assign(new Error(`review response violates ${input.phase} schema: ${errors.slice(0,8).join("; ")}`),{code:"REVIEW_RESPONSE_INVALID"});
-      }
-      return candidate;
+      if(result.stopReason!=="stop")throw Object.assign(new Error(result.errorMessage ?? `review stopped: ${result.stopReason}`),result.stopReason==="aborted"?{code:"CANCELLED"}:result.stopReason==="length"?{code:"REVIEW_RESPONSE_INVALID"}:{});
+      const text=result.content.filter(b=>b.type==="text").map(b=>b.text).join("");
+      if(text.length>512*1024)throw Object.assign(new Error("review output exceeds bounded response"),{code:"REVIEW_RESPONSE_INVALID"});
+      return JSON.parse(text);
     },
   });
   return io;
@@ -214,9 +195,10 @@ export default function (pi: ExtensionAPI) {
     if (rt.modeOn) core.ensureBaseline(core.makeIo(ctx.cwd,{expectedRootId:rt.rootId}));
   };
 
-  const modeStatusText = (io: ReturnType<typeof core.makeIo>) => {
+  // "prompt" is the bounded per-turn injection; full evidence is explicit-only.
+  const modeStatusText = (io: ReturnType<typeof core.makeIo>, detail: "prompt" | "normal" | "evidence" = "normal") => {
     const snap = core.statusSnapshot(io);
-    if(snap.active)return `${rt.rootId!==snap.root?"Session does not own this workspace root. Use /exitcode resume to adopt it explicitly.\n":""}${core.statusText(io)}`;
+    if(snap.active)return `${rt.rootId!==snap.root?"Session does not own this workspace root. Use /exitcode resume to adopt it explicitly.\n":""}${detail==="prompt"?core.promptStatusText(io):core.statusText(io,{detail})}`;
     if (rt.rootId) {
       const root = core.loadRoot(io, rt.rootId);
       return [
@@ -313,41 +295,36 @@ export default function (pi: ExtensionAPI) {
     {
       name: "exitcode_status",
       label: "Exitcode Status",
-      description: "Show the active exitcode contract, result vectors, budgets, and required next action.",
-      promptSnippet: "exitcode_status: show the active contract, result vectors, budgets, next action",
+      description: "Show the current phase, results, diagnostics, budgets, and next action.",
+      promptSnippet: "exitcode_status: phase, results, diagnostics, budgets, next action",
       parameters: Type.Object({
-        node: Type.Optional(Type.String({ description: "Node id (defaults to the active leaf)" })),
+        detail: Type.Optional(Type.Union([Type.Literal("normal"), Type.Literal("evidence")], { description: "evidence adds the full contract, E0 evidence and metrics; use only for debugging" })),
       }),
-      execute: async (_id, _params, _signal, _onUpdate, ctx) => {
+      execute: async (_id, params, _signal, _onUpdate, ctx) => {
         assertMode();
         const io = core.makeIo(ctx.cwd);
-        return textResult(modeStatusText(io), { ...core.statusSnapshot(io), modeOn: rt.modeOn, rootId: rt.rootId, pendingGoal: rt.pendingGoal });
+        const detail = params.detail === "evidence" ? "evidence" : "normal";
+        const { evaluatorEvidence, contract, ...snap } = core.statusSnapshot(io) as any;
+        return textResult(modeStatusText(io, detail), { ...snap, ...(detail === "evidence" ? { evaluatorEvidence, contract } : {}), modeOn: rt.modeOn, rootId: rt.rootId, pendingGoal: rt.pendingGoal });
       },
     },
     {
       name: "exitcode_draft",
       label: "Exitcode Draft",
       description:
-        "Propose or revise a root contract with goal, observable criteria, executable checks, assumptions, exclusions, and verification approach. " +
-        "Each behavioral criterion needs setup commands for known-valid and known-invalid fixtures in temporary candidate copies. " +
-        "The same check must PASS the valid fixture and FAIL every invalid fixture, not ERROR. Do not change the real candidate while validating the evaluator. " +
-        "Policy corrections are allowed before first approval; omitted fields retain their effective values. " +
-        "Never replace the user's objective with extension housekeeping or a commit reminder. " +
-        "Safely prepares and validates before returning review. Repair typed failures internally. Present a validated plan and STOP for user review before sealing or implementation.",
-      promptSnippet: "exitcode_draft: propose the root contract (goal + criteria + checks + controls)",
+        "Submit the smallest observable acceptance contract. Prefer existing tests and behavioral evidence over implementation-detail checks. " +
+        "ExitCode validates it before user review; repair returned diagnostics, then present the returned plan and wait for the user's reply.",
+      promptSnippet: "exitcode_draft: submit the root contract (goal + observable criteria + checks)",
       parameters: Type.Object({
         goal: Type.String({ description: "Goal statement" }),
         originalRequest: Type.Optional(Type.String({ description: "Fallback request only; the /exitcode goal and existing root request take priority" })),
         criteria: Type.Array(CriterionSchema),
-        intentAtoms: Type.Optional(IntentSchema),
-        ambiguities: Type.Optional(AmbiguitySchema),
-        specificationPaths: Type.Optional(Type.Array(Type.String({minLength:1}), {description:"Referenced Markdown plans to include in independent review, including explicit hidden paths"})),
-        mutableDependencies: Type.Optional(Type.Boolean({description:"The reviewed task may change product dependencies; devDependencies and evaluator runtimes stay frozen"})),
-        policy: Type.Optional(PolicySchema),
         assumptions: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { description: "Resolved product assumptions to show in user review" })),
         exclusions: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { description: "Out-of-scope work to show in user review" })),
-        verification: Type.Optional(Type.String({ minLength: 1, description: "Plain-language verification approach; do not dump shell mechanics" })),
         revise: Type.Optional(Type.String({ description: "Existing DRAFT root id to revise (e.g. G1)" })),
+        policy: Type.Optional(PolicySchema),
+        specificationPaths: Type.Optional(Type.Array(Type.String({minLength:1}), {description:"Advanced: referenced Markdown plans to include in independent review, including explicit hidden paths"})),
+        mutableDependencies: Type.Optional(Type.Boolean({description:"Advanced: the task must change product dependencies; devDependencies and evaluator runtimes stay frozen"})),
       }),
       execute: async (_id, params, _signal, _onUpdate, ctx) => withOperation(ctx,_signal,_onUpdate,async io => {
         assertMode();
@@ -358,14 +335,11 @@ export default function (pi: ExtensionAPI) {
           goal: params.goal,
           originalRequest: rt.pendingGoal ?? params.originalRequest,
           criteria: params.criteria,
-          intentAtoms: params.intentAtoms,
-          ambiguities: params.ambiguities,
           specificationPaths: params.specificationPaths,
           mutableDependencies: params.mutableDependencies,
           policy: params.policy,
           assumptions: params.assumptions,
           exclusions: params.exclusions,
-          verification: params.verification,
           revise: params.revise,
         });
         if (!result.ok) return textResult(`draft rejected:\n${errLines(result)}`, result, true);
@@ -377,23 +351,18 @@ export default function (pi: ExtensionAPI) {
         const prepared = await core.prepareNode(io,result.id);
         prepared.warnings=[...(result.warnings??[]),...(prepared.warnings??[])];
         syncBaseline(ctx);
-        if (!prepared.ok) return {...textResult(withWarnings([`Evaluator preparation needs repair:\n${errLines(prepared)}${prepared.questions?.length ? '\nClarification: '+JSON.stringify(prepared.questions) : ''}`],prepared.warnings).join("\n"),prepared,true),usage:io.reviewUsage};
+        if (!prepared.ok) return {...textResult(withWarnings([`Evaluator preparation needs repair:\n${errLines(prepared)}`],prepared.warnings).join("\n"),prepared,true),usage:io.reviewUsage};
         return {...textResult(withWarnings([prepared.review],prepared.warnings).join("\n"),prepared),usage:io.reviewUsage};
       }),
     },
     {
       name: "exitcode_seal",
       label: "Exitcode Seal",
-      description:
-        "Seal the exact safely prepared evaluator bundle. Stale candidate or environment requires preparation and review again. " +
-        "For an unapproved root, interpret the user's reply to the current review: acceptance, requested changes, or a question. " +
-        "On acceptance (for example 'looks good, go ahead'), supply userApproval quoting the reply. /exitcode approve is an optional shortcut. " +
-        "A reply requesting changes is not approval, even with assent. Revise and present the complete contract again. Ask when unclear. Never infer approval. " +
-        "Evaluator failures are repaired before review. A revision after review requires validation and fresh approval. Children need no userApproval. The candidate becomes writable after sealing.",
-      promptSnippet: "exitcode_seal: validate the evaluator, seal the contract, record the baseline",
+      description: "After explicit root approval, seal the exact validated contract. Children seal without separate approval.",
+      promptSnippet: "exitcode_seal: seal the approved, validated contract",
       parameters: Type.Object({
         node: Type.String({ description: "Draft node id (e.g. G1, G1.1)" }),
-        userApproval: Type.Optional(Type.String({ minLength: 1, description: "Quote the user's reply accepting the current root contract after review. Omit for children or an already-approved root. Never use the initial goal, silence, a change request, or an assistant message." })),
+        userApproval: Type.Optional(Type.String({ minLength: 1, description: "Quote the user's reply accepting the current root plan (e.g. 'looks good, go ahead'). A reply requesting changes is not approval: revise and present again; ask when unclear. Omit for children or an already-approved root. Never use the initial goal, silence, or an assistant message." })),
       }),
       execute: async (_id, params, _signal, _onUpdate, ctx) => {
         assertMode();
@@ -403,11 +372,8 @@ export default function (pi: ExtensionAPI) {
     {
       name: "exitcode_evaluate",
       label: "Exitcode Evaluate",
-      description:
-        "Fresh supervisor evaluation of the current candidate. Consumes one shared attempt when the tree changed. " +
-        "Checks ancestor regressions (restoring on regress), and reruns the parent when a child passes. " +
-        "Follow the returned parent result and next action. Only ALL PASS here closes a goal.",
-      promptSnippet: "exitcode_evaluate: run the sealed checks fresh; ALL PASS closes the goal",
+      description: "Run the sealed criteria fresh. Follow failures and the returned next action; only root ALL PASS completes the goal.",
+      promptSnippet: "exitcode_evaluate: run the sealed checks fresh",
       parameters: Type.Object({
         node: Type.Optional(Type.String({ description: "Node id (defaults to the active leaf)" })),
       }),
@@ -433,23 +399,17 @@ export default function (pi: ExtensionAPI) {
     {
       name: "exitcode_child",
       label: "Exitcode Child",
-      description:
-        "Propose or revise a narrower child targeting exactly one failed parent criterion. Explain how it advances that requirement. " +
-        "Use after the configured local repair attempts, or for an early prerequisite with an observable prerequisiteArtifact. " +
-        "Supply the child's own checks and valid/invalid fixture setups as for a root. Seal and evaluate it without user approval. " +
-        "The supervisor enforces child gates and reevaluates the parent after child PASS.",
-      promptSnippet: "exitcode_child: propose one narrower child tied to a failing parent criterion",
+      description: "Create one smaller goal for one failing parent criterion when direct repair is no longer the clearest path.",
+      promptSnippet: "exitcode_child: one smaller goal for one failing parent criterion",
       parameters: Type.Object({
         parent: Type.String({ description: "Parent node id (e.g. G1)" }),
         target: Type.String({ description: "Failing parent criterion id (e.g. C2)" }),
         goal: Type.String({ description: "Narrower child goal" }),
         originalRequest: Type.Optional(Type.String({ description: "Retained request (defaults to the parent's)" })),
         criteria: Type.Array(CriterionSchema),
-        intentAtoms: Type.Optional(IntentSchema),
-        ambiguities: Type.Optional(AmbiguitySchema),
         specificationPaths: Type.Optional(Type.Array(Type.String({minLength:1}))),
         reason: Type.String({ description: "How this child advances the parent target" }),
-        prerequisite: Type.Optional(Type.Boolean({ description: "True to request decomposition before the local repair threshold; requires prerequisiteArtifact" })),
+        prerequisite: Type.Optional(Type.Boolean({ description: "Decompose before the local repair threshold; requires prerequisiteArtifact" })),
         prerequisiteArtifact: Type.Optional(Type.String({ description: "Observable artifact the prerequisite produces" })),
         revise: Type.Optional(Type.String({ description: "Existing DRAFT child id to revise (e.g. G1.1)" })),
       }),
@@ -461,8 +421,6 @@ export default function (pi: ExtensionAPI) {
           goal: params.goal,
           originalRequest: params.originalRequest,
           criteria: params.criteria,
-          intentAtoms: params.intentAtoms,
-          ambiguities: params.ambiguities,
           specificationPaths: params.specificationPaths,
           reason: params.reason,
           prerequisite: params.prerequisite,
@@ -480,10 +438,8 @@ export default function (pi: ExtensionAPI) {
     {
       name: "exitcode_block",
       label: "Exitcode Block",
-      description:
-        "Pause a root for a concrete missing requirement, authority, budget, or infrastructure cause without dropping work or accounting. " +
-        "A declined child path is withdrawn and its parent rerun. Infrastructure ERROR keeps the stack and useful edits. /exitcode resume retries a paused operation. A pause or BLOCKED child is not success.",
-      promptSnippet: "exitcode_block: pause with the exact missing requirement; withdraw only a genuinely failed child path",
+      description: "Pause with the concrete missing authority, infrastructure, budget, ambiguity, or viable path. On a child, withdraws that path and reruns its parent.",
+      promptSnippet: "exitcode_block: pause with the concrete missing requirement",
       parameters: Type.Object({
         node: Type.Optional(Type.String({ description: "Node id (defaults to the active leaf)" })),
         reason: Type.String({ description: "Specific missing requirement, credential, authorization, or cause" }),
@@ -552,7 +508,7 @@ export default function (pi: ExtensionAPI) {
     }
     syncBaseline(ctx);
     const io = core.makeIo(ctx.cwd);
-    const lines = [core.PROTOCOL_PROMPT, "", modeStatusText(io)];
+    const lines = [core.PROTOCOL_PROMPT, "", modeStatusText(io, "prompt")];
     event.systemPromptOptions.sections["exitcode"] = lines.join("\n");
   });
 
@@ -594,7 +550,7 @@ export default function (pi: ExtensionAPI) {
       if(root?.status==='PASS')maybeAutoExit({terminal:{root:root.id,status:root.status,outcome:root.outcome}},ctx);
       return undefined;
     }
-    if(snap.status==='PAUSED' || snap.phase==='CLARIFICATION' || snap.awaitingApproval)return undefined;
+    if(snap.status==='PAUSED' || snap.awaitingApproval)return undefined;
     const leafId=snap.stack?.at(-1),leaf=leafId?(snap.nodes as any)?.[leafId]:null;
     if(!leaf || !['ACTIVE','DRAFT'].includes(leaf.status))return undefined;
     if(snap.expired) {
@@ -624,7 +580,7 @@ export default function (pi: ExtensionAPI) {
       "exitcode: contract-first recursive execution.",
       "/exitcode <goal>  enter exitcode mode rooted at your goal (root only; children come from exitcode_child)",
       "/exitcode approve optional shortcut to approve the root draft and start autonomous work",
-      "/exitcode status  show the active contract, vectors, and budgets",
+      "/exitcode status [evidence]  show the active contract, vectors, and budgets (evidence adds full E0 evidence)",
       "/exitcode resume [Gid] [minutes=N] [attempts=N] [evaluators=N]  retry the same paused operation; optional positive grants require this user command",
       "/exitcode exit    user cancellation only; not successful completion (work on disk is preserved)",
     ].join("\n");
@@ -641,7 +597,8 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       if (sub === "status") {
-        ctx.ui.notify(rt.modeOn ? modeStatusText(io) : `exitcode mode is off.\n${core.statusText(io)}`, "info");
+        const detail = text.split(/\s+/)[1] === "evidence" ? "evidence" : "normal";
+        ctx.ui.notify(rt.modeOn ? modeStatusText(io, detail) : `exitcode mode is off.\n${core.statusText(io, { detail })}`, "info");
         return;
       }
       if (sub === "approve") {

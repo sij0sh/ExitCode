@@ -8,13 +8,13 @@
  *
  * This module is Pi-agnostic on purpose: no Pi imports, no UI. The thin
  * adapter in exitcode.ts wires it to the extension runtime. File IO uses
- * node builtins against <cwd>/.exitcode/; execution and runtime fingerprinting
- * are injected so tests can substitute fakes.
+ * node builtins against <cwd>/.exitcode/; command execution is injected
+ * so tests can substitute a fake.
  */
 
 import { createHash, randomUUID } from "node:crypto";
 export { RECIPE_KINDS, MUTATION_KINDS } from "./exitcode-evaluator.mjs";
-import { sandboxCommand, candidateIdentity, evaluatorEnvironment, fingerprintRuntime, normalizeEvaluator, runRecipe, diagnostic, fileDigest, inventory, fixtureDirectory, captureEvaluatorAssets, verifyEvaluatorAssets, installEvaluatorAssets, restoreEvaluatorAssets, compatibleEnvironment, digest, safePath } from "./exitcode-evaluator.mjs";
+import { sandboxCommand, candidateIdentity, evaluatorEnvironment, normalizeEvaluator, runRecipe, diagnostic, fileDigest, inventory, fixtureDirectory, captureEvaluatorAssets, verifyEvaluatorAssets, installEvaluatorAssets, restoreEvaluatorAssets, compatibleEnvironment, digest, safePath } from "./exitcode-evaluator.mjs";
 import { prepareGate, emptyMetrics, addMetrics, copyCandidate, releasePreparation } from "./exitcode-preparation.mjs";
 import { ensureRunning, operationSignal, operationError } from "./exitcode-operation.mjs";
 import * as fs from "node:fs";
@@ -33,7 +33,6 @@ export const NodeState = Object.freeze({
   DRAFT: "DRAFT",
   EVALUATOR_PREPARATION: "EVALUATOR_PREPARATION",
   READY_FOR_APPROVAL: "READY_FOR_APPROVAL",
-  CLARIFICATION: "CLARIFICATION",
   ACTIVE: "ACTIVE",
   PAUSED: "PAUSED",
   PASS: "PASS",
@@ -87,31 +86,16 @@ export const EXITCODE_TOOL_NAMES = Object.freeze([
   "exitcode_evaluate", "exitcode_child", "exitcode_block",
 ]);
 
-/** Short protocol instructions supplied to Pi while exitcode mode is on. */
-export const PROTOCOL_PROMPT = [
-  "EXITCODE MODE - FIX SUCCESS / PURSUE SUCCESS / PROVE SUCCESS.",
-  "FIX SUCCESS: Inspect the goal, architecture, tests, and likely regressions before implementation.",
-  "Resolve known product ambiguity with the user and propose observable acceptance criteria with executable checks.",
-  "Submit recipes, confined fixtures, declared intent outcomes and ambiguity candidates to exitcode_draft. The supervisor safely prepares E0 before returning a validated plan. Repair typed evaluator failures before review; do not ask approval for invalid proposals.",
-  "Present the validated plan and wait for explicit user approval. READY_FOR_APPROVAL pauses autonomous continuation.",
-  "Repair evaluator proposals before review. Revisions after review require fresh validated-plan approval. Policy and remaining time are in status.",
-  "Operational policy can change before approval. Initial discovery, evaluator preparation, E0 and human review spend no execution time. The root execution clock starts once at seal; retries and children never reset it.",
-  "Keep the user's original objective above extension housekeeping and commit reminders. Never replace it with a commit-only goal.",
-  "Before sealing, inspect with any available tools but never change the candidate. Pre-seal changes are discarded and the working tree is restored.",
-  "Supervisor state under .exitcode/ is private. Submit contracts through ExitCode tools only.",
-  "The supervisor validates the evaluator before user review. Approval seals that exact validated bundle; stale preparation must be repeated.",
-  "The sealed acceptance program, tests, required cases and expectations are fixed and cannot be weakened. Declare custom acceptance helpers in check.assets and referenced plans in specificationPaths. Declare mutableDependencies only when the approved task must change product dependencies.",
-  "PURSUE SUCCESS: Implement the approved goal. Use the sealed criteria to measure whether it has been achieved.",
-  "Use evaluator failures as repair feedback and preserve previously passing behavior.",
-  "Prefer direct repair. Decompose only when the supervisor permits it and a smaller goal offers a clearer path to a failed parent criterion.",
-  "A child is a temporary reduction of its parent problem, not a new objective.",
-  "It targets one failed parent criterion, needs no user approval, and cannot change ancestor contracts.",
-  "PROVE SUCCESS: Evaluate after meaningful changes.",
-  "Only a fresh supervisor evaluation with all criteria passing completes a goal.",
-  "A passing child does not complete its parent; follow the supervisor's returned parent result and next action.",
-  "Infrastructure ERROR is inconclusive, not FAIL. Preserve useful edits and retry the same authorized operation or resume its pause. Never retry assertions until green. Report concrete authority, ambiguity, integrity or exhausted-budget blockers.",
-  "Only a fresh root PASS exits mode automatically. A blocker or clarification pause keeps enforcement on. Only the user can cancel with /exitcode exit.",
-].join(" ");
+/** The loop only. Tools explain how to act; the supervisor enforces invariants. */
+export const PROTOCOL_PROMPT =
+  "EXITCODE MODE. Understand the user's goal and inspect the project before changing it. " +
+  "Before implementation, submit the smallest observable acceptance contract to ExitCode; ask the user only when ambiguity materially changes success. " +
+  "Keep the candidate unchanged until ExitCode validates the evaluator and the user approves the plan; follow tool diagnostics and next actions to repair it. " +
+  "After sealing, implement toward failing criteria, evaluate after meaningful changes, and use a child only when a smaller goal helps one failing parent criterion. " +
+  "Only a fresh root PASS completes the goal; pauses, errors, and child PASS do not.";
+
+/** Upper bound on supervisor state injected into every agent turn. */
+export const PROMPT_STATUS_MAX_BYTES = 4096;
 
 // ---------------------------------------------------------------------------
 // Small utilities
@@ -267,20 +251,19 @@ function validateCheck(check, where, errors) {
   validateExpect(check.expect, `${where}.check`, errors);
 }
 
-function validateControls(controls, where, errors, { required }) {
-  if (controls === undefined) {
-    if (required) errors.push(`${where}: behavioral criteria require controls.accept and at least one controls.reject`);
-    return;
-  }
+/** Controls are optional witnesses; E0 supplies independent negatives. */
+function validateControls(controls, where, errors) {
+  if (controls === undefined) return;
   if (!isRecord(controls)) {
     errors.push(`${where}: controls must be an object`);
     return;
   }
-  if (!isRecord(controls.accept) || !(nonEmptyString(controls.accept.setup) || Array.isArray(controls.accept.mutations) && controls.accept.mutations.length > 0)) {
-    errors.push(`${where}: controls.accept.setup must be a nonempty string`);
+  if (controls.accept !== undefined && (!isRecord(controls.accept) || !(nonEmptyString(controls.accept.setup) || Array.isArray(controls.accept.mutations) && controls.accept.mutations.length > 0))) {
+    errors.push(`${where}: controls.accept needs a nonempty setup or mutations`);
   }
+  if (controls.reject === undefined) return;
   if (!Array.isArray(controls.reject) || controls.reject.length === 0) {
-    errors.push(`${where}: controls.reject must be a nonempty array`);
+    errors.push(`${where}: controls.reject must be a nonempty array when supplied`);
   } else {
     controls.reject.forEach((entry, i) => {
       if (!isRecord(entry) || !(nonEmptyString(entry.setup) || Array.isArray(entry.mutations) && entry.mutations.length > 0)) {
@@ -311,10 +294,6 @@ export function validateStructure(draft, opts = {}) {
       errors.push(`${key} must be an array of nonempty strings`);
     }
   }
-  if (draft.verification !== undefined && !nonEmptyString(draft.verification)) {
-    errors.push("verification must be a nonempty description of the verification approach");
-  }
-
   if(draft.specificationPaths !== undefined && (!Array.isArray(draft.specificationPaths) || !draft.specificationPaths.every(nonEmptyString)))errors.push("specificationPaths must be an array of paths");
   if(draft.mutableDependencies !== undefined && typeof draft.mutableDependencies !== "boolean")errors.push("mutableDependencies must be boolean");
 
@@ -365,7 +344,7 @@ export function validateStructure(draft, opts = {}) {
         errors.push(`${criterion.id || where}: type must be "behavior" or "regression"`);
       }
       validateCheck(criterion.check, `${criterion.id || where}`, errors);
-      validateControls(criterion.controls, `${criterion.id || where}`, errors, { required: type === "behavior" });
+      validateControls(criterion.controls, `${criterion.id || where}`, errors);
     });
     if (!isChild && !draft.criteria.some((c) => (c.type ?? "behavior") === "regression")) {
       errors.push("root contracts must include at least one regression criterion");
@@ -797,124 +776,6 @@ function onBaseline(io, operation) {
 }
 
 // ---------------------------------------------------------------------------
-// Evaluator gate (E0): structure, traceability, discrimination, wiring,
-// execution, baseline, sealing
-// ---------------------------------------------------------------------------
-
-async function runControlProbe(criterion, setup, deps) {
-  let fixture;
-  try {
-    // Prefer the candidate filesystem for reflinks, but stay outside Git ancestry
-    // so fixture commands cannot discover the real candidate's repository.
-    let parent = path.dirname(path.resolve(deps.cwd));
-    for (let dir = path.resolve(deps.cwd); ; dir = path.dirname(dir)) {
-      if (fs.existsSync(path.join(dir, ".git"))) parent = path.dirname(dir);
-      if (dir === path.dirname(dir)) break;
-    }
-    try {
-      fixture = fs.mkdtempSync(path.join(parent, "exitcode-control-"));
-    } catch (error) {
-      if (!["EACCES", "EPERM", "EROFS"].includes(error?.code)) throw error;
-      fixture = fs.mkdtempSync(path.join(os.tmpdir(), "exitcode-control-"));
-    }
-    // Reuse candidate snapshot rules, but keep metadata out of the fixture.
-    const copy = snapshotTree(deps.cwd, fixture, { writeManifest: false, maxBytes: deps.maxBytes ?? SNAPSHOT_MAX_BYTES });
-    if (!copy.ok) return { error: copy.reason };
-    const prepared = await runCheck(
-      { ...criterion, check: { command: setup, timeoutSeconds:criterion.check.timeoutSeconds, expect: { exit: 0 } } },
-      deps.exec, fixture, deps.defaultTimeoutMs,
-    );
-    if (prepared.status !== "PASS") {
-      return { error: `setup ${prepared.status}: ${prepared.reasons.join("; ")}` };
-    }
-    const outcome = await runCheck(criterion, deps.exec, fixture, deps.defaultTimeoutMs);
-    return { outcome };
-  } catch (error) {
-    return { error: `fixture error: ${error?.message ?? String(error)}` };
-  } finally {
-    if (fixture) fs.rmSync(fixture, { recursive: true, force: true });
-  }
-}
-
-/**
- * Run the fixed gate over an immutable draft copy.
- * deps: { exec, cwd, wiringDir, candidateDigest, env, defaultTimeoutMs, maxBytes? }
- */
-export async function runGate(draft, validation, deps) {
-  const errors = [];
-  if (!validation.ok) return { ok: false, errors: validation.errors };
-
-  const candidateDigest = deps.candidateDigest ?? digestTree(deps.cwd);
-  const verifyCandidate = () => {
-    try {
-      if (digestTree(deps.cwd) !== candidateDigest) {
-        errors.push("candidate mutated during evaluator validation");
-      }
-    } catch (error) {
-      errors.push(`candidate identity unavailable during evaluator validation: ${error?.message ?? String(error)}`);
-    }
-  };
-  verifyCandidate();
-  if (errors.length > 0) return { ok: false, errors };
-
-  // Discrimination: setup only prepares a fresh copy. The actual check must
-  // PASS on the valid fixture and FAIL (not ERROR) on every invalid fixture.
-  for (const criterion of draft.criteria) {
-    if ((criterion.type ?? "behavior") !== "behavior") continue;
-    const controls = [
-      { entry: criterion.controls.accept, kind: "accept", expected: "PASS" },
-      ...criterion.controls.reject.map((entry) => ({ entry, kind: "reject", expected: "FAIL" })),
-    ];
-    for (const { entry, kind, expected } of controls) {
-      const probe = await runControlProbe(criterion, entry.setup, deps);
-      if (probe.error) {
-        errors.push(`${criterion.id}: ${kind} control ${probe.error}`);
-      } else if (probe.outcome.status !== expected) {
-        errors.push(`${criterion.id}: ${kind} control check is ${probe.outcome.status}, wanted ${expected} (${entry.reason ?? entry.setup}; ${probe.outcome.reasons.join("; ")}); check cannot discriminate`);
-      }
-    }
-  }
-  verifyCandidate();
-  if (errors.length > 0) return { ok: false, errors };
-
-  // Wiring: the complete runner must reject a missing target. A check that
-  // passes in an empty directory is fixture-only and proves nothing.
-  fs.mkdirSync(deps.wiringDir, { recursive: true });
-  for (const criterion of draft.criteria) {
-    const outcome = await runCheck(criterion, deps.exec, deps.wiringDir, deps.defaultTimeoutMs);
-    if (outcome.status === "PASS") {
-      errors.push(`${criterion.id}: check passes against an empty target; it is not wired to the candidate`);
-    }
-  }
-  verifyCandidate();
-  if (errors.length > 0) return { ok: false, errors };
-
-  // Execution: fixed inventory (every criterion is mandatory), fixed inputs.
-  // Baseline: record all criterion outcomes on the current candidate.
-  const outcomes = [];
-  for (const criterion of draft.criteria) {
-    outcomes.push(await runCheck(criterion, deps.exec, deps.cwd, deps.defaultTimeoutMs));
-  }
-  verifyCandidate();
-  if (errors.length > 0) return { ok: false, errors };
-  const baseline = { outcomes, allPass: allPass(outcomes), at: new Date().toISOString(), candidateDigest };
-
-  // Sealing: freeze the exact validated bundle with its digest, environment,
-  // and baseline candidate identity.
-  const contract = JSON.parse(stableStringify(draft));
-  const bundle = {
-    version: 1,
-    contract,
-    digest: sha256Hex(stableStringify(contract)),
-    env: deps.env,
-    candidateDigest,
-    sealedAt: new Date().toISOString(),
-    baseline,
-  };
-  return { ok: true, errors: [], baseline, bundle };
-}
-
-// ---------------------------------------------------------------------------
 // Budgets and decomposition policy
 // ---------------------------------------------------------------------------
 
@@ -1026,8 +887,8 @@ export function resolveModeFromBranch(branch) {
 }
 
 // ---------------------------------------------------------------------------
-// Supervisor flows. IO injects execution, time, and runtime fingerprinting.
-// Defaults use execCommand, Date.now, and fresh host runtime fingerprints.
+// Supervisor flows. io = { cwd, exec?, nowMs? }.
+// exec defaults to execCommand; nowMs defaults to Date.now.
 // ---------------------------------------------------------------------------
 
 /** One state-changing operation per workspace, including across Pi sessions. */
@@ -1176,7 +1037,7 @@ export function resumeRoot(io,{deadlineMinutes,maxTotalAttempts,evaluatorAttempt
 }
 
 export function makeIo(cwd, overrides = {}) {
-  return { cwd, exec: execCommand, nowMs: () => Date.now(), fingerprintRuntime, ...overrides };
+  return { cwd, exec: execCommand, nowMs: () => Date.now(), ...overrides };
 }
 
 function newRunId() {
@@ -1416,7 +1277,7 @@ function createDraft(io, args) {
       const s = loadNodeState(io, id);
       return s ? { id: s.id, status: s.status, target: s.target, goalDigest: s.goalDigest, candidateDigest: s.blockedCandidateDigest, environmentIdentity:s.blockedEnvironmentIdentity } : null;
     }).filter(Boolean);
-    const gates = childGates({ root, parentState, parentResult, target: args.target, goal, siblings, nowMs, environmentIdentity:digest(evaluatorEnvironment(io.cwd,io)) });
+    const gates = childGates({ root, parentState, parentResult, target: args.target, goal, siblings, nowMs, environmentIdentity:digest(evaluatorEnvironment(io.cwd)) });
     if (!gates.ok) return { ok: false, errors: gates.errors };
     if (!nonEmptyString(args.reason)) return { ok: false, errors: ["reason must explain how the child advances its parent"] };
     const repairs = root.policy.localRepairs ?? DEFAULT_POLICY.localRepairs;
@@ -1438,10 +1299,8 @@ function createDraft(io, args) {
       originalRequest: nonEmptyString(originalRequest) ? originalRequest.trim() : parentBundle.contract.originalRequest,
       parent: { id: args.parentId, targets: [args.target] },
       criteria: withIds,
-    ...(args.intentAtoms !== undefined ? {intentAtoms: args.intentAtoms} : {}),
-    ...(args.ambiguities !== undefined ? {ambiguities: args.ambiguities} : {}),
-    ...(args.specificationPaths !== undefined ? {specificationPaths:args.specificationPaths} : {}),
-    mutableDependencies:parentBundle.contract.mutableDependencies===true,
+      ...(args.specificationPaths !== undefined ? {specificationPaths:args.specificationPaths} : {}),
+      mutableDependencies:parentBundle.contract.mutableDependencies===true,
     };
     const validation = validateStructure(draft, {
       parent: parentBundle,
@@ -1510,13 +1369,10 @@ function createDraft(io, args) {
     originalRequest: nonEmptyString(originalRequest) ? originalRequest.trim() : goal.trim(),
     parent: null,
     criteria: withIds,
-    ...(args.intentAtoms !== undefined ? {intentAtoms: args.intentAtoms} : {}),
-    ...(args.ambiguities !== undefined ? {ambiguities: args.ambiguities} : {}),
     ...(args.specificationPaths !== undefined ? {specificationPaths:args.specificationPaths} : {}),
     ...(args.mutableDependencies !== undefined ? {mutableDependencies:args.mutableDependencies} : {}),
     ...(args.assumptions !== undefined ? { assumptions: args.assumptions } : {}),
     ...(args.exclusions !== undefined ? { exclusions: args.exclusions } : {}),
-    ...(args.verification !== undefined ? { verification: args.verification } : {}),
   };
   const validation = validateStructure(draft, { policy: merged.policy });
   if (!validation.ok) return { ok: false, errors: validation.errors };
@@ -1625,10 +1481,8 @@ function reviseDraft(io, index, args) {
         : (previous?.originalRequest ?? parentBundle?.contract.originalRequest ?? args.goal.trim()),
       parent: { id: node.parentId, targets: [node.target] },
       criteria: withIds,
-    ...(args.intentAtoms !== undefined ? {intentAtoms: args.intentAtoms} : {}),
-    ...(args.ambiguities !== undefined ? {ambiguities: args.ambiguities} : {}),
-    ...(args.specificationPaths !== undefined ? {specificationPaths:args.specificationPaths} : {}),
-    mutableDependencies:parentBundle?.contract.mutableDependencies===true,
+      ...(args.specificationPaths !== undefined ? {specificationPaths:args.specificationPaths} : {}),
+      mutableDependencies:parentBundle?.contract.mutableDependencies===true,
     };
     validation = validateStructure(draft, {
       parent: parentBundle,
@@ -1645,12 +1499,8 @@ function reviseDraft(io, index, args) {
       originalRequest: previous?.originalRequest ?? (nonEmptyString(args.originalRequest) ? args.originalRequest.trim() : args.goal.trim()),
       parent: null,
       criteria: withIds,
-    ...(args.intentAtoms !== undefined ? {intentAtoms: args.intentAtoms} : {}),
-    ...(args.ambiguities !== undefined ? {ambiguities: args.ambiguities} : {}),
-    ...(args.specificationPaths !== undefined ? {specificationPaths:args.specificationPaths} : {}),
-    ...(args.mutableDependencies !== undefined ? {mutableDependencies:args.mutableDependencies} : {}),
     };
-    for (const key of ["assumptions", "exclusions", "verification", "intentAtoms", "ambiguities", "specificationPaths", "mutableDependencies"]) {
+    for (const key of ["assumptions", "exclusions", "specificationPaths", "mutableDependencies"]) {
       const value = args[key] !== undefined ? args[key] : previous?.[key];
       if (value !== undefined) draft[key] = value;
     }
@@ -1728,8 +1578,22 @@ function approveDraft(io, { userReply } = {}) {
   return { ok: true, id: root.id, approval: root.approval };
 }
 
+const RECIPE_EVIDENCE = { test_suite: "the project test suite", build_succeeds: "the project build", typecheck_succeeds: "the project typecheck" };
+
+/** Generated from the validated evaluator, never authored by the drafting agent. */
+export function verificationSummary(draft, prepared) {
+  const challenges = id => (prepared?.stages ?? []).filter(s => ["discrimination", "sham", "adversarial"].includes(s.stage))
+    .flatMap(s => s.probes ?? []).filter(p => p.criterionId === id && p.expected === "FAIL").length;
+  return draft.criteria.map(c => {
+    const r = c.check.recipe, n = challenges(c.id);
+    const how = r?.kind === "existing_test" ? `existing test "${r.selector}" in ${r.path}` : RECIPE_EVIDENCE[r?.kind] ??
+      (r?.path ? `${r.kind.replace(/_/g, " ")} ${r.path}` : r?.kind === "command_exit" ? `isolated command ${r.command}` : "an isolated custom command");
+    return `- ${c.id}: ${how}${n ? `; rejected ${n} independent near-miss${n === 1 ? "" : "es"}` : ""}.`;
+  });
+}
+
 /** Human acceptance layer; executable checks stay in the same draft. */
-export function rootReviewText(draft, root, nowMs = Date.now()) {
+export function rootReviewText(draft, root, nowMs = Date.now(), prepared = null) {
   if (isExpired(root, nowMs)) return "Validated plan unavailable: shared deadline expired.";
   const lines = ["Validated plan", "", "Goal", draft.goal, "", "Success means"];
   for (const criterion of draft.criteria) lines.push(`${criterion.id}: ${criterion.requirement}`);
@@ -1737,20 +1601,21 @@ export function rootReviewText(draft, root, nowMs = Date.now()) {
     lines.push("", key === "assumptions" ? "Assumptions" : "Exclusions");
     lines.push(...(draft[key]?.length ? draft[key].map(x=>`- ${x}`) : ["- None stated."]));
   }
-  lines.push("", "Verification", draft.verification ?? "Validated positive, negative, empty-target, repeatability and baseline checks. Finite fixtures do not prove semantic equivalence.",
+  lines.push("", "Verification", ...verificationSummary(draft, prepared),
+    "Every check ran isolated, rejected an empty project, and was recorded against the current candidate. Finite challenges do not prove semantic equivalence.",
     "", "Approve this plan, or tell me what to change. /exitcode status shows policy and evaluator evidence. /exitcode exit cancels.");
   return lines.join("\n");
 }
 
 function intentDigestOf(draft) {
-  return sha256Hex(stableStringify({goal:draft.goal,originalRequest:draft.originalRequest,criteria:draft.criteria.map(c=>({id:c.id,requirement:c.requirement,type:c.type??'behavior'})),assumptions:draft.assumptions,exclusions:draft.exclusions,intentAtoms:draft.intentAtoms,ambiguities:draft.ambiguities}));
+  return sha256Hex(stableStringify({goal:draft.goal,originalRequest:draft.originalRequest,criteria:draft.criteria.map(c=>({id:c.id,requirement:c.requirement,type:c.type??'behavior'})),assumptions:draft.assumptions,exclusions:draft.exclusions}));
 }
 function evaluatorDigestOf(draft) { return sha256Hex(stableStringify(draft.criteria.map(c=>({id:c.id,check:c.check,controls:c.controls})))); }
 function preparationMatches(io,node) {
   try {
     const draft=readJson(draftFile(io.cwd,node.id))?.draft,p=node.prepared,root=loadRoot(io,node.rootId);
     if(!p || !draft || (node.parentId?node.preparedDigest:root.validatedBundleDigest)!==sha256Hex(stableStringify(p)) ||
-      p.draftDigest!==sha256Hex(stableStringify(draft)) || p.candidateDigest!==digestTree(io.cwd) || stableStringify(p.environment)!==stableStringify(evaluatorEnvironment(io.cwd,io)))return false;
+      p.draftDigest!==sha256Hex(stableStringify(draft)) || p.candidateDigest!==digestTree(io.cwd) || stableStringify(p.environment)!==stableStringify(evaluatorEnvironment(io.cwd)))return false;
     if(!p.assets)return false;
     verifyEvaluatorAssets(io.cwd,p.assetsDirectory,p.assets);return true;
   } catch{return false;}
@@ -1772,10 +1637,6 @@ async function prepareDraft(io, nodeId) {
   node.evaluatorMetrics??=emptyMetrics();
   if(node.evaluatorMetrics.e0Attempts >= (node.evaluatorAttemptLimit??root.policy.evaluatorAttempts??DEFAULT_POLICY.evaluatorAttempts))return pauseRoot(io,root,{reason:"evaluator preparation budget exhausted; diagnose or revise the proposal before retrying",code:"EVALUATOR_UNBUILDABLE",nodeId:node.id,operation:"prepare"});
   const {draft,repairs}=normalizeEvaluator(stored.draft);
-  if(!draft.intentAtoms && (node.parentId || draft.criteria.every(c=>c.check.command))) {
-    draft.intentAtoms=draft.criteria.map(c=>({id:`legacy-${c.id}`,outcome:c.requirement,criteria:[c.id]}));
-    repairs.push({repair:"Migrated declared coverage; independent semantic review remains required"});
-  }
   writeJsonAtomic(draftFile(io.cwd,node.id),{draft});
   if(!node.parentId){delete root.approval;delete root.validatedBundleDigest;root.reviewDigest=rootReviewDigest(root,draft);}saveRoot(io,root);
   const draftDigest=sha256Hex(stableStringify(draft)),reviewDigest=root.reviewDigest;
@@ -1785,7 +1646,7 @@ async function prepareDraft(io, nodeId) {
   const directory=path.join(storePaths(io.cwd).assetsDir,`${node.id}.prepared`);
   try {
     ensureBudget(operation,root);
-    environment=evaluatorEnvironment(io.cwd,operation);candidateDigest=digestTree(io.cwd);
+    environment=evaluatorEnvironment(io.cwd);candidateDigest=digestTree(io.cwd);
     const parentBundle=node.parentId?loadBundle(io,node.parentId):null;
     const validation=validateStructure(draft,{policy:root.policy,parent:parentBundle,parentDepth:node.parentId?depthOf(node.parentId):-1,parentLastResult:node.parentId?loadNodeState(io,node.parentId)?.lastResult:null});
     if(!validation.ok)result={ok:false,errors:validation.errors,diagnostics:validation.errors.map(e=>diagnostic("INVALID_STRUCTURE","lint",null,e,"Correct evaluator structure")),stages:[],metrics:emptyMetrics()};
@@ -1797,7 +1658,7 @@ async function prepareDraft(io, nodeId) {
           defaultTimeoutMs:defaultTimeoutMs(root),environment,maxBytes:SNAPSHOT_MAX_BYTES,candidateDigest,review:io.review,signal:operation.signal,
           reviewTimeoutMs:io.reviewTimeoutMs,assets,assetsDirectory:directory,onProgress:io.onProgress,deadlineAt:root.deadlineAt,nowMs:io.nowMs});
       ensureBudget(operation,root);
-      if(stableStringify(environment)!==stableStringify(evaluatorEnvironment(io.cwd,operation)))throw operationError("ENVIRONMENT_CHANGED","Environment changed during preparation");
+      if(stableStringify(environment)!==stableStringify(evaluatorEnvironment(io.cwd)))throw operationError("ENVIRONMENT_CHANGED","Environment changed during preparation");
       verifyEvaluatorAssets(io.cwd,directory,assets);
       if(digestTree(io.cwd)!==candidateDigest)throw operationError("CANDIDATE_MUTATED","Candidate changed during preparation");
     }
@@ -1827,8 +1688,8 @@ async function prepareDraft(io, nodeId) {
     current.phase="READY_FOR_APPROVAL";
     current.prepared={draftDigest,candidateDigest,environment,assets,assetsDirectory:directory,intentDigest:intentDigestOf(draft),evaluatorDigest:evaluatorDigestOf(draft),stages:result.stages,baseline:result.baseline,capabilities:result.capabilities};
     current.preparedDigest=sha256Hex(stableStringify(current.prepared));
-    if(!node.parentId){currentRoot.validatedBundleDigest=current.preparedDigest;currentRoot.reviewDigest=rootReviewDigest(currentRoot,draft);saveRoot(io,currentRoot);current.evaluatorMetrics.reviewTurns++;result.review=rootReviewText(draft,currentRoot,io.nowMs());}
-  } else {current.phase=result.questions?.length?"CLARIFICATION":"EVALUATOR_PREPARATION";fs.rmSync(directory,{recursive:true,force:true});}
+    if(!node.parentId){currentRoot.validatedBundleDigest=current.preparedDigest;currentRoot.reviewDigest=rootReviewDigest(currentRoot,draft);saveRoot(io,currentRoot);current.evaluatorMetrics.reviewTurns++;result.review=rootReviewText(draft,currentRoot,io.nowMs(),current.prepared);}
+  } else {current.phase="EVALUATOR_PREPARATION";fs.rmSync(directory,{recursive:true,force:true});}
   saveNodeState(io,current);
   if(infrastructure) {
     const d=result.diagnostics.find(d=>d.repairability==="supervisor")??result.diagnostics[0];
@@ -1911,7 +1772,7 @@ async function sealPrepared(io, nodeId, { userApproval } = {}) {
   node.status=NodeState.ACTIVE;node.phase="EXECUTION";node.sealAttempts++;
   node.lastResult=resultFromBaseline(bundle);node.lastCandidateDigest=bundle.candidateDigest;
   node.lastEnvironmentIdentity=digest(bundle.env);
-  if(digestTree(io.cwd)!==bundle.candidateDigest || stableStringify(evaluatorEnvironment(io.cwd,io))!==stableStringify(bundle.env))throw operationError("CANDIDATE_MUTATED","candidate or environment changed while sealing");
+  if(digestTree(io.cwd)!==bundle.candidateDigest || stableStringify(evaluatorEnvironment(io.cwd))!==stableStringify(bundle.env))throw operationError("CANDIDATE_MUTATED","candidate or environment changed while sealing");
   ensureBudget(io,root);
   if(!node.parentId && root.clockVersion===2 && root.executionStartedAt===null) {
     root.executionStartedAt=io.nowMs();root.deadlineAt=deadlineAtMs(root.executionStartedAt,root.policy);
@@ -2239,7 +2100,7 @@ async function blockActive(io,nodeId,{reason,code="NO_PATH"}) {
   const refreshed=await refreshStack(io,{...root,stack:root.stack.filter(id=>id!==node.id)},digestAfter,defaultTimeoutMs(root));
   if(refreshed[parent.id])events.push(`${parent.id} rerun: ${formatVector(refreshed[parent.id].outcomes)}`);
   for(const result of Object.values(refreshed))requireIdentity(io,root,result);
-  node.status=NodeState.BLOCKED;node.blockedReason=reason.trim();node.blockedCode=code;node.blockedCandidateDigest=digestAfter;node.blockedEnvironmentIdentity=digest(evaluatorEnvironment(io.cwd,io));
+  node.status=NodeState.BLOCKED;node.blockedReason=reason.trim();node.blockedCode=code;node.blockedCandidateDigest=digestAfter;node.blockedEnvironmentIdentity=digest(evaluatorEnvironment(io.cwd));
   saveNodeState(io,node);popStack(root,node.id);saveRoot(io,root);
   const reloaded=loadNodeState(io,parent.id),snap=takeCheckpoint(io,reloaded,"eval");saveNodeState(io,reloaded);
   if(!snap.ok)events.push(`warning: ${snap.warning}`);
@@ -2316,12 +2177,48 @@ export function statusSnapshot(io) {
     evaluatorEvidence: rootNode?.prepared ?? null,
     originalRequest: rootDraft?.originalRequest ?? loadBundle(io,root.id)?.contract.originalRequest,
     contract: rootDraft ?? loadBundle(io,root.id)?.contract,
-    review: awaitingApproval ? rootReviewText(rootDraft, root, io.nowMs()) : null,
+    review: awaitingApproval ? rootReviewText(rootDraft, root, io.nowMs(), rootNode.prepared) : null,
     next: leaf ? nextAction(root, leaf, leaf.id === root.id ? rootDraft : null, io.nowMs()) : "none",
   };
 }
 
-export function statusText(io) {
+const clip = (value, max) => {
+  const text = String(value ?? "").replace(/\s+/g, " ").trim();
+  return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+};
+
+const diagnosticLine = (d, max) => typeof d === "string" ? clip(d, max) : `${d.criterionId ?? "contract"} ${d.code}: ${clip(d.evidence, max)}`;
+
+function leafContract(io, snap) {
+  const leafId = snap.stack.at(-1);
+  return leafId ? loadBundle(io, leafId)?.contract ?? readJson(draftFile(io.cwd, leafId))?.draft : null;
+}
+
+/**
+ * Bounded control-plane state injected into every agent turn. Never contains
+ * checks, controls, evaluator evidence, or metrics; those are explicit-only.
+ */
+export function promptStatusText(io) {
+  const snap = statusSnapshot(io);
+  if (!snap.active) return "exitcode: no active root";
+  const lines = [`exitcode root ${snap.root} [${snap.status}] phase ${snap.phase}; stack ${snap.stack.join(" > ") || "(empty)"}`];
+  for (const [id, node] of Object.entries(snap.nodes)) lines.push(`${id} ${node.status} :: ${node.vector} :: ${clip(node.goal, 160)}`);
+  const contract = leafContract(io, snap);
+  for (const c of contract?.criteria ?? []) lines.push(`  ${c.id}${c.type === "regression" ? " (regression)" : ""}: ${clip(c.requirement, 120)}`);
+  lines.push(`approval: ${snap.awaitingApproval ? "awaiting the user's reply to the validated plan" : snap.approval ? "approved" : "none"}`);
+  lines.push(`budget: ${snap.consumedAttempts}/${snap.maxTotalAttempts} attempts; ${snap.clockStarted ? `${(snap.remainingMs / 60000).toFixed(1)} min left` : "clock starts at root seal"}${snap.expired ? " (EXPIRED)" : ""}`);
+  if (snap.pause) lines.push(`pause: ${snap.pause.code}: ${clip(snap.pause.reason, 200)}`);
+  const shown = snap.diagnostics.slice(0, 6);
+  for (const d of shown) lines.push(`diagnostic: ${diagnosticLine(d, 160)}`);
+  if (snap.diagnostics.length > shown.length) lines.push(`diagnostic: +${snap.diagnostics.length - shown.length} more (exitcode_status)`);
+  lines.push(`next: ${clip(snap.next, 400)}`);
+  const text = lines.join("\n");
+  return Buffer.byteLength(text) <= PROMPT_STATUS_MAX_BYTES ? text
+    : `${Buffer.from(text).subarray(0, PROMPT_STATUS_MAX_BYTES - 64).toString("utf8")}\n…\nnext: ${clip(snap.next, 40)}`;
+}
+
+/** Operational status. detail "evidence" adds the full contract, E0 evidence, and metrics. */
+export function statusText(io, { detail = "normal" } = {}) {
   const snap = statusSnapshot(io);
   if (!snap.active) return `exitcode: no active root (previous roots: ${snap.roots.join(", ") || "none"})`;
   const lines = [`exitcode root ${snap.root} [${snap.status}] stack: ${snap.stack.join(" > ") || "(empty)"}`];
@@ -2329,11 +2226,19 @@ export function statusText(io) {
     lines.push(`  ${id} ${node.status} attempts=${node.attempts} :: ${node.vector}`);
     if (node.goal) lines.push(`    goal: ${node.goal.slice(0, 160)}`);
   }
+  for (const c of leafContract(io, snap)?.criteria ?? []) lines.push(`  ${c.id}${c.type === "regression" ? " (regression)" : ""}: ${clip(c.requirement, 200)}`);
   lines.push(`  budget: ${snap.consumedAttempts}/${snap.maxTotalAttempts} attempts, deadline ${snap.clockStarted?snap.deadlineAt:"starts at root seal"}${snap.expired ? " (EXPIRED)" : ""}`);
   lines.push(`  effective policy: ${JSON.stringify(snap.policy)}`);
   lines.push(`  remaining: ${(snap.remainingMs / 60000).toFixed(2)} minutes; policy ${snap.policyEditable ? "editable before approval" : "locked"}${snap.clockStarted?"":"; execution clock not started"}`);
-  lines.push(`  execution grants: ${JSON.stringify(snap.executionGrants)}`,`  acceptance restorations: ${JSON.stringify(snap.acceptanceRestorations)}`);
-  lines.push(`  phase: ${snap.phase}`, ...(snap.pause?[`  pause: ${JSON.stringify(snap.pause)}`]:[]), `  evaluator metrics: ${JSON.stringify(snap.evaluatorMetrics)}`, `  intent digest: ${snap.intentDigest}`, `  evaluator digest: ${snap.evaluatorDigest}`, `  diagnostics: ${JSON.stringify(snap.diagnostics)}`, `  evaluator evidence: ${JSON.stringify(snap.evaluatorEvidence)}`, `  contract: ${JSON.stringify(snap.contract)}`);
+  if (snap.executionGrants.length) lines.push(`  execution grants: ${JSON.stringify(snap.executionGrants)}`);
+  if (snap.acceptanceRestorations.length) lines.push(`  acceptance restorations: ${JSON.stringify(snap.acceptanceRestorations)}`);
+  lines.push(`  phase: ${snap.phase}`, ...(snap.pause?[`  pause: ${snap.pause.code}: ${snap.pause.reason}`]:[]));
+  if (detail === "evidence") {
+    lines.push(`  evaluator metrics: ${JSON.stringify(snap.evaluatorMetrics)}`, `  intent digest: ${snap.intentDigest}`, `  evaluator digest: ${snap.evaluatorDigest}`,
+      `  diagnostics: ${JSON.stringify(snap.diagnostics)}`, `  evaluator evidence: ${JSON.stringify(snap.evaluatorEvidence)}`, `  contract: ${JSON.stringify(snap.contract)}`);
+  } else {
+    for (const d of snap.diagnostics) lines.push(`  - ${diagnosticLine(d, 400)}${d?.recommendedRepair ? ` (${d.recommendedRepair})` : ""}`);
+  }
   lines.push(`  next: ${snap.next}`);
   if (snap.review) lines.push("", snap.review);
   return lines.join("\n");
@@ -2345,7 +2250,7 @@ export function terminalStale(io, rootId) {
   if (!root || root.status !== NodeState.PASS) return { stale: false };
   if(root.closingStack)return {stale:true,reason:"interrupted verdict commit requires fresh evaluation"};
   const current = root.clockVersion===2 || root.outcome?.environment ? digestTree(io.cwd) : legacyCandidateIdentity(io.cwd);
-  return { stale: Boolean(current !== root.outcome?.candidateDigest || root.outcome?.environment && stableStringify(evaluatorEnvironment(io.cwd,io))!==stableStringify(root.outcome.environment)), recorded: root.outcome?.candidateDigest, current };
+  return { stale: Boolean(current !== root.outcome?.candidateDigest || root.outcome?.environment && stableStringify(evaluatorEnvironment(io.cwd))!==stableStringify(root.outcome.environment)), recorded: root.outcome?.candidateDigest, current };
 }
 
 /** Interrupted preparation never restores approval or unlocks coding. */
@@ -2364,4 +2269,4 @@ export function resumePreparation(io) {
   });
 }
 
-export { reviewPrompt, REVIEW_TIMEOUT_MS, REVIEW_MAX_TOKENS, REVIEW_RESPONSE_BYTES, REVIEW_INPUT_BYTES, REVIEW_SCHEMAS, reviewSchema, validateReviewSchema } from './exitcode-quality.mjs';
+export { reviewPrompt, REVIEW_TIMEOUT_MS, REVIEW_MAX_TOKENS } from './exitcode-quality.mjs';

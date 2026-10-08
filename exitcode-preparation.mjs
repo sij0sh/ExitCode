@@ -1,7 +1,7 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { callReview, reviewRepository, validateDerivation, validateAssessment, truncateReviewCriteria, chunkReviewInput, mergeReviewChunks } from './exitcode-quality.mjs';
-import { candidateIdentity, digest, diagnostic, inventory, applyMutations, auditIntent, lintEvaluators, scanCapabilities, fixtureDirectory, sandboxCommand, installEvaluatorAssets, verifyEvaluatorAssets } from './exitcode-evaluator.mjs';
+import { callReview, reviewRepository, validateDerivation, validateAssessment, witnessChanges } from './exitcode-quality.mjs';
+import { BUILTIN_RECIPES, candidateIdentity, digest, diagnostic, inventory, applyMutations, auditCriteria, positiveWitness, lintEvaluators, scanCapabilities, fixtureDirectory, sandboxCommand, installEvaluatorAssets, verifyEvaluatorAssets } from './exitcode-evaluator.mjs';
 import { ensureRunning, operationError, reviewFailure, delay } from './exitcode-operation.mjs';
 
 export function emptyMetrics() {
@@ -75,24 +75,6 @@ export async function prepareGate(draft, {cwd,exec,runCheck,defaultTimeoutMs,env
       catch(e) {
         const failure=reviewFailure(e);
         stages.push({stage:'review-transport',phase:input.phase,attempt:attempt+1,code:failure.code,evidence:failure.message});
-        // Oversized output falls back to one chunked pass over behavior
-        // criteria before failing. Chunk calls are single level: a chunk that
-        // still overflows reports its own failure without further splitting.
-        if(failure.code==='REVIEW_RESPONSE_INVALID' && failure.lengthTruncated){
-          const chunks=chunkReviewInput(input);
-          if(chunks){
-            onProgress?.({phase:'EVALUATOR_PREPARATION',stage:'review-chunk',chunks:chunks.length,evidence:failure.message});
-            try{
-              const results=[];
-              for(const [i,chunk] of chunks.entries()){
-                report('quality-' + input.phase + `-chunk-${i+1}`);metrics.reviewCalls++;
-                results.push(await callReview(review,chunk,{signal,timeoutMs:reviewTimeoutMs}));metrics.reviewCompleted++;
-              }
-              stages.push({stage:'review-chunk',phase:input.phase,chunks:chunks.length});
-              return mergeReviewChunks(input.phase,results);
-            }catch(chunkError){throw reviewFailure(chunkError);}
-          }
-        }
         if(!failure.retryable || attempt >= 2)throw failure;
         metrics.transportRetries++;
         onProgress?.({phase:'EVALUATOR_PREPARATION',stage:'review-transport-retry',attempt:attempt+1,evidence:failure.message});
@@ -101,8 +83,7 @@ export async function prepareGate(draft, {cwd,exec,runCheck,defaultTimeoutMs,env
     }
   };
   report('intent');
-  const audit=auditIntent(draft);stages.push({stage:'intent',ok:audit.ok,coverage:audit.coverage});diagnostics.push(...audit.diagnostics);
-  if(audit.questions.length)return finish({ok:false,questions:audit.questions,phase:'CLARIFICATION'});
+  diagnostics.push(...auditCriteria(draft.criteria));stages.push({stage:'intent',ok:!diagnostics.length});
   if(diagnostics.length)return finish();
   let capabilities;
   try{capabilities=scanCapabilities(cwd);diagnostics.push(...lintEvaluators(draft,cwd,capabilities));}
@@ -114,8 +95,7 @@ export async function prepareGate(draft, {cwd,exec,runCheck,defaultTimeoutMs,env
     report('preflight');
     session=sessionFor(cwd,identity,maxBytes,metrics,signal,options);
     if(candidateIdentity(session.base,options)!==candidateDigest)throw operationError('CANDIDATE_MUTATED','Candidate changed while copying preparation base');
-    const builtins=['file_exists','file_contains','file_not_contains','json_value'];
-    if(exec===sandboxCommand && draft.criteria.some(c=>!builtins.includes(c.check.recipe?.kind) || [c.controls?.accept,...(c.controls?.reject??[])].some(x=>x?.setup))) {
+    if(exec===sandboxCommand && draft.criteria.some(c=>!BUILTIN_RECIPES.includes(c.check.recipe?.kind) || [c.controls?.accept,...(c.controls?.reject??[])].some(x=>x?.setup))) {
       const runtime=await execute('true',{cwd:session.base,timeoutMs:defaultTimeoutMs,signal});
       if(runtime.error || runtime.timedOut || runtime.exit!==0)throw operationError(runtime.errorCode ?? 'ISOLATION_UNAVAILABLE',runtime.error ?? runtime.stderr ?? 'isolated runtime unavailable');
     }
@@ -125,32 +105,40 @@ export async function prepareGate(draft, {cwd,exec,runCheck,defaultTimeoutMs,env
     const requirements=draft.criteria.map(c=>({id:c.id,requirement:c.requirement,type:c.type??'behavior'}));
     const repository=reviewRepository(cwd,capabilities,requirements,draft.specificationPaths);
     if(repository.missingSpecifications.length)throw operationError('SPECIFICATION_UNAVAILABLE',`declared specification cannot be reviewed safely: ${repository.missingSpecifications.join(', ')}`);
-    derived=await reviewed({phase:'derive',originalRequest:draft.originalRequest,
+    const validated=validateDerivation(await reviewed({phase:'derive',originalRequest:draft.originalRequest,
       criteria:requirements,assumptions:draft.assumptions,exclusions:draft.exclusions,repository,
-      ...(draft.parent?{scope:draft.parent,parentRequirement:draft.parentRequirement,goal:draft.goal}:{} )});
-    diagnostics.push(...validateDerivation(derived,draft.criteria));
+      ...(draft.parent?{scope:draft.parent,parentRequirement:draft.parentRequirement,goal:draft.goal}:{} )}),draft.criteria);
+    derived=validated.derived;diagnostics.push(...validated.diagnostics);
   } catch(e) {diagnostics.push(boundaryDiagnostic(e,'quality'));}
   stages.push({stage:'quality-derive',ok:!diagnostics.length,derived});
   if(diagnostics.length)return finish();
+  const behaviors=draft.criteria.filter(c=>(c.type??'behavior')==='behavior');
+  const witnesses=new Map(behaviors.map(c=>[c.id,positiveWitness(c)]));
   const validFixtures=[];
   try {
-    for(const c of draft.criteria.filter(c=>(c.type??'behavior')==='behavior')){
+    for(const c of behaviors){
       report('valid-fixtures');
+      const {source,control}=witnesses.get(c.id);
+      if(!control){validFixtures.push({criterionId:c.id,witness:source,changed:[],removed:[]});continue;}
       const fixture=fixtureDirectory(cwd,'exitcode-valid-');
       try {
         metrics.fixtureBytes+=copyCandidate(session.base,fixture,maxBytes,signal,options);metrics.fixtureCopies++;
-        if(c.controls.accept.mutations){try{await applyMutations(fixture,c.controls.accept.mutations);}catch(e){throw operationError('CONTROL_SETUP_FAILED',e.message);}}
-        if(c.controls.accept.setup){const r=await execute(c.controls.accept.setup,{cwd:fixture,timeoutMs:defaultTimeoutMs,writable:true,signal});if(r.error||r.timedOut)throw operationError(r.errorCode ?? 'RUNNER_ERROR',r.error ?? `accept setup timed out for ${c.id}`);if(r.exit!==0)throw operationError('CONTROL_SETUP_FAILED',`accept setup failed for ${c.id}`);}
+        if(control.mutations){try{await applyMutations(fixture,control.mutations);}catch(e){throw operationError('CONTROL_SETUP_FAILED',e.message);}}
+        if(control.setup){const r=await execute(control.setup,{cwd:fixture,timeoutMs:defaultTimeoutMs,writable:true,signal});if(r.error||r.timedOut)throw operationError(r.errorCode ?? 'RUNNER_ERROR',r.error ?? `accept setup timed out for ${c.id}`);if(r.exit!==0)throw operationError('CONTROL_SETUP_FAILED',`accept setup failed for ${c.id}`);}
         if(assets){installEvaluatorAssets(fixture,assetsDirectory,assets);verifyEvaluatorAssets(fixture,assetsDirectory,assets);}
         ensureRunning(signal);
-        validFixtures.push({criterionId:c.id,repository:reviewRepository(fixture,scanCapabilities(fixture),[c],draft.specificationPaths)});
+        validFixtures.push({criterionId:c.id,witness:source,...witnessChanges(session.base,fixture,draft.specificationPaths)});
       } finally {fs.rmSync(fixture,{recursive:true,force:true});}
     }
     assessed=await reviewed({phase:'assess',originalRequest:draft.originalRequest,derived,
-      criteria:truncateReviewCriteria(draft.criteria),repository:reviewRepository(cwd,capabilities,draft.criteria,draft.specificationPaths),validFixtures,
+      criteria:draft.criteria,repository:reviewRepository(cwd,capabilities,draft.criteria,draft.specificationPaths),validFixtures,
       ...(draft.parent?{scope:draft.parent,parentRequirement:draft.parentRequirement,goal:draft.goal}:{} )});
     diagnostics.push(...validateAssessment(assessed,derived,draft.criteria,cwd,assets));
   }catch(e){diagnostics.push(boundaryDiagnostic(e,e.code==='CONTROL_SETUP_FAILED'?'discrimination':'quality'));}
+  // Every behavior needs some negative evidence: authored, independently derived, or built in.
+  if(assessed && !diagnostics.length)for(const c of behaviors)
+    if(!(c.controls?.reject?.length||assessed?.criteria.find(a=>a.criterionId===c.id)?.shams.length||BUILTIN_RECIPES.includes(c.check.recipe?.kind)))
+      diagnostics.push(diagnostic('NEGATIVE_EVIDENCE_MISSING','quality',c.id,'No independent near-miss or reject witness challenges this check','Supply one minimal controls.reject witness or a behavioral check whose near-misses can be challenged'));
   stages.push({stage:'quality-assess',ok:!diagnostics.length,assessed});
   if(diagnostics.length)return finish();
   let active=0;
@@ -159,7 +147,7 @@ export async function prepareGate(draft, {cwd,exec,runCheck,defaultTimeoutMs,env
     jobs.push(async()=>{
       ensureRunning(signal);
       const key=digest({criterion,stage,control,expected,label});
-      const cacheable=Boolean(criterion.check.recipe && ['file_exists','file_contains','file_not_contains','json_value'].includes(criterion.check.recipe.kind) && !control?.setup);
+      const cacheable=Boolean(BUILTIN_RECIPES.includes(criterion.check.recipe?.kind) && !control?.setup);
       if(useCache&&cacheable&&session.probes.has(key)){metrics.cacheHits++;return session.probes.get(key);}
       active++;metrics.peakConcurrency=Math.max(metrics.peakConcurrency,active);
       let fixture;
@@ -193,15 +181,16 @@ export async function prepareGate(draft, {cwd,exec,runCheck,defaultTimeoutMs,env
   };
   for(const c of draft.criteria){
     if((c.type??'behavior')==='behavior'){
-      queue(c,'discrimination',c.controls.accept,'PASS','accept');
-      for(const [i,control]of c.controls.reject.entries())queue(c,'discrimination',control,'FAIL',`reject:${i}`);
+      const accept=witnesses.get(c.id).control;
+      queue(c,'discrimination',accept,'PASS','accept');
+      for(const [i,control]of (c.controls?.reject??[]).entries())queue(c,'discrimination',control,'FAIL',`reject:${i}`);
       for(const sham of assessed.criteria.find(a=>a.criterionId===c.id).shams)
-        queue(c,'sham',{...c.controls.accept,sham:sham.mutations},'FAIL',sham.id);
+        queue(c,'sham',{...accept,sham:sham.mutations},'FAIL',sham.id);
       // Repeat the valid fixture independently. This includes custom commands.
-      queue(c,'determinism',c.controls.accept,'PASS','accept-repeat');
-      // Bounded independent defects beyond the author's reject fixture.
+      queue(c,'determinism',accept,'PASS','accept-repeat');
+      // Supervisor-generated negatives for built-in recipes.
       const r=c.check.recipe;
-      if(r?.path&&['file_exists','file_contains','file_not_contains','json_value'].includes(r.kind)){
+      if(r?.path&&BUILTIN_RECIPES.includes(r.kind)){
         queue(c,'adversarial',{mutations:[{kind:'delete_file',path:r.path}]},'FAIL','delete-target');
         if(r.kind==='file_contains')queue(c,'adversarial',{mutations:[{kind:'write_file',path:r.path,content:`unrelated-${digest(r.value).slice(0,8)}`}]},'FAIL','unrelated-content');
         if(r.kind==='file_not_contains')queue(c,'adversarial',{mutations:[{kind:'write_file',path:r.path,content:r.value}]},'FAIL','forbidden-content');
@@ -216,15 +205,20 @@ export async function prepareGate(draft, {cwd,exec,runCheck,defaultTimeoutMs,env
   if(signal?.aborted)diagnostics.push(diagnostic(signal.reason?.code??'CANCELLED','preparation',null,'Operation stopped during preparation','Resume with authorized remaining budget','supervisor'));
   else report('probes-complete');
   const completed=results.filter(Boolean);
+  // Without a passing positive witness, sham and repeat failures are consequences, not separate defects.
+  const unwitnessed=new Set(completed.filter(r=>r.label==='accept'&&r.outcome?.status!=='PASS').map(r=>r.criterionId));
   for(const stage of ['discrimination','sham','adversarial','determinism','wiring','baseline']){
     const probes=completed.filter(r=>r.stage===stage);
     for(const r of probes){
+      if(['sham','determinism'].includes(stage)&&unwitnessed.has(r.criterionId))continue;
       if(r.error)diagnostics.push(diagnostic(r.errorCode ?? (stage==='sham'?'SHAM_INVALID':'CONTROL_SETUP_FAILED'),stage,r.criterionId,r.error,'Restore the fixture runtime or correct the confined control setup',r.errorCode && !['CONTROL_SETUP_FAILED','SHAM_INVALID','EVALUATOR_DRIFT'].includes(r.errorCode)?'supervisor':'agent'));
       else if(r.outcome.status==='ERROR')diagnostics.push(diagnostic(r.outcome.errorCode ?? 'RUNNER_ERROR',stage,r.criterionId,r.outcome.reasons.join('; '),'Restore isolated execution and resume', 'supervisor'));
       else if(stage==='baseline'){}
       else if((r.expected==='NOT_PASS'&&r.outcome.status==='PASS')||(r.expected!=='NOT_PASS'&&r.outcome.status!==r.expected)){
-        const code=stage==='sham'?(r.outcome.status==='ERROR'?'SHAM_INVALID':'SHAM_SURVIVED'):stage==='wiring'?'EMPTY_TARGET_PASS':stage==='determinism'?'NONDETERMINISTIC':r.label==='accept'?'ACCEPT_NOT_DISCRIMINATED':'REJECT_NOT_DISCRIMINATED';
-        diagnostics.push(diagnostic(code,stage,r.criterionId,`${r.label}: ${r.outcome.status}, expected ${r.expected}; ${r.outcome.reasons.join('; ')}`,'Repair the evaluator or fixture, not the real candidate'));
+        const baselineWitness=r.label==='accept'&&witnesses.get(r.criterionId)?.source==='baseline';
+        const code=stage==='sham'?(r.outcome.status==='ERROR'?'SHAM_INVALID':'SHAM_SURVIVED'):stage==='wiring'?'EMPTY_TARGET_PASS':stage==='determinism'?'NONDETERMINISTIC':baselineWitness?'POSITIVE_WITNESS_REQUIRED':r.label==='accept'?'ACCEPT_NOT_DISCRIMINATED':'REJECT_NOT_DISCRIMINATED';
+        diagnostics.push(diagnostic(code,stage,r.criterionId,`${r.label}: ${r.outcome.status}, expected ${r.expected}; ${r.outcome.reasons.join('; ')}`,
+          baselineWitness?'The check does not pass on the current candidate; supply controls.accept as a minimal positive witness':'Repair the evaluator or fixture, not the real candidate'));
       }
     }
     stages.push({stage,ok:!diagnostics.some(d=>d.stage===stage),probes});

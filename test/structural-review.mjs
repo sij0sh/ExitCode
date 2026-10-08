@@ -3,18 +3,9 @@
  */
 export async function structuralReview(input) {
   const behavior=input.criteria.filter(c=>(c.type??'behavior')==='behavior');
-  if(input.phase==='derive')return {
-    outcomes:input.criteria.map(c=>({id:`I-${c.id}`,outcome:c.requirement,criteria:[c.id]})),
-    criteria:behavior.map(c=>({criterionId:c.id,artifactOnly:true,
-      observation:'Observe literal content in this supervisor test fixture',nearMisses:[],
-      negative:{required:false,reason:'This fixture has no behavioral inputs'},
-      regression:{required:false,reason:'Recursion fixtures can be independently structural'},
-      reuse:{reason:'These tests exercise supervisor mechanics with literal artifacts'}})),
-  };
-  return {criteria:behavior.map(c=>({criterionId:c.id,outcomeObserved:true,
-    structuralJustification:'The test fixture models literal artifact content, not application behavior',
-    negativeCovered:true,regressionCriteria:input.criteria.filter(c=>c.type==='regression').map(c=>c.id),
-    reuseReason:'Reuse the existing supervisor test fixtures',shams:[]})),issues:[]};
+  if(input.phase==='derive')return {uncovered:[],
+    criteria:behavior.map(c=>({criterionId:c.id,structural:true,observation:'Observe literal content in this supervisor test fixture',nearMisses:[]}))};
+  return {criteria:behavior.map(c=>({criterionId:c.id,outcomeObserved:true,shams:[]})),issues:[]};
 }
 export function structuralRegistry() {
   return {streamSimple(_model,context){return {async result(){return {
