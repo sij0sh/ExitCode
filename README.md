@@ -240,11 +240,12 @@ This flag does not grant installation, network, credentials, or external authori
 ### Model calls and bounds
 
 New root and child preparation uses the currently selected Pi model and session thinking level through `ctx.modelRegistry.streamSimple()`.
-It makes two separate, tool-free semantic review phases per successful preparation.
-Each call starts with a fresh context containing only the phase's review prompt and input, not the session history.
+It makes two separate semantic review phases per successful preparation.
+Each call starts with a fresh context containing only the phase's review prompt, its input, and one `submit_review` tool carrying that phase's JSON schema with preferred strict sampling; the response is validated against the schema locally before acceptance.
 Changing the session model or thinking level applies to subsequent review calls without separate reviewer configuration.
 Initial model review has no ExitCode wall-clock ceiling.
-Each response retains an 8192-token output limit.
+Each response retains a 32768-token output limit and a 512 KiB response cap.
+Assessment criteria are truncated past 64 KiB total, and a length-truncated phase with more than one behavior criterion is retried once per chunk before failing.
 Tool updates report phase and elapsed progress.
 Cancellation still aborts the call.
 Child review after sealing shares the original execution deadline.

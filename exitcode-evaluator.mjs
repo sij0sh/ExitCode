@@ -56,7 +56,11 @@ export function inventory(cwd, { dependencies = false, signal, deadlineAt, nowMs
 export function fileDigest(file, {signal,deadlineAt,nowMs=Date.now}={}) {
   ensureRunning(signal,deadlineAt,nowMs);
   const hash = createHash('sha256'); const fd = fs.openSync(file, 'r');
-  try { const buf = Buffer.alloc(1024 * 1024); let n; while ((n = fs.readSync(fd, buf, 0, buf.length, null))) {ensureRunning(signal,deadlineAt,nowMs);hash.update(buf.subarray(0,n));} }
+  try {
+    const buf = Buffer.alloc(Math.max(1, Math.min(fs.fstatSync(fd).size, 1024 * 1024)));
+    let n;
+    while ((n = fs.readSync(fd, buf, 0, buf.length, null))) {ensureRunning(signal,deadlineAt,nowMs);hash.update(buf.subarray(0,n));}
+  }
   finally { fs.closeSync(fd); }
   return hash.digest('hex');
 }
@@ -259,13 +263,20 @@ export async function sandboxCommand(command, {cwd,timeoutMs = 900000,bwrapPath 
   });
 }
 
-export function evaluatorEnvironment(cwd,options) {
+// Production fingerprints the host runtime afresh at every environment boundary.
+export function fingerprintRuntime(options) {
   const runtime = [process.execPath,'/usr/bin/bwrap','/bin/sh'].map(p=>{try{return {path:p,digest:fileDigest(fs.realpathSync(p),options)};}catch(e){if(['CANCELLED','DEADLINE_EXCEEDED','CHECK_TIMEOUT'].includes(e.code))throw e;return {path:p,error:e.code};}});
   const npm = npmRuntime();
   return {platform:os.platform(),release:os.release(),arch:os.arch(),node:process.version,runtime,
-    npm:fs.existsSync(npm)?candidateIdentity(npm,options):null,
-    dependencies:fs.existsSync(path.join(cwd,'node_modules'))?digest(inventory(path.join(cwd,'node_modules'),{...options,dependencies:true}).map(({rel,sha,mode,link})=>({rel,sha,mode,link}))):null,
-    runnerVersion:1};
+    npm:fs.existsSync(npm)?candidateIdentity(npm,options):null,runnerVersion:1};
+}
+
+export function evaluatorEnvironment(cwd,{fingerprintRuntime:getRuntime=fingerprintRuntime,...options}={}) {
+  ensureRunning(options.signal,options.deadlineAt,options.nowMs);
+  const runtime=getRuntime(options);
+  ensureRunning(options.signal,options.deadlineAt,options.nowMs);
+  return {...runtime,
+    dependencies:fs.existsSync(path.join(cwd,'node_modules'))?digest(inventory(path.join(cwd,'node_modules'),{...options,dependencies:true}).map(({rel,sha,mode,link})=>({rel,sha,mode,link}))):null};
 }
 
 export function auditIntent({criteria = [],intentAtoms = [],ambiguities = []}) {

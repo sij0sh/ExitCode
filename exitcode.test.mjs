@@ -60,7 +60,8 @@ import {
 // ---------------------------------------------------------------------------
 
 import { structuralReview } from './test/structural-review.mjs';
-const makeIo = (cwd,overrides={}) => hostMakeIo(cwd,{review:structuralReview,...overrides});
+import { fixedTestRuntime } from './test/runtime.mjs';
+const makeIo = (cwd,overrides={}) => hostMakeIo(cwd,{review:structuralReview,fingerprintRuntime:fixedTestRuntime,...overrides});
 
 const behavior = (id, cmd) => ({
   id,
@@ -407,13 +408,11 @@ test("runGate: refuses a stale candidate digest before executing commands", asyn
 });
 
 test("runGate: snapshot cap failures stop probes without touching the candidate", async (t) => {
-  const dir = tempProject();
+  const maxBytes = 8;
+  const dir = tempProject({ "feature.txt": "x".repeat(maxBytes + 1) });
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
-  const file = path.join(dir, "large.bin");
-  fs.writeFileSync(file, "");
-  fs.truncateSync(file, SNAPSHOT_MAX_BYTES + 1);
   const exec = fileExec(dir, { checks: standardChecks });
-  const deps = gateDeps(dir, exec);
+  const deps = { ...gateDeps(dir, exec), maxBytes };
   const draft = rootDraft();
   const gate = await runGate(draft, validateStructure(draft), deps);
   assert.equal(gate.ok, false);

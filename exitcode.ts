@@ -147,10 +147,16 @@ function reviewIo(ctx: ExtensionContext, signal?: AbortSignal, onProgress?: (pro
     review: async (input: any, options: {signal:AbortSignal}) => {
       if (!ctx.model || !ctx.modelRegistry?.streamSimple) throw new Error("selected review model unavailable");
       const encoded=JSON.stringify(input);
-      if(encoded.length>2*1024*1024)throw new Error("review input exceeds bounded context; reduce evaluator scope");
+      if(encoded.length>core.REVIEW_INPUT_BYTES)throw new Error("review input exceeds bounded context; reduce evaluator scope");
+      const schema=core.reviewSchema(input.phase);
+      // Prefer provider-side constrained sampling where supported; the local
+      // schema check below remains the binding gate on every provider.
+      const tools=schema?[{name:"submit_review",description:"Submit the independent review object.",
+        parameters:Type.Unsafe(schema),constrainedSampling:{type:"json_schema",strict:"prefer"} as const}]:undefined;
       const result=await ctx.modelRegistry.streamSimple(ctx.model, {
         systemPrompt:core.reviewPrompt(input.phase),
         messages:[{role:"user",content:encoded,timestamp:Date.now()}],
+        ...(tools?{tools}:{}),
       }, {reasoning:ctx.thinkingLevel,maxTokens:core.REVIEW_MAX_TOKENS,signal:options.signal}).result();
       // Provider errors can still carry billable usage.
       if(result.usage)usage.available=true;
@@ -158,10 +164,22 @@ function reviewIo(ctx: ExtensionContext, signal?: AbortSignal, onProgress?: (pro
         usage[k]+=result.usage?.[k] ?? 0;
       for(const k of ["input","output","cacheRead","cacheWrite","total"] as const)
         usage.cost[k]+=result.usage?.cost?.[k] ?? 0;
-      if(result.stopReason!=="stop")throw Object.assign(new Error(result.errorMessage ?? `review stopped: ${result.stopReason}`),result.stopReason==="aborted"?{code:"CANCELLED"}:result.stopReason==="length"?{code:"REVIEW_RESPONSE_INVALID"}:{});
-      const text=result.content.filter(b=>b.type==="text").map(b=>b.text).join("");
-      if(text.length>512*1024)throw Object.assign(new Error("review output exceeds bounded response"),{code:"REVIEW_RESPONSE_INVALID"});
-      return JSON.parse(text);
+      if(result.stopReason==="length")throw Object.assign(new Error("review stopped: length"),{code:"REVIEW_RESPONSE_INVALID",lengthTruncated:true});
+      if(result.stopReason!=="stop"&&result.stopReason!=="toolUse")throw Object.assign(new Error(result.errorMessage ?? `review stopped: ${result.stopReason}`),result.stopReason==="aborted"?{code:"CANCELLED"}:{});
+      const call=(result.content as any[]).find(b=>b.type==="toolCall"&&b.name==="submit_review");
+      let candidate:any;
+      if(call)candidate=call.arguments;
+      else{
+        const text=result.content.filter(b=>b.type==="text").map(b=>(b as any).text).join("");
+        if(!text)throw Object.assign(new Error("review response missing"),{code:"REVIEW_RESPONSE_INVALID"});
+        candidate=JSON.parse(text);
+      }
+      if(JSON.stringify(candidate).length>core.REVIEW_RESPONSE_BYTES)throw Object.assign(new Error("review output exceeds bounded response"),{code:"REVIEW_RESPONSE_INVALID",lengthTruncated:true});
+      if(schema){
+        const errors=core.validateReviewSchema(input.phase,candidate);
+        if(errors.length)throw Object.assign(new Error(`review response violates ${input.phase} schema: ${errors.slice(0,8).join("; ")}`),{code:"REVIEW_RESPONSE_INVALID"});
+      }
+      return candidate;
     },
   });
   return io;

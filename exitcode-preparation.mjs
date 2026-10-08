@@ -1,6 +1,6 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { callReview, reviewRepository, validateDerivation, validateAssessment } from './exitcode-quality.mjs';
+import { callReview, reviewRepository, validateDerivation, validateAssessment, truncateReviewCriteria, chunkReviewInput, mergeReviewChunks } from './exitcode-quality.mjs';
 import { candidateIdentity, digest, diagnostic, inventory, applyMutations, auditIntent, lintEvaluators, scanCapabilities, fixtureDirectory, sandboxCommand, installEvaluatorAssets, verifyEvaluatorAssets } from './exitcode-evaluator.mjs';
 import { ensureRunning, operationError, reviewFailure, delay } from './exitcode-operation.mjs';
 
@@ -75,6 +75,24 @@ export async function prepareGate(draft, {cwd,exec,runCheck,defaultTimeoutMs,env
       catch(e) {
         const failure=reviewFailure(e);
         stages.push({stage:'review-transport',phase:input.phase,attempt:attempt+1,code:failure.code,evidence:failure.message});
+        // Oversized output falls back to one chunked pass over behavior
+        // criteria before failing. Chunk calls are single level: a chunk that
+        // still overflows reports its own failure without further splitting.
+        if(failure.code==='REVIEW_RESPONSE_INVALID' && failure.lengthTruncated){
+          const chunks=chunkReviewInput(input);
+          if(chunks){
+            onProgress?.({phase:'EVALUATOR_PREPARATION',stage:'review-chunk',chunks:chunks.length,evidence:failure.message});
+            try{
+              const results=[];
+              for(const [i,chunk] of chunks.entries()){
+                report('quality-' + input.phase + `-chunk-${i+1}`);metrics.reviewCalls++;
+                results.push(await callReview(review,chunk,{signal,timeoutMs:reviewTimeoutMs}));metrics.reviewCompleted++;
+              }
+              stages.push({stage:'review-chunk',phase:input.phase,chunks:chunks.length});
+              return mergeReviewChunks(input.phase,results);
+            }catch(chunkError){throw reviewFailure(chunkError);}
+          }
+        }
         if(!failure.retryable || attempt >= 2)throw failure;
         metrics.transportRetries++;
         onProgress?.({phase:'EVALUATOR_PREPARATION',stage:'review-transport-retry',attempt:attempt+1,evidence:failure.message});
@@ -129,7 +147,7 @@ export async function prepareGate(draft, {cwd,exec,runCheck,defaultTimeoutMs,env
       } finally {fs.rmSync(fixture,{recursive:true,force:true});}
     }
     assessed=await reviewed({phase:'assess',originalRequest:draft.originalRequest,derived,
-      criteria:draft.criteria,repository:reviewRepository(cwd,capabilities,draft.criteria,draft.specificationPaths),validFixtures,
+      criteria:truncateReviewCriteria(draft.criteria),repository:reviewRepository(cwd,capabilities,draft.criteria,draft.specificationPaths),validFixtures,
       ...(draft.parent?{scope:draft.parent,parentRequirement:draft.parentRequirement,goal:draft.goal}:{} )});
     diagnostics.push(...validateAssessment(assessed,derived,draft.criteria,cwd,assets));
   }catch(e){diagnostics.push(boundaryDiagnostic(e,e.code==='CONTROL_SETUP_FAILED'?'discrimination':'quality'));}

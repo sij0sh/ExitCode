@@ -8,13 +8,13 @@
  *
  * This module is Pi-agnostic on purpose: no Pi imports, no UI. The thin
  * adapter in exitcode.ts wires it to the extension runtime. File IO uses
- * node builtins against <cwd>/.exitcode/; command execution is injected
- * so tests can substitute a fake.
+ * node builtins against <cwd>/.exitcode/; execution and runtime fingerprinting
+ * are injected so tests can substitute fakes.
  */
 
 import { createHash, randomUUID } from "node:crypto";
 export { RECIPE_KINDS, MUTATION_KINDS } from "./exitcode-evaluator.mjs";
-import { sandboxCommand, candidateIdentity, evaluatorEnvironment, normalizeEvaluator, runRecipe, diagnostic, fileDigest, inventory, fixtureDirectory, captureEvaluatorAssets, verifyEvaluatorAssets, installEvaluatorAssets, restoreEvaluatorAssets, compatibleEnvironment, digest, safePath } from "./exitcode-evaluator.mjs";
+import { sandboxCommand, candidateIdentity, evaluatorEnvironment, fingerprintRuntime, normalizeEvaluator, runRecipe, diagnostic, fileDigest, inventory, fixtureDirectory, captureEvaluatorAssets, verifyEvaluatorAssets, installEvaluatorAssets, restoreEvaluatorAssets, compatibleEnvironment, digest, safePath } from "./exitcode-evaluator.mjs";
 import { prepareGate, emptyMetrics, addMetrics, copyCandidate, releasePreparation } from "./exitcode-preparation.mjs";
 import { ensureRunning, operationSignal, operationError } from "./exitcode-operation.mjs";
 import * as fs from "node:fs";
@@ -818,7 +818,7 @@ async function runControlProbe(criterion, setup, deps) {
       fixture = fs.mkdtempSync(path.join(os.tmpdir(), "exitcode-control-"));
     }
     // Reuse candidate snapshot rules, but keep metadata out of the fixture.
-    const copy = snapshotTree(deps.cwd, fixture, { writeManifest: false });
+    const copy = snapshotTree(deps.cwd, fixture, { writeManifest: false, maxBytes: deps.maxBytes ?? SNAPSHOT_MAX_BYTES });
     if (!copy.ok) return { error: copy.reason };
     const prepared = await runCheck(
       { ...criterion, check: { command: setup, timeoutSeconds:criterion.check.timeoutSeconds, expect: { exit: 0 } } },
@@ -838,7 +838,7 @@ async function runControlProbe(criterion, setup, deps) {
 
 /**
  * Run the fixed gate over an immutable draft copy.
- * deps: { exec, cwd, wiringDir, candidateDigest, env, defaultTimeoutMs }
+ * deps: { exec, cwd, wiringDir, candidateDigest, env, defaultTimeoutMs, maxBytes? }
  */
 export async function runGate(draft, validation, deps) {
   const errors = [];
@@ -1026,8 +1026,8 @@ export function resolveModeFromBranch(branch) {
 }
 
 // ---------------------------------------------------------------------------
-// Supervisor flows. io = { cwd, exec?, nowMs? }.
-// exec defaults to execCommand; nowMs defaults to Date.now.
+// Supervisor flows. IO injects execution, time, and runtime fingerprinting.
+// Defaults use execCommand, Date.now, and fresh host runtime fingerprints.
 // ---------------------------------------------------------------------------
 
 /** One state-changing operation per workspace, including across Pi sessions. */
@@ -1176,7 +1176,7 @@ export function resumeRoot(io,{deadlineMinutes,maxTotalAttempts,evaluatorAttempt
 }
 
 export function makeIo(cwd, overrides = {}) {
-  return { cwd, exec: execCommand, nowMs: () => Date.now(), ...overrides };
+  return { cwd, exec: execCommand, nowMs: () => Date.now(), fingerprintRuntime, ...overrides };
 }
 
 function newRunId() {
@@ -1416,7 +1416,7 @@ function createDraft(io, args) {
       const s = loadNodeState(io, id);
       return s ? { id: s.id, status: s.status, target: s.target, goalDigest: s.goalDigest, candidateDigest: s.blockedCandidateDigest, environmentIdentity:s.blockedEnvironmentIdentity } : null;
     }).filter(Boolean);
-    const gates = childGates({ root, parentState, parentResult, target: args.target, goal, siblings, nowMs, environmentIdentity:digest(evaluatorEnvironment(io.cwd)) });
+    const gates = childGates({ root, parentState, parentResult, target: args.target, goal, siblings, nowMs, environmentIdentity:digest(evaluatorEnvironment(io.cwd,io)) });
     if (!gates.ok) return { ok: false, errors: gates.errors };
     if (!nonEmptyString(args.reason)) return { ok: false, errors: ["reason must explain how the child advances its parent"] };
     const repairs = root.policy.localRepairs ?? DEFAULT_POLICY.localRepairs;
@@ -1750,7 +1750,7 @@ function preparationMatches(io,node) {
   try {
     const draft=readJson(draftFile(io.cwd,node.id))?.draft,p=node.prepared,root=loadRoot(io,node.rootId);
     if(!p || !draft || (node.parentId?node.preparedDigest:root.validatedBundleDigest)!==sha256Hex(stableStringify(p)) ||
-      p.draftDigest!==sha256Hex(stableStringify(draft)) || p.candidateDigest!==digestTree(io.cwd) || stableStringify(p.environment)!==stableStringify(evaluatorEnvironment(io.cwd)))return false;
+      p.draftDigest!==sha256Hex(stableStringify(draft)) || p.candidateDigest!==digestTree(io.cwd) || stableStringify(p.environment)!==stableStringify(evaluatorEnvironment(io.cwd,io)))return false;
     if(!p.assets)return false;
     verifyEvaluatorAssets(io.cwd,p.assetsDirectory,p.assets);return true;
   } catch{return false;}
@@ -1785,7 +1785,7 @@ async function prepareDraft(io, nodeId) {
   const directory=path.join(storePaths(io.cwd).assetsDir,`${node.id}.prepared`);
   try {
     ensureBudget(operation,root);
-    environment=evaluatorEnvironment(io.cwd);candidateDigest=digestTree(io.cwd);
+    environment=evaluatorEnvironment(io.cwd,operation);candidateDigest=digestTree(io.cwd);
     const parentBundle=node.parentId?loadBundle(io,node.parentId):null;
     const validation=validateStructure(draft,{policy:root.policy,parent:parentBundle,parentDepth:node.parentId?depthOf(node.parentId):-1,parentLastResult:node.parentId?loadNodeState(io,node.parentId)?.lastResult:null});
     if(!validation.ok)result={ok:false,errors:validation.errors,diagnostics:validation.errors.map(e=>diagnostic("INVALID_STRUCTURE","lint",null,e,"Correct evaluator structure")),stages:[],metrics:emptyMetrics()};
@@ -1797,7 +1797,7 @@ async function prepareDraft(io, nodeId) {
           defaultTimeoutMs:defaultTimeoutMs(root),environment,maxBytes:SNAPSHOT_MAX_BYTES,candidateDigest,review:io.review,signal:operation.signal,
           reviewTimeoutMs:io.reviewTimeoutMs,assets,assetsDirectory:directory,onProgress:io.onProgress,deadlineAt:root.deadlineAt,nowMs:io.nowMs});
       ensureBudget(operation,root);
-      if(stableStringify(environment)!==stableStringify(evaluatorEnvironment(io.cwd)))throw operationError("ENVIRONMENT_CHANGED","Environment changed during preparation");
+      if(stableStringify(environment)!==stableStringify(evaluatorEnvironment(io.cwd,operation)))throw operationError("ENVIRONMENT_CHANGED","Environment changed during preparation");
       verifyEvaluatorAssets(io.cwd,directory,assets);
       if(digestTree(io.cwd)!==candidateDigest)throw operationError("CANDIDATE_MUTATED","Candidate changed during preparation");
     }
@@ -1911,7 +1911,7 @@ async function sealPrepared(io, nodeId, { userApproval } = {}) {
   node.status=NodeState.ACTIVE;node.phase="EXECUTION";node.sealAttempts++;
   node.lastResult=resultFromBaseline(bundle);node.lastCandidateDigest=bundle.candidateDigest;
   node.lastEnvironmentIdentity=digest(bundle.env);
-  if(digestTree(io.cwd)!==bundle.candidateDigest || stableStringify(evaluatorEnvironment(io.cwd))!==stableStringify(bundle.env))throw operationError("CANDIDATE_MUTATED","candidate or environment changed while sealing");
+  if(digestTree(io.cwd)!==bundle.candidateDigest || stableStringify(evaluatorEnvironment(io.cwd,io))!==stableStringify(bundle.env))throw operationError("CANDIDATE_MUTATED","candidate or environment changed while sealing");
   ensureBudget(io,root);
   if(!node.parentId && root.clockVersion===2 && root.executionStartedAt===null) {
     root.executionStartedAt=io.nowMs();root.deadlineAt=deadlineAtMs(root.executionStartedAt,root.policy);
@@ -2239,7 +2239,7 @@ async function blockActive(io,nodeId,{reason,code="NO_PATH"}) {
   const refreshed=await refreshStack(io,{...root,stack:root.stack.filter(id=>id!==node.id)},digestAfter,defaultTimeoutMs(root));
   if(refreshed[parent.id])events.push(`${parent.id} rerun: ${formatVector(refreshed[parent.id].outcomes)}`);
   for(const result of Object.values(refreshed))requireIdentity(io,root,result);
-  node.status=NodeState.BLOCKED;node.blockedReason=reason.trim();node.blockedCode=code;node.blockedCandidateDigest=digestAfter;node.blockedEnvironmentIdentity=digest(evaluatorEnvironment(io.cwd));
+  node.status=NodeState.BLOCKED;node.blockedReason=reason.trim();node.blockedCode=code;node.blockedCandidateDigest=digestAfter;node.blockedEnvironmentIdentity=digest(evaluatorEnvironment(io.cwd,io));
   saveNodeState(io,node);popStack(root,node.id);saveRoot(io,root);
   const reloaded=loadNodeState(io,parent.id),snap=takeCheckpoint(io,reloaded,"eval");saveNodeState(io,reloaded);
   if(!snap.ok)events.push(`warning: ${snap.warning}`);
@@ -2345,7 +2345,7 @@ export function terminalStale(io, rootId) {
   if (!root || root.status !== NodeState.PASS) return { stale: false };
   if(root.closingStack)return {stale:true,reason:"interrupted verdict commit requires fresh evaluation"};
   const current = root.clockVersion===2 || root.outcome?.environment ? digestTree(io.cwd) : legacyCandidateIdentity(io.cwd);
-  return { stale: Boolean(current !== root.outcome?.candidateDigest || root.outcome?.environment && stableStringify(evaluatorEnvironment(io.cwd))!==stableStringify(root.outcome.environment)), recorded: root.outcome?.candidateDigest, current };
+  return { stale: Boolean(current !== root.outcome?.candidateDigest || root.outcome?.environment && stableStringify(evaluatorEnvironment(io.cwd,io))!==stableStringify(root.outcome.environment)), recorded: root.outcome?.candidateDigest, current };
 }
 
 /** Interrupted preparation never restores approval or unlocks coding. */
@@ -2364,4 +2364,4 @@ export function resumePreparation(io) {
   });
 }
 
-export { reviewPrompt, REVIEW_TIMEOUT_MS, REVIEW_MAX_TOKENS } from './exitcode-quality.mjs';
+export { reviewPrompt, REVIEW_TIMEOUT_MS, REVIEW_MAX_TOKENS, REVIEW_RESPONSE_BYTES, REVIEW_INPUT_BYTES, REVIEW_SCHEMAS, reviewSchema, validateReviewSchema } from './exitcode-quality.mjs';

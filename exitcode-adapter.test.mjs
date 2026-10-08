@@ -4,8 +4,11 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { stripTypeScriptTypes } from "node:module";
 import { test } from "node:test";
-import * as core from "./exitcode-core.mjs";
-import { structuralRegistry } from "./test/structural-review.mjs";
+import * as hostCore from "./exitcode-core.mjs";
+import { fixedTestRuntime } from "./test/runtime.mjs";
+import { structuralRegistry, structuralReview } from "./test/structural-review.mjs";
+
+const core = { ...hostCore, makeIo: (cwd, overrides = {}) => hostCore.makeIo(cwd, { fingerprintRuntime: fixedTestRuntime, ...overrides }) };
 
 // Exercise the actual adapter without requiring Pi's host-provided packages.
 // Schema constructors are inert here; the supervisor validates draft behavior.
@@ -770,7 +773,9 @@ for(const mode of ['success','error','invalid-json','malformed','length','missin
   },controller.signal,()=>{},h.ctx);
   for(const c of registry.calls){
     assert.equal(c.model,h.ctx.model);assert.equal(c.options.reasoning,h.ctx.thinkingLevel);assert.ok(c.options.signal instanceof AbortSignal);
-    assert.ok(c.options.maxTokens>0&&c.options.maxTokens<=8192);assert.ok(!c.context.tools?.length);
+    assert.equal(c.options.maxTokens,core.REVIEW_MAX_TOKENS);
+    assert.equal(c.context.tools?.length,1);assert.equal(c.context.tools[0].name,"submit_review");
+    assert.deepEqual(c.context.tools[0].constrainedSampling,{type:"json_schema",strict:"prefer"});
   }
   if(registry.calls.length){
     const first=registry.calls[0];assert.equal(first.input.phase,'derive');
@@ -800,7 +805,7 @@ for(const mode of ['success','error','invalid-json','malformed','length','missin
 });
 
 for (const thinkingLevel of ["off", "minimal", "low", "medium", "high", "xhigh", "max"]) {
-  test(`adapter: review inherits session thinking ${thinkingLevel} in fresh tool-free contexts`, async (t) => {
+  test(`adapter: review inherits session thinking ${thinkingLevel} in fresh schema-tool contexts`, async (t) => {
     const h = harness(t);
     const registry = reviewRegistry();
     h.ctx.modelRegistry = registry;
@@ -821,10 +826,34 @@ for (const thinkingLevel of ["off", "minimal", "low", "medium", "high", "xhigh",
       assert.equal(call.context.messages[0].role, "user");
       assert.equal(call.context.messages[0].content, JSON.stringify(call.input));
       assert.doesNotMatch(JSON.stringify(call.context), /Session-only history/);
-      assert.ok(!call.context.tools?.length);
+      assert.equal(call.context.tools?.length,1);assert.equal(call.context.tools[0].name,"submit_review");
+      assert.deepEqual(call.context.tools[0].constrainedSampling,{type:"json_schema",strict:"prefer"});
     }
   });
 }
+
+test("adapter: review accepts schema tool submissions", async (t) => {
+  const h = harness(t);
+  const seen = [];
+  h.ctx.modelRegistry = { streamSimple(model, context) {
+    seen.push(context);
+    return { async result() {
+      return {
+        stopReason: "toolUse",
+        content: [{ type: "toolCall", id: "call_1", name: "submit_review",
+          arguments: await structuralReview(JSON.parse(context.messages[0].content)) }],
+        usage: { input: 5, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 10,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+      };
+    } };
+  } };
+  const result = await draft(h);
+  assert.equal(result.isError, undefined);
+  assert.equal(seen.length, 2);
+  assert.equal(seen[0].tools?.length, 1);
+  assert.equal(result.usage.input, 10);
+  assert.equal(core.statusSnapshot(core.makeIo(h.cwd)).awaitingApproval, true);
+});
 
 
 // Recovery commands operate on the same root and never grant acceptance.

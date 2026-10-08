@@ -6,11 +6,14 @@ import * as path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { test } from 'node:test';
-import * as core from './exitcode-core.mjs';
+import * as hostCore from './exitcode-core.mjs';
+import { fixedTestRuntime } from './test/runtime.mjs';
 import { callReview, reviewRepository } from './exitcode-quality.mjs';
 import { releasePreparation } from './exitcode-preparation.mjs';
 import { sandboxCommand, scanCapabilities, evaluatorEnvironment, captureEvaluatorAssets, verifyEvaluatorAssets, restoreEvaluatorAssets } from './exitcode-evaluator.mjs';
 import { structuralReview } from './test/structural-review.mjs';
+
+const core={...hostCore,makeIo:(cwd,overrides={})=>hostCore.makeIo(cwd,{fingerprintRuntime:fixedTestRuntime,...overrides})};
 
 const read = (cwd, file) => fs.existsSync(path.join(cwd, file)) ? fs.readFileSync(path.join(cwd, file), 'utf8') : null;
 const run = (exit, extra = {}) => ({ exit, stdout: '', stderr: '', timedOut: false, ...extra });
@@ -601,7 +604,7 @@ test('recovery: legacy builtin acceptance keeps original local limits and depend
   assert.equal(core.loadRoot(f.io, 'G1').consumedAttempts, 0);
   assert.equal(core.loadRoot(f.io, 'G1').deadlineAt, root.deadlineAt);
   assert.deepEqual(core.loadRoot(f.io, 'G1').policy, root.policy);
-  assert.deepEqual(evaluatorEnvironment(f.cwd), bundle.env);
+  assert.deepEqual(evaluatorEnvironment(f.cwd,f.io), bundle.env);
 });
 
 
