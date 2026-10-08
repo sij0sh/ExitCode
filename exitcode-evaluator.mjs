@@ -191,6 +191,9 @@ export async function runRecipe(recipe, {cwd, timeoutMs = 120000, capabilities, 
 
 // Do not inherit credentials, NODE_OPTIONS, shell startup files, sockets, or host /proc.
 // Only system runtime trees and the caller's independent fixture are mounted.
+// A supervisor verification can itself run inside this sandbox. Reuse its read-only npm mount.
+const npmRuntime = () => fs.existsSync('/runtime/npm/bin/npm-cli.js') ? '/runtime/npm' : path.join(path.dirname(fs.realpathSync(process.execPath)), '../lib/node_modules/npm');
+
 export function sandboxArgs(cwd, {writable = false} = {}) {
   const args = ['--unshare-all','--die-with-parent','--new-session','--cap-drop','ALL','--ro-bind','/usr','/usr'];
   for (const name of ['lib','lib64','bin','sbin']) {
@@ -200,7 +203,7 @@ export function sandboxArgs(cwd, {writable = false} = {}) {
     else args.push('--ro-bind',full,full);
   }
   args.push('--proc','/proc','--dev','/dev','--tmpfs','/tmp','--dir','/runtime','--ro-bind',fs.realpathSync(process.execPath),'/runtime/node');
-  const npm = path.join(path.dirname(fs.realpathSync(process.execPath)), '../lib/node_modules/npm');
+  const npm = npmRuntime();
   if (fs.existsSync(npm)) args.push('--ro-bind',fs.realpathSync(npm),'/runtime/npm');
   args.push(writable?'--bind':'--ro-bind',fs.realpathSync(cwd),'/workspace','--chdir','/workspace','--clearenv','--setenv','PATH','/runtime:/usr/bin:/bin','--setenv','HOME','/tmp','--setenv','TMPDIR','/tmp','--setenv','LANG','C.UTF-8');
   return args;
@@ -228,7 +231,7 @@ export async function sandboxCommand(command, {cwd,timeoutMs = 120000,bwrapPath 
 
 export function evaluatorEnvironment(cwd) {
   const runtime = [process.execPath,'/usr/bin/bwrap','/bin/sh'].map(p=>{try{return {path:p,digest:fileDigest(fs.realpathSync(p))};}catch(e){return {path:p,error:e.code};}});
-  const npm = path.join(path.dirname(fs.realpathSync(process.execPath)), '../lib/node_modules/npm');
+  const npm = npmRuntime();
   return {platform:os.platform(),release:os.release(),arch:os.arch(),node:process.version,runtime,
     npm:fs.existsSync(npm)?candidateIdentity(npm):null,
     dependencies:fs.existsSync(path.join(cwd,'node_modules'))?digest(inventory(path.join(cwd,'node_modules'),{dependencies:true}).map(({rel,sha,mode,link})=>({rel,sha,mode,link}))):null,
