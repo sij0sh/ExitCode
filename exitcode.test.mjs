@@ -6,6 +6,7 @@ import { test } from "node:test";
 import {
   BLOCK_CODES,
   DEFAULT_POLICY,
+  MAX_DISCARDED_CHANGES,
   MAX_DRAFT_PROPOSALS,
   MODE_ENTRY_TYPE,
   NodeState,
@@ -14,9 +15,14 @@ import {
   allPass,
   assignCriterionIds,
   approveRoot,
+  baselineScope,
+  captureBaseline,
+  enforceBaseline,
+  ensureBaseline,
   prepareNode,
   draftFile,
   rootReviewText,
+  resumeRoot,
   blockNode,
   budgetsOk,
   childGates,
@@ -462,7 +468,7 @@ test("seal: fixtures and checkpoints accept trees above the old 64 MiB cap", asy
   assert.equal(restored.ok, true);
   assert.equal(digestTree(dir), before);
   fs.truncateSync(large, 9);
-  assert.equal(fs.statSync(path.join(checkpoint, "target/build.bin")).size, bytes,
+  assert.equal(fs.statSync(path.join(checkpoint, "tree/target/build.bin")).size, bytes,
     "restored writes must not affect the checkpoint");
 });
 
@@ -628,7 +634,148 @@ test("prepare: candidate mutations prevent review and sealing", async (t) => {
       if(!changed && (phase==="controls"&&command==="reject:C1" || phase==="wiring"&&fs.readdirSync(opts.cwd).length===0 || phase==="baseline"&&command==="check:reg"&&fs.existsSync(path.join(opts.cwd,"feature.txt")))) {changed=true;fs.writeFileSync(path.join(dir,"feature.txt"),"changed");}return result;};
     const io=makeIo(dir,{exec:wrapped});draftNode(io,{goal:"g",criteria:ROOT_CRITERIA});
     const p=await prepareNode(io);assert.equal(p.ok,false);assert.ok(p.diagnostics.some(d=>d.code==='CANDIDATE_MUTATED'));assert.equal(p.review,undefined);assert.equal(approveRoot(io).ok,false);assert.equal(loadBundle(io,"G1"),null);assert.equal(exec.calls.some(c=>c.cwd===dir),false);
+    // The mutated tree never survives as the next preparation's candidate.
+    assert.match(p.warnings[0],/modified feature\.txt/);assert.equal(fs.readFileSync(path.join(dir,"feature.txt"),"utf8"),"todo\n");
   }
+});
+
+// ---------------------------------------------------------------------------
+// Pre-seal baseline
+// ---------------------------------------------------------------------------
+
+const baselineDir = (dir) => path.join(dir, ".exitcode/baseline");
+const discardedSets = (dir) => fs.existsSync(path.join(dir, ".exitcode/discarded")) ? fs.readdirSync(path.join(dir, ".exitcode/discarded")).sort() : [];
+const readText = (dir, rel) => fs.readFileSync(path.join(dir, rel), "utf8");
+
+test("baseline: pre-seal changes from any source are saved, restored, and reported", async (t) => {
+  const dir = tempProject({ "feature.txt": "todo\n", "docs/guide.md": "guide\n", "keep/.gitkeep": "" });
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(dir, "empty"));
+  const { io } = testIo(dir, fileExec(dir, { checks: standardChecks }));
+  assert.equal(baselineScope(io), "G1");
+  assert.equal(draftNode(io, { goal: "g", criteria: ROOT_CRITERIA }).ok, true);
+  assert.equal(baselineScope(io), "G1");
+  const before = digestTree(dir);
+  const untouched = fs.statSync(path.join(dir, "docs/guide.md")).mtimeMs;
+  // An unrecognized analysis tool modifies, adds, and removes candidate files.
+  fs.writeFileSync(path.join(dir, "feature.txt"), "done\n");
+  fs.mkdirSync(path.join(dir, ".cache"));
+  fs.writeFileSync(path.join(dir, ".cache/generated-index.json"), "{}");
+  fs.rmSync(path.join(dir, "keep/.gitkeep"));
+  const prepared = await prepareNode(io);
+  assert.equal(prepared.ok, true, JSON.stringify(prepared.errors));
+  assert.match(prepared.review, /Validated plan/);
+  assert.match(prepared.warnings[0], /not permitted before the contract is sealed/);
+  assert.match(prepared.warnings[0], /modified feature\.txt; added \.cache\/generated-index\.json; removed keep\/\.gitkeep/);
+  assert.equal(digestTree(dir), before);
+  assert.equal(loadNodeState(io, "G1").prepared.candidateDigest, before);
+  assert.equal(readText(dir, "feature.txt"), "todo\n");
+  assert.equal(fs.existsSync(path.join(dir, ".cache")), false);
+  assert.ok(fs.existsSync(path.join(dir, "empty")), "unrelated empty directories are untouched");
+  assert.equal(fs.statSync(path.join(dir, "docs/guide.md")).mtimeMs, untouched, "unchanged files are not rewritten");
+  const [saved] = discardedSets(dir);
+  assert.ok(prepared.warnings[0].includes(`.exitcode/discarded/${saved}`));
+  assert.equal(readText(dir, `.exitcode/discarded/${saved}/files/feature.txt`), "done\n");
+  assert.deepEqual(JSON.parse(readText(dir, `.exitcode/discarded/${saved}/changes.json`)).removed, ["keep/.gitkeep"]);
+  assert.deepEqual(enforceBaseline(io), { ok: true });
+});
+
+test("baseline: review-time changes are discarded before approval, and sealing releases the baseline", async (t) => {
+  const dir = tempProject();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const { io } = testIo(dir, fileExec(dir, { checks: standardChecks }));
+  draftNode(io, { goal: "g", criteria: ROOT_CRITERIA });
+  assert.equal((await prepareNode(io)).ok, true);
+  fs.writeFileSync(path.join(dir, "feature.txt"), "edited during review\n");
+  const approval = approveRoot(io);
+  assert.equal(approval.ok, true);
+  assert.match(approval.warnings[0], /restored to the pre-seal baseline/);
+  assert.equal(readText(dir, "feature.txt"), "todo\n");
+  fs.writeFileSync(path.join(dir, "late.txt"), "late\n");
+  const sealed = await sealNode(io, "G1");
+  assert.equal(sealed.ok, true, JSON.stringify(sealed.errors));
+  assert.match(sealed.warnings[0], /added late\.txt/);
+  assert.equal(fs.existsSync(path.join(dir, "late.txt")), false);
+  assert.equal(fs.existsSync(baselineDir(dir)), false);
+  // Sealed execution may change the candidate.
+  assert.equal(baselineScope(io), null);
+  fs.writeFileSync(path.join(dir, "feature.txt"), "done\n");
+  assert.deepEqual(enforceBaseline(io), { ok: true });
+  assert.equal(ensureBaseline(io), null);
+  assert.equal(readText(dir, "feature.txt"), "done\n");
+});
+
+test("baseline: a child draft freezes the parent's work until the child seals", async (t) => {
+  const dir = tempProject();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const { io } = await sealedRoot(dir, fileExec(dir, { checks: standardChecks }), { now: Date.now() });
+  fs.writeFileSync(path.join(dir, "feature.txt"), "partial\n");
+  const child = draftNode(io, { parentId: "G1", target: "C1", goal: "sub", criteria: childCriteria(), reason: "r",
+    prerequisite: true, prerequisiteArtifact: "a" });
+  assert.equal(child.ok, true);
+  assert.equal(baselineScope(io), "G1.1");
+  fs.writeFileSync(path.join(dir, "feature.txt"), "rewritten before the child seals\n");
+  const sealed = await sealNode(io, "G1.1");
+  assert.equal(sealed.ok, true, JSON.stringify(sealed.errors));
+  assert.match(sealed.warnings[0], /modified feature\.txt/);
+  assert.equal(readText(dir, "feature.txt"), "partial\n", "restores the parent's work, not the root baseline");
+  assert.equal(fs.existsSync(baselineDir(dir)), false);
+});
+
+test("baseline: a resumable pause starts its own baseline without reverting execution work", async (t) => {
+  const dir = tempProject();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const { io } = await sealedRoot(dir, fileExec(dir, { checks: standardChecks }), { now: Date.now() });
+  captureBaseline(io, "G1"); // A stale record from the root's review phase.
+  fs.writeFileSync(path.join(dir, "feature.txt"), "work\n");
+  const blocked = await blockNode(io, "G1", { reason: "Missing authorization", code: "AUTHORIZATION_MISSING" });
+  assert.equal(blocked.status, NodeState.PAUSED);
+  assert.deepEqual(loadRoot(io,"G1").stack,["G1"]);
+  assert.equal(baselineScope(io), "G1");
+  assert.deepEqual(enforceBaseline(io), { ok: true });
+  assert.equal(readText(dir, "feature.txt"), "work\n");
+  fs.writeFileSync(path.join(dir, "feature.txt"), "after the block\n");
+  assert.equal(enforceBaseline(io).restored, true);
+  assert.equal(readText(dir, "feature.txt"), "work\n");
+});
+
+test("baseline: changes that cannot be saved or restored are never silently destroyed", async (t) => {
+  const dir = tempProject();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const { io } = testIo(dir, fileExec(dir, { checks: standardChecks }));
+  draftNode(io, { goal: "g", criteria: ROOT_CRITERIA });
+  // Recovery storage is unavailable: the change stays and preparation stops.
+  fs.writeFileSync(path.join(dir, ".exitcode/discarded"), "not a directory");
+  fs.writeFileSync(path.join(dir, "feature.txt"), "unsaved\n");
+  const unsaved = await prepareNode(io);
+  assert.equal(unsaved.ok, false);
+  assert.match(unsaved.errors[0], /could not be saved for recovery/);
+  assert.equal(readText(dir, "feature.txt"), "unsaved\n");
+  assert.equal(loadNodeState(io, "G1").evaluatorMetrics.e0Attempts, 0);
+  fs.rmSync(path.join(dir, ".exitcode/discarded"));
+  // Without a restorable copy, detection keeps the change as the new baseline.
+  fs.rmSync(path.join(baselineDir(dir), "manifest.json"));
+  const unrestorable = await prepareNode(io);
+  assert.equal(unrestorable.ok, false);
+  assert.match(unrestorable.errors[0], /cannot be restored \(baseline snapshot missing\)/);
+  assert.equal(readText(dir, "feature.txt"), "unsaved\n");
+  assert.equal((await prepareNode(io)).ok, true);
+  assert.equal(loadNodeState(io, "G1").prepared.candidateDigest, digestTree(dir));
+});
+
+test("baseline: only the latest discarded change sets are kept", async (t) => {
+  const dir = tempProject();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const io = makeIo(dir);
+  assert.equal(ensureBaseline(io).scope, "G1");
+  for (let i = 0; i < MAX_DISCARDED_CHANGES + 2; i++) {
+    fs.writeFileSync(path.join(dir, `stray-${i}.txt`), String(i));
+    assert.equal(enforceBaseline(io).restored, true);
+  }
+  const sets = discardedSets(dir);
+  assert.deepEqual(sets, Array.from({ length: MAX_DISCARDED_CHANGES }, (_, i) => `d-${String(i + 3).padStart(6, "0")}`));
+  assert.equal(readText(dir, `.exitcode/discarded/${sets.at(-1)}/files/stray-${MAX_DISCARDED_CHANGES + 1}.txt`), String(MAX_DISCARDED_CHANGES + 1));
+  assert.deepEqual(fs.readdirSync(dir).sort(), [".exitcode", "feature.txt"]);
 });
 
 // ---------------------------------------------------------------------------
@@ -678,87 +825,59 @@ test("prepare: gate failure consumes evaluator budget; repair precedes first app
  bad=false;draftNode(io,{goal:'g',criteria:ROOT_CRITERIA,revise:'G1'});assert.equal((await prepareNode(io)).ok,true);assert.equal(approveRoot(io).ok,true);assert.equal((await sealNode(io,'G1')).ok,true);assert.equal(loadNodeState(io,'G1').sealAttempts,1);
 });
 
-test("prepare: exhausting evaluator attempts BLOCKEDs without implementation attempts", async (t) => {
+test("prepare: exhausting evaluator attempts pauses without implementation attempts", async (t) => {
  const dir=tempProject();t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));const io=makeIo(dir,{exec:fileExec(dir,{checks:standardChecks,accepts:{'accept:C1':{content:'todo'}}})});draftNode(io,{goal:'g',criteria:ROOT_CRITERIA,policy:{evaluatorAttempts:2}});
- assert.equal((await prepareNode(io)).ok,false);assert.equal((await prepareNode(io)).ok,false);const result=await prepareNode(io);assert.equal(result.terminal.status,'BLOCKED');assert.equal(loadNodeState(io,'G1').blockedCode,'EVALUATOR_UNBUILDABLE');assert.equal(loadRoot(io,'G1').consumedAttempts,0);
+ assert.equal((await prepareNode(io)).ok,false);assert.equal((await prepareNode(io)).ok,false);const result=await prepareNode(io);assert.equal(result.status,'PAUSED');assert.equal(result.pause.code,'EVALUATOR_UNBUILDABLE');assert.equal(loadNodeState(io,'G1').status,'DRAFT');assert.equal(loadRoot(io,'G1').consumedAttempts,0);
 });
 
-test("policy: rejected initial scope can amend every limit after expiry without resetting time", async (t) => {
-  const dir = tempProject();
-  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
-  const nowRef = { now: Date.parse("2026-10-07T22:02:15.029Z") };
-  const exec = fileExec(dir, { checks: standardChecks });
-  const { io } = testIo(dir, exec, nowRef);
-  const originalPolicy = { localRepairs: 2, maxDepth: 1, maxTotalAttempts: 3, deadlineMinutes: 30, evalTimeoutSeconds: 900 };
-  const proposedPolicy = { localRepairs: 4, maxDepth: 3, maxTotalAttempts: 24, deadlineMinutes: 480, evalTimeoutSeconds: 1200 };
-  draftNode(io, { goal: "Commit-only detour", originalRequest: "Complete the implementation", criteria: ROOT_CRITERIA, policy: originalPolicy });
-  const createdAt = loadRoot(io, "G1").createdAt;
-  const beforeNode = loadNodeState(io, "G1");
-  nowRef.now += 30 * 60000 + 15465;
-  assert.equal(statusSnapshot(io).expired, true);
-  assert.doesNotMatch(statusSnapshot(io).next, /wait for the user to accept/);
-  assert.match(statusSnapshot(io).next, /larger finite policy/);
-  assert.equal(statusSnapshot(io).review, null);
-  const rootBefore = loadRoot(io, "G1");
-  assert.equal(approveRoot(io).ok, false);
-  const unapprovedSeal = await sealNode(io, "G1");
-  assert.equal(unapprovedSeal.ok, false);
-  assert.match(unapprovedSeal.errors[0], /approval and E0 are unavailable/);
-  assert.doesNotMatch(unapprovedSeal.next, /wait for the user to accept/);
-  assert.equal((await sealNode(io, "G1", { userApproval: "Go ahead" })).ok, false);
-  assert.deepEqual(loadRoot(io, "G1"), rootBefore);
-  const expiredRevision = draftNode(io, { revise: "G1", goal: "Implementation", criteria: ROOT_CRITERIA });
-  assert.equal(expiredRevision.ok, false);
-  assert.deepEqual(loadRoot(io, "G1"), rootBefore);
-  const revised = draftNode(io, { revise: "G1", goal: "Implementation", criteria: ROOT_CRITERIA,
-    originalRequest: "Extension housekeeping", policy: proposedPolicy });
-  assert.equal(revised.ok, true);
-  assert.deepEqual(revised.policy, {...DEFAULT_POLICY,...proposedPolicy});
-  assert.deepEqual(revised.warnings, []);
-  assert.equal(revised.draft.originalRequest, "Complete the implementation");
-  assert.equal(revised.createdAt, createdAt);
-  assert.equal(revised.deadlineAt, "2026-10-08T06:02:15.029Z");
-  assert.equal(revised.remainingMs, createdAt + 480 * 60000 - nowRef.now);
-  assert.equal(revised.policyEditable, true);
+test("policy: initial scope can amend every limit without spending execution time", async (t) => {
+  const dir=tempProject();t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
+  const nowRef={now:Date.parse("2026-10-07T22:02:15.029Z")},exec=fileExec(dir,{checks:standardChecks});
+  const {io}=testIo(dir,exec,nowRef);
+  draftNode(io,{goal:"Initial scope",originalRequest:"Complete the implementation",criteria:ROOT_CRITERIA,
+    policy:{localRepairs:2,maxDepth:1,maxTotalAttempts:3,deadlineMinutes:30,evalTimeoutSeconds:900}});
+  const createdAt=loadRoot(io,"G1").createdAt,beforeNode=loadNodeState(io,"G1");
+  nowRef.now+=14*86400000;
+  assert.equal(statusSnapshot(io).expired,false);
+  assert.equal(statusSnapshot(io).deadlineAt,null);
+  assert.equal(approveRoot(io).ok,false);
+  assert.equal((await sealNode(io,"G1")).ok,false);
+  const policy={localRepairs:4,maxDepth:3,maxTotalAttempts:24,deadlineMinutes:480,evalTimeoutSeconds:1200};
+  const revised=draftNode(io,{revise:"G1",goal:"Implementation",criteria:ROOT_CRITERIA,originalRequest:"Housekeeping",policy});
+  assert.equal(revised.ok,true);
+  assert.equal(revised.draft.originalRequest,"Complete the implementation");
+  assert.deepEqual(revised.policy,{...DEFAULT_POLICY,...policy});
+  assert.equal(revised.createdAt,createdAt);
+  assert.equal(revised.deadlineAt,null);
+  assert.equal(revised.remainingMs,480*60000);
+  assert.equal(revised.policyEditable,true);
   assert.equal(loadNodeState(io,"G1").evaluatorMetrics.evaluatorProposals,beforeNode.evaluatorMetrics.evaluatorProposals+1);
-  assert.equal(loadNodeState(io,"G1").attempts,beforeNode.attempts);
-  assert.equal(loadRoot(io, "G1").consumedAttempts, 0);
-  assert.equal(exec.calls.length, 0);
-  assert.equal(revised.review,undefined);
-  assert.equal(revised.remainingMs,449.74225*60000);
-  assert.deepEqual(statusSnapshot(io).policy, {...DEFAULT_POLICY,...proposedPolicy});
-  const noReset = draftNode(io, { revise: "G1", goal: "Clarified implementation", criteria: ROOT_CRITERIA });
-  assert.equal(noReset.deadlineAt, revised.deadlineAt);
-  assert.deepEqual(noReset.policy, {...DEFAULT_POLICY,...proposedPolicy});
-  assert.equal((await sealNode(io, "G1")).ok, false, "amendment still needs fresh approval");
+  assert.equal(loadRoot(io,"G1").consumedAttempts,0);
+  assert.equal(exec.calls.length,0);
   assert.equal((await prepareNode(io)).ok,true);
-  assert.equal((await sealNode(io, "G1", { userApproval: "Approve the revised scope and limits" })).sealed, "G1");
-  assert.equal(loadRoot(io, "G1").policyLocked, true);
-  assert.equal(loadNodeState(io, "G1").sealAttempts, 1);
-  assert.ok(exec.calls.every((call) => call.timeoutMs === 1200 * 1000));
+  assert.equal((await sealNode(io,"G1",{userApproval:"Approve scope and limits"})).sealed,"G1");
+  const root=loadRoot(io,"G1");
+  assert.equal(root.policyLocked,true);
+  assert.equal(root.executionStartedAt,nowRef.now);
+  assert.equal(root.deadlineAt,nowRef.now+480*60000);
+  assert.ok(exec.calls.every(call=>call.timeoutMs===1200*1000));
 });
 
-test("policy: an approved expired root cannot revise or revive its budget", async (t) => {
-  const dir = tempProject();
-  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
-  const exec = fileExec(dir, { checks: standardChecks });
-  const { io, nowRef } = testIo(dir, exec);
-  draftNode(io, { goal: "g", criteria: ROOT_CRITERIA });
-  await prepareNode(io);
-  approveRoot(io);
-  exec.calls.length=0;
-  const before = loadRoot(io, "G1");
-  nowRef.now = before.deadlineAt;
-  assert.equal(draftNode(io, { revise: "G1", goal: "New scope", criteria: ROOT_CRITERIA }).ok, false);
-  assert.equal(draftNode(io, { revise: "G1", goal: "g", criteria: ROOT_CRITERIA, policy: { deadlineMinutes: 480 } }).ok, false);
-  assert.deepEqual(loadRoot(io, "G1"), before);
-  const sealed = await sealNode(io, "G1");
-  assert.equal(sealed.status, "BLOCKED");
-  assert.equal(sealed.terminal.outcome.code, "BUDGET_EXHAUSTED");
-  assert.equal(loadNodeState(io, "G1").sealAttempts, 0);
-  assert.equal(exec.calls.length, 0);
-  assert.equal(draftNode(io, { revise: "G1", goal: "g", criteria: ROOT_CRITERIA, policy: { deadlineMinutes: 480 } }).ok, false);
-  assert.equal(loadRoot(io, "G1").deadlineAt, before.deadlineAt);
+test("policy: sealed expiry cannot revise acceptance or revive budget without an explicit user grant", async (t) => {
+  const dir=tempProject();t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
+  const nowRef={now:Date.now()},exec=fileExec(dir,{checks:standardChecks});
+  const {io}=await sealedRoot(dir,exec,nowRef);
+  const before=loadRoot(io,"G1");nowRef.now=before.deadlineAt;exec.calls.length=0;
+  assert.equal(draftNode(io,{revise:"G1",goal:"New scope",criteria:ROOT_CRITERIA}).ok,false);
+  assert.equal(draftNode(io,{revise:"G1",goal:"g",criteria:ROOT_CRITERIA,policy:{deadlineMinutes:480}}).ok,false);
+  assert.deepEqual(loadRoot(io,"G1"),before);
+  const result=await evaluateNode(io);
+  assert.equal(result.status,"PAUSED");
+  assert.equal(result.pause.code,"DEADLINE_EXCEEDED");
+  assert.equal(resumeRoot(io).ok,false);
+  assert.equal(exec.calls.length,0);
+  assert.equal(loadRoot(io,"G1").deadlineAt,before.deadlineAt);
+  assert.equal(loadRoot(io,"G1").consumedAttempts,0);
 });
 
 test("policy: invalid root-creation limits leave no root or consumed identity", (t) => {
@@ -794,21 +913,21 @@ test("policy: partial corrections retain effective values and invalid revisions 
   assert.deepEqual(files.map((file) => fs.readFileSync(file, "utf8")), before);
 });
 
-test("policy: a correction whose deadline is already past is rejected without replacing usable limits", async (t) => {
-  const dir = tempProject();
-  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
-  const { io, nowRef } = testIo(dir, fileExec(dir, { checks: standardChecks }));
-  draftNode(io, { goal: "g", criteria: ROOT_CRITERIA });
-  const before = loadRoot(io, "G1");
-  nowRef.now += 30 * 60000;
-  const result = draftNode(io, { revise: "G1", goal: "New scope", criteria: ROOT_CRITERIA, policy: { deadlineMinutes: 20 } });
-  assert.equal(result.ok, false);
-  assert.match(result.errors[0], /proposed policy deadline has already elapsed/);
-  assert.equal(result.expired, false, "returned limits are the unchanged effective policy");
-  assert.deepEqual(result.policy, before.policy);
-  assert.deepEqual(loadRoot(io, "G1"), before);
-  assert.equal((await prepareNode(io)).ok, true);
-  assert.equal(approveRoot(io).ok, true);
+test("policy: a shorter execution duration does not expire an unsealed preparation", async (t) => {
+  const dir=tempProject();t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
+  const {io,nowRef}=testIo(dir,fileExec(dir,{checks:standardChecks}));
+  draftNode(io,{goal:"g",criteria:ROOT_CRITERIA});const before=loadRoot(io,"G1");
+  nowRef.now+=30*60000;
+  const result=draftNode(io,{revise:"G1",goal:"New scope",criteria:ROOT_CRITERIA,policy:{deadlineMinutes:20}});
+  assert.equal(result.ok,true);
+  assert.equal(result.expired,false);
+  assert.equal(result.deadlineAt,null);
+  assert.equal(result.remainingMs,20*60000);
+  assert.equal(loadRoot(io,"G1").createdAt,before.createdAt);
+  assert.equal((await prepareNode(io)).ok,true);
+  assert.equal(approveRoot(io).ok,true);
+  assert.equal((await sealNode(io,"G1")).ok,true);
+  assert.equal(loadRoot(io,"G1").deadlineAt,nowRef.now+20*60000);
 });
 
 test("policy: first approval locks limits across revision and fresh IO before E0", async (t) => {
@@ -845,7 +964,7 @@ test("policy: first approval locks limits across revision and fresh IO before E0
   assert.equal((await sealNode(fresh, "G1")).sealed, "G1");
 });
 
-test("policy: failed E0 and cleared approval never reopen policy editing", async (t) => {
+test("policy: failed E0 allows reviewed operational corrections before first approval", async (t) => {
   const dir = tempProject();
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   let badFixture = true;
@@ -866,7 +985,7 @@ test("policy: failed E0 and cleared approval never reopen policy editing", async
   assert.equal(draftNode(io, { revise: "G1", goal: "g", criteria: ROOT_CRITERIA }).ok, true);
   const fresh = makeIo(dir, { exec: wrapped });
   assert.equal(loadRoot(fresh, "G1").approval, undefined);
-  assert.equal(draftNode(fresh, { revise: "G1", goal: "g", criteria: ROOT_CRITERIA, policy: { deadlineMinutes: 480 } }).ok, false);
+  assert.equal(draftNode(fresh, { revise: "G1", goal: "g", criteria: ROOT_CRITERIA, policy: { deadlineMinutes: 480 } }).ok, true);
   assert.equal(loadNodeState(fresh, "G1").sealAttempts, 0);
   assert.equal(loadRoot(fresh, "G1").deadlineAt, deadlineAt);
   badFixture = false;
@@ -950,7 +1069,7 @@ test("policy: evidence of work closes initial editing even without current appro
 
 test("policy: review and approval bind every limit and the shared clock", async (t) => {
   for (const [key, value] of [...Object.entries({ localRepairs: 4, maxDepth: 1, maxTotalAttempts: 24,
-    deadlineMinutes: 480, evalTimeoutSeconds: 900 }), ["createdAt", Date.now() - 1000], ["deadlineAt", Date.now() + 480 * 60000]]) {
+    deadlineMinutes: 480, evalTimeoutSeconds: 1200 }), ["createdAt", Date.now() - 1000], ["deadlineAt", Date.now() + 480 * 60000]]) {
     const dir = tempProject();
     t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
     const exec = fileExec(dir, { checks: standardChecks });
@@ -990,7 +1109,7 @@ test("policy: changes during E0 cannot seal a stale approval", async (t) => {
       assert.equal(draftNode(io, { revise: "G1", goal: "Changed limits", criteria: ROOT_CRITERIA,
         policy: { deadlineMinutes: 480 } }).ok, false);
       const root = loadRoot(io, "G1");
-      root.policy.evalTimeoutSeconds = 900;
+      root.policy.evalTimeoutSeconds = 1200;
       fs.writeFileSync(path.join(dir, ".exitcode/roots/G1.json"), JSON.stringify(root));
     }
     return exec(command, opts);
@@ -1160,26 +1279,25 @@ test("approval: semantic or evaluator edits on disk cannot reuse approval", asyn
   }
 });
 
-test("approval: root revision during asynchronous E0 cannot seal stale intent", async () => {
+test("approval: workspace ownership refuses a concurrent root revision during E0", async () => {
   const dir = tempProject();
   const exec = fileExec(dir, { checks: standardChecks });
   let revised = false;
   const io = makeIo(dir, { exec: async (command, opts) => {
     if (!revised) {
       revised = true;
-      assert.equal(draftNode(io, { goal: "new goal", criteria: ROOT_CRITERIA, revise: "G1" }).ok, true);
+      assert.equal(draftNode(io, { goal: "new goal", criteria: ROOT_CRITERIA, revise: "G1" }).code,"OPERATION_BUSY");
     }
     return exec(command, opts);
   } });
   draftNode(io, { goal: "g", criteria: ROOT_CRITERIA });
   const result = await prepareNode(io);
-  assert.equal(result.ok, false);
-  assert.match(result.errors[0], /changed during preparation/);
+  assert.equal(result.ok,true);
   assert.equal(loadBundle(io, "G1"), null);
   assert.equal(loadRoot(io, "G1").approval, undefined);
   assert.equal(loadNodeState(io, "G1").status, "DRAFT");
   assert.equal(loadNodeState(io, "G1").sealAttempts, 0);
-  assert.equal(JSON.parse(fs.readFileSync(draftFile(dir, "G1"), "utf8")).draft.goal, "new goal");
+  assert.equal(JSON.parse(fs.readFileSync(draftFile(dir, "G1"), "utf8")).draft.goal, "g");
 });
 
 test("approval: child revisions and sealing need no separate user approval", async () => {
@@ -1259,7 +1377,7 @@ test("evaluate: unchanged tree is a free re-run; changed tree consumes", async (
   assert.equal(loadNodeState(io, "G1").attempts, 1);
 });
 
-test("evaluate: attempt budget exhaustion BLOCKEDs the node", async () => {
+test("evaluate: attempt budget exhaustion pauses the same root", async () => {
   const dir = tempProject();
   const nowRef = { now: Date.now() };
   const { io } = testIo(dir, fileExec(dir, { checks: standardChecks }), nowRef);
@@ -1271,8 +1389,8 @@ test("evaluate: attempt budget exhaustion BLOCKEDs the node", async () => {
   assert.equal((await evaluateNode(io, null)).status, NodeState.ACTIVE);
   fs.writeFileSync(path.join(dir, "feature.txt"), "v3\n");
   const exhausted = await evaluateNode(io, null);
-  assert.equal(exhausted.status, NodeState.BLOCKED);
-  assert.equal(loadNodeState(io, "G1").blockedCode, "BUDGET_EXHAUSTED");
+  assert.equal(exhausted.status,NodeState.PAUSED);assert.equal(exhausted.pause.code,"BUDGET_EXHAUSTED");
+  assert.equal(loadRoot(io,"G1").pause.code,"BUDGET_EXHAUSTED");
 });
 
 test("evaluate: ALL PASS closes the root with the candidate identity", async () => {
@@ -1295,7 +1413,7 @@ test("evaluate: ALL PASS closes the root with the candidate identity", async () 
   assert.equal(root.outcome.candidateDigest, digestTree(dir));
 });
 
-test("evaluate: deadline expiry BLOCKEDs changed-tree work", async () => {
+test("evaluate: deadline expiry pauses changed-tree work", async () => {
   const dir = tempProject();
   const nowRef = { now: Date.now() };
   const { io } = testIo(dir, fileExec(dir, { checks: standardChecks }), nowRef);
@@ -1306,11 +1424,11 @@ test("evaluate: deadline expiry BLOCKEDs changed-tree work", async () => {
   nowRef.now += 31 * 60 * 1000;
   fs.writeFileSync(path.join(dir, "feature.txt"), "late edit\n");
   const result = await evaluateNode(io, null);
-  assert.equal(result.status, NodeState.BLOCKED);
-  assert.equal(loadNodeState(io, "G1").blockedCode, "BUDGET_EXHAUSTED");
+  assert.equal(result.status,NodeState.PAUSED);
+  assert.equal(loadRoot(io,"G1").pause.code,"DEADLINE_EXCEEDED");
 });
 
-test("evaluate: sealed-bundle tampering BLOCKEDs instead of trusting edits", async () => {
+test("evaluate: sealed-bundle tampering pauses instead of trusting edits", async () => {
   const dir = tempProject();
   const exec = fileExec(dir, { checks: standardChecks });
   const nowRef = { now: Date.now() };
@@ -1324,8 +1442,8 @@ test("evaluate: sealed-bundle tampering BLOCKEDs instead of trusting edits", asy
   bundle.contract.goal = "tampered";
   fs.writeFileSync(sealedFile, JSON.stringify(bundle));
   const result = await evaluateNode(io, null);
-  assert.equal(result.status, NodeState.BLOCKED);
-  assert.ok(loadNodeState(io, "G1").blockedReason.includes("digest mismatch"));
+  assert.equal(result.status,NodeState.PAUSED);
+  assert.equal(loadRoot(io,"G1").pause.code,"EVALUATOR_DRIFT");assert.match(loadRoot(io,"G1").pause.reason,/supervisor identity/);
 });
 
 // ---------------------------------------------------------------------------
@@ -1427,8 +1545,8 @@ test("child: one active child; identical repeats rejected on unchanged evidence"
     prerequisite: true, prerequisiteArtifact: "a",
   });
   assert.equal(second.ok, false);
-  assert.ok(second.errors.some((e) => e.includes("one active child")));
-  assert.equal((await blockNode(io, "G1.1", { reason: "missing credential", code: "CREDENTIAL_MISSING" })).status, NodeState.BLOCKED);
+  assert.ok(second.errors.some((e) => /one active child|active leaf/.test(e)));
+  assert.equal((await blockNode(io, "G1.1", { reason: "No viable child path", code: "NO_PATH" })).status, NodeState.BLOCKED);
   const repeat = draftNode(io, {
     parentId: "G1", target: "C1", goal: "same subgoal", criteria: childCriteria(), reason: "r2",
     prerequisite: true, prerequisiteArtifact: "a",
@@ -1504,7 +1622,7 @@ test("block: child BLOCKED restores the pre-child candidate and reruns parent", 
   assert.equal((await sealNode(io, "G1.1")).ok, true);
   fs.writeFileSync(path.join(dir, "child1.txt"), "half-baked");
   fs.writeFileSync(path.join(dir, "feature.txt"), "todo edited\n");
-  const blocked = await blockNode(io, "G1.1", { reason: "needs human API key", code: "CREDENTIAL_MISSING" });
+  const blocked = await blockNode(io, "G1.1", { reason: "This child cannot solve the targeted requirement", code: "NO_PATH" });
   assert.equal(blocked.status, NodeState.BLOCKED);
   assert.ok(blocked.events.some((e) => e.includes("restored G1 to pre-child checkpoint")));
   assert.ok(blocked.events.some((e) => e.includes("G1 rerun: C1=FAIL C2=PASS")));
@@ -1603,6 +1721,32 @@ test("snapshot/restore roundtrips the tree and deletes later files", () => {
   assert.equal(fs.existsSync(path.join(dir, "new.txt")), false);
 });
 
+test("restoreTree: rewrites only changed files and replaces paths whose type changed", (t) => {
+  const dir = tempProject({ "a.txt": "a", "b.txt": "b", "sub/c.txt": "c" });
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), "exitcode-outside-"));
+  t.after(() => { fs.rmSync(dir, { recursive: true, force: true }); fs.rmSync(outside, { recursive: true, force: true }); });
+  fs.writeFileSync(path.join(outside, "c.txt"), "outside");
+  fs.mkdirSync(path.join(dir, "empty"));
+  const snapDir = path.join(dir, ".exitcode", "tmp", "snap");
+  const snap = snapshotTree(dir, snapDir);
+  const kept = fs.statSync(path.join(dir, "a.txt")).ino;
+  fs.rmSync(path.join(dir, "b.txt"));
+  fs.mkdirSync(path.join(dir, "b.txt/nested"), { recursive: true });
+  fs.mkdirSync(path.join(dir, "b.txt/empty"));
+  fs.writeFileSync(path.join(dir, "b.txt/nested/x"), "x");
+  fs.rmSync(path.join(dir, "sub"), { recursive: true });
+  fs.symlinkSync(outside, path.join(dir, "sub"));
+  const restored = restoreTree(dir, snapDir, snap.manifest);
+  assert.deepEqual(restored.restored.sort(), ["b.txt", "sub/c.txt"]);
+  assert.deepEqual(restored.removed.sort(), ["b.txt/nested/x", "sub"]);
+  assert.equal(fs.statSync(path.join(dir, "a.txt")).ino, kept);
+  assert.equal(fs.readFileSync(path.join(dir, "b.txt"), "utf8"), "b");
+  assert.equal(fs.lstatSync(path.join(dir, "sub")).isDirectory(), true);
+  assert.equal(fs.readFileSync(path.join(dir, "sub/c.txt"), "utf8"), "c");
+  assert.equal(fs.readFileSync(path.join(outside, "c.txt"), "utf8"), "outside");
+  assert.ok(fs.existsSync(path.join(dir, "empty")));
+});
+
 test("snapshot: explicit caps count all content, accept the boundary, and clean up rejection", (t) => {
   const dir = tempProject({ "a.txt": "abc", "sub/b.txt": "def" });
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
@@ -1624,8 +1768,8 @@ test("snapshot: copy failures return diagnostics and remove partial content", (t
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const before = digestTree(dir);
   const snapDir = path.join(dir, ".exitcode/tmp/snapshot");
-  fs.mkdirSync(snapDir, { recursive: true });
-  fs.writeFileSync(path.join(snapDir, "sub"), "blocks directory creation");
+  fs.mkdirSync(path.join(snapDir,"tree"), { recursive: true });
+  fs.writeFileSync(path.join(snapDir,"tree", "sub"), "blocks directory creation");
   const result = snapshotTree(dir, snapDir);
   assert.equal(result.ok, false);
   assert.match(result.reason, /snapshot failed \(EEXIST\)/);
@@ -1633,14 +1777,15 @@ test("snapshot: copy failures return diagnostics and remove partial content", (t
   assert.equal(digestTree(dir), before);
 });
 
-test("digestTree: ignores supervisor and dependency dirs, tracks content", () => {
+test("digestTree: ignores supervisor state and tracks installed dependency content", () => {
   const dir = tempProject({ "a.txt": "a" });
   const before = digestTree(dir);
   fs.mkdirSync(path.join(dir, ".exitcode", "x"), { recursive: true });
   fs.writeFileSync(path.join(dir, ".exitcode", "x", "y.json"), "{}");
+  assert.equal(digestTree(dir),before);
   fs.mkdirSync(path.join(dir, "node_modules", "z"), { recursive: true });
   fs.writeFileSync(path.join(dir, "node_modules", "z", "y.js"), "1");
-  assert.equal(digestTree(dir), before);
+  assert.notEqual(digestTree(dir), before);
   fs.writeFileSync(path.join(dir, "a.txt"), "b");
   assert.notEqual(digestTree(dir), before);
 });
@@ -1679,12 +1824,12 @@ test("checkpoints: rolling cap keeps pre-child checkpoints of live children", as
 
 test("protocol: separates the approved goal, recursive repair, and proof of success", () => {
   for (const text of ["FIX SUCCESS", "PURSUE SUCCESS", "PROVE SUCCESS", "wait for explicit user approval",
-    "Revisions after review require fresh validated-plan approval", "sealed contract is fixed and cannot be weakened",
+    "Revisions after review require fresh validated-plan approval", "sealed acceptance program, tests, required cases and expectations are fixed and cannot be weakened",
     "Implement the approved goal", "Use the sealed criteria to measure", "preserve previously passing behavior",
     "Decompose only when the supervisor permits it", "temporary reduction of its parent problem",
     "needs no user approval", "cannot change ancestor contracts", "Evaluate after meaningful changes",
     "fresh supervisor evaluation with all criteria passing", "follow the supervisor's returned parent result and next action",
-    "report the concrete blocker"]) {
+    "Report concrete authority, ambiguity, integrity or exhausted-budget blockers"]) {
     assert.ok(PROTOCOL_PROMPT.includes(text), text);
   }
   assert.doesNotMatch(PROTOCOL_PROMPT, /stalled|toward the sealed criteria|controls\.accept|userApproval/);
@@ -1692,51 +1837,43 @@ test("protocol: separates the approved goal, recursive repair, and proof of succ
 
 test("guardToolCall: invisible when mode is off", () => {
   const dir = tempProject();
-  assert.equal(guardToolCall({ modeOn: false, leafStatus: null, cwd: dir, toolName: "write", input: { path: "a" } }), null);
-  assert.equal(guardToolCall({ modeOn: false, leafStatus: null, cwd: dir, toolName: "bash", input: { command: "rm -rf /" } }), null);
+  assert.equal(guardToolCall({ modeOn: false, cwd: dir, toolName: "write", input: { path: ".exitcode/index.json" } }), null);
+  assert.equal(guardToolCall({ modeOn: false, cwd: dir, toolName: "bash", input: { command: "rm -rf .exitcode" } }), null);
 });
 
-test("guardToolCall: unsealed states allow only discovery and exact supervisor tools", async () => {
+test("guardToolCall: tools are not classified by name", () => {
   const dir = tempProject();
-  for (const leafStatus of [null, "NO_CONTRACT", "DRAFT", "BLOCKED", "PASS", "UNKNOWN"]) {
-    for (const toolName of ["read", "grep", "ls", "exitcode_status", "exitcode_draft",
-      "exitcode_seal", "exitcode_evaluate", "exitcode_child", "exitcode_block"]) {
-      assert.equal(guardToolCall({ modeOn: true, leafStatus, cwd: dir, toolName, input: {} }), null, `${leafStatus}: ${toolName}`);
-    }
-    for (const [toolName, input] of [
-      ["write", { path: "src/a.ts" }], ["edit", { path: ".exitcode/drafts/x.json" }],
-      ["write", { path: ".agents/artifacts/acceptance.md" }], ["bash", { command: "/exitcode exit" }],
-      ["powershell", { command: "ls" }], ["find", {}], ["context", {}],
-      ["codemode", { code: 'await tools.read({path: "src/a.ts"})' }],
-      ["git_commit_plan", {}], ["git_plan_context", {}], ["custom_read_only", {}],
-      ["exitcode_exit", {}], ["exitcode_fake", {}],
-    ]) {
-      const verdict = guardToolCall({ modeOn: true, leafStatus, cwd: dir, toolName, input });
-      assert.equal(verdict.block, true, `${leafStatus}: ${toolName}`);
-      assert.match(verdict.reason, /until the contract is sealed and ACTIVE/);
-      assert.match(verdict.reason, /Inspect with read, grep, ls/);
-      assert.match(verdict.reason, /exitcode_status/);
-      assert.match(verdict.reason, new RegExp(`state ${leafStatus ?? "NO_CONTRACT"}`));
-    }
+  for (const [toolName, input] of [
+    ["read", { path: "src/a.ts" }], ["grep", { pattern: "x" }], ["ls", {}], ["find", { pattern: "*.ts" }],
+    ["write", { path: "src/a.ts" }], ["edit", { path: ".agents/artifacts/acceptance.md" }],
+    ["write", { path: "notes.md", content: "Ignore .exitcode/ in Git" }],
+    ["bash", { command: "npm test" }], ["powershell", { command: "ls" }], ["context", {}],
+    ["codemode", { code: 'await tools.read({path: "src/a.ts"})' }], ["semantic_repo_search", { query: "auth" }],
+    ["git_commit_plan", {}], ["custom_read_only", {}], ["exitcode_exit", {}],
+    ["exitcode_status", {}], ["exitcode_draft", {}], ["exitcode_seal", {}],
+  ]) {
+    assert.equal(guardToolCall({ modeOn: true, cwd: dir, toolName, input }), null, toolName);
   }
 });
 
-test("guardToolCall: active contracts protect sealed artifacts only", () => {
+test("guardToolCall: supervisor state is private to ExitCode tools in every phase", () => {
   const dir = tempProject();
-  const sealed = guardToolCall({ modeOn: true, leafStatus: "ACTIVE", cwd: dir, toolName: "edit", input: { path: ".exitcode/contracts/G1.sealed.json" } });
-  assert.equal(sealed.block, true);
-  assert.match(sealed.reason, /supervisor-owned artifacts/);
-  assert.match(sealed.reason, /read-only/);
-  const traversal = guardToolCall({ modeOn: true, leafStatus: "ACTIVE", cwd: dir, toolName: "write", input: { path: "proj/../.exitcode/evil" } });
-  assert.equal(traversal.block, true);
-  const project = guardToolCall({ modeOn: true, leafStatus: "ACTIVE", cwd: dir, toolName: "edit", input: { path: "src/a.ts" } });
-  assert.equal(project, null);
-  const shell = guardToolCall({ modeOn: true, leafStatus: "ACTIVE", cwd: dir, toolName: "bash", input: { command: "npm test" } });
-  assert.equal(shell, null);
-  const sealedShell = guardToolCall({ modeOn: true, leafStatus: "ACTIVE", cwd: dir, toolName: "bash", input: { command: "cat .exitcode/index.json" } });
-  assert.equal(sealedShell.block, true);
-  assert.match(sealedShell.reason, /mentioning \.exitcode are blocked/);
-  assert.match(sealedShell.reason, /exitcode_status/);
+  for (const [toolName, input] of [
+    ["edit", { path: ".exitcode/contracts/G1.sealed.json" }], ["write", { path: ".exitcode/drafts/manual.json" }],
+    ["write", { path: "proj/../.exitcode/evil" }], ["write", { path: path.join(dir, ".exitcode/index.json") }],
+    ["read", { path: ".exitcode/nodes/G1.json" }], ["ls", { path: ".exitcode" }],
+    ["grep", { pattern: "digest", path: ".exitcode/" }], ["find", { pattern: "*.json", path: "./.exitcode/roots" }],
+  ]) {
+    const verdict = guardToolCall({ modeOn: true, cwd: dir, toolName, input });
+    assert.equal(verdict?.block, true, `${toolName} ${input.path}`);
+    assert.match(verdict.reason, /private to ExitCode tools/);
+    assert.match(verdict.reason, /exitcode_status/);
+  }
+  const shell = guardToolCall({ modeOn: true, cwd: dir, toolName: "bash", input: { command: "cat .exitcode/index.json" } });
+  assert.equal(shell.block, true);
+  assert.match(shell.reason, /mentioning \.exitcode are blocked/);
+  assert.match(shell.reason, /exitcode_status/);
+  assert.equal(guardToolCall({ modeOn: true, cwd: dir, toolName: "read", input: { path: "src/exitcode.ts" } }), null);
 });
 
 test("resolveModeFromBranch: last mode entry wins; other entries ignored", () => {

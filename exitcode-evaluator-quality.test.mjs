@@ -72,16 +72,15 @@ test('evaluator-quality: external dependencies are typed pre-review failures',as
 });
 
 test('evaluator-quality: inconsistent probe results fail determinism',async t=>{
-  const cwd=project(t);let n=0;const io=makeIo(cwd,{exec:async(_cmd,{cwd:fixture,writable})=>{
-    if(writable)return {exit:0,stdout:'',stderr:'',timedOut:false};
+  const cwd=project(t);let n=0;const io=makeIo(cwd,{exec:async(_cmd,{cwd:fixture})=>{
     const feature=fs.existsSync(path.join(fixture,'feature'))?fs.readFileSync(path.join(fixture,'feature'),'utf8'):'';
-    return {exit:feature.includes('done')?0:1,stdout:feature.includes('done')?String(++n):'',stderr:'',timedOut:false};
+    return {exit:feature.includes('done')&&++n%2===1?0:1,stdout:'',stderr:'',timedOut:false};
   }});const cs=criteria();cs[0].check={command:'check feature'};cs[0].controls.accept={mutations:[{kind:'write_file',path:'feature',content:'done'}]};core.draftNode(io,args(cs));const p=await core.prepareNode(io,'G1');assert.equal(p.ok,false);assert.ok(p.diagnostics.some(d=>d.code==='NONDETERMINISTIC'));
 });
 
 test('evaluator-quality: evaluator budget is separate and shared clock never resets',async t=>{
   const cwd=project(t),io=makeIo(cwd),cs=criteria();cs[0].controls.reject[0].mutations[0].content='done';core.draftNode(io,{...args(cs),policy:{evaluatorAttempts:2}});
-  const root=core.loadRoot(io,'G1');await core.prepareNode(io,'G1');await core.prepareNode(io,'G1');const b=await core.prepareNode(io,'G1');assert.equal(b.terminal.status,'BLOCKED');assert.equal(core.loadRoot(io,'G1').consumedAttempts,0);assert.equal(core.loadRoot(io,'G1').deadlineAt,root.deadlineAt);
+  const root=core.loadRoot(io,'G1');await core.prepareNode(io,'G1');await core.prepareNode(io,'G1');const b=await core.prepareNode(io,'G1');assert.equal(b.status,'PAUSED');assert.equal(b.pause.code,'EVALUATOR_UNBUILDABLE');assert.equal(core.loadRoot(io,'G1').consumedAttempts,0);assert.equal(core.loadRoot(io,'G1').deadlineAt,root.deadlineAt);
 });
 
 test('evaluator-quality: full-content identity catches middle bytes modes and symlink targets',t=>{
@@ -93,7 +92,7 @@ test('evaluator-quality: full-content identity catches middle bytes modes and sy
 
 test('evaluator-quality: stale candidate environment and bundle evidence invalidate approval',async t=>{
   const cwd=project(t),io=makeIo(cwd);core.draftNode(io,args());assert.equal((await core.prepareNode(io,'G1')).ok,true);
-  fs.mkdirSync(path.join(cwd,'node_modules'));fs.writeFileSync(path.join(cwd,'node_modules','dependency'),'changed');assert.equal(core.approveRoot(io).ok,false);
+  fs.mkdirSync(path.join(cwd,'node_modules'));fs.writeFileSync(path.join(cwd,'node_modules','dependency'),'changed');const approval=core.approveRoot(io);assert.equal(approval.ok,true);assert.match(approval.warnings[0],/node_modules/);assert.equal(fs.existsSync(path.join(cwd,'node_modules')),false);
   assert.equal((await core.prepareNode(io,'G1')).ok,true);const node=core.loadNodeState(io,'G1');node.prepared.baseline.allPass=true;core.saveNodeState(io,node);assert.equal(core.approveRoot(io).ok,false);
 });
 

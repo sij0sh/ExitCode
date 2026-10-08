@@ -109,7 +109,9 @@ test('semantic: cancellation aborts reviewer and bounds ignored cancellation',as
   const already=new AbortController();already.abort();let calls=0;
   await assert.rejects(callReview(()=>{calls++;},{},{signal:already.signal}),/cancelled/);assert.equal(calls,0);
   await assert.rejects(callReview(()=>({large:'x'.repeat(600000)}),{}),/too large/);
-  for(const timeoutMs of [0,Infinity,30001])await assert.rejects(callReview(()=>({}),{},{timeoutMs}),/fixed bound/);
+  for(const timeoutMs of [0,-1,Infinity,NaN])await assert.rejects(callReview(()=>({}),{},{timeoutMs}),/finite and positive/);
+  assert.deepEqual(await callReview(()=>({ok:true}),{},{timeoutMs:30001}),{ok:true});
+  await assert.rejects(callReview(()=>new Promise(()=>{}),{},{timeoutMs:5}),e=>e.code==='REVIEW_TIMEOUT');
 });
 
 test('semantic: repository context is bounded and does not follow secret or symlink paths',t=>{

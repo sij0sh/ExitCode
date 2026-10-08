@@ -8,7 +8,9 @@
  *
  * Supervisor logic lives in exitcode-core.mjs (Pi-agnostic and tested).
  * This file is a thin adapter: mode state, tool visibility, prompt
- * injection, lifecycle guards, and the /exitcode command.
+ * injection, lifecycle guards, and the /exitcode command. The user's tool
+ * loadout is never changed; before sealing, candidate immutability is
+ * verified at supervisor boundaries instead.
  */
 
 import type {
@@ -38,7 +40,8 @@ const CheckSchema = Type.Object({
     runner: Type.Optional(Type.String()), command: Type.Optional(Type.String()),
     args: Type.Optional(Type.Array(Type.String())),
   })),
-  timeoutSeconds: Type.Optional(Type.Number({ description: "Per-check timeout (defaults to policy)" })),
+  assets: Type.Optional(Type.Array(Type.String({minLength:1}), {description:"Acceptance helpers outside conventional test paths; frozen at seal, not product source"})),
+  timeoutSeconds: Type.Optional(Type.Number({ description: "Immutable explicit check watchdog; otherwise use remaining execution time" })),
   expect: Type.Optional(ExpectSchema),
 });
 
@@ -69,8 +72,9 @@ const PolicySchema = Type.Object({
   localRepairs: Type.Optional(Type.Number({ description: "Local repair attempts before ordinary child decomposition is permitted (default 2)" })),
   maxDepth: Type.Optional(Type.Number({ description: "Recursion depth below the root (default 3)" })),
   maxTotalAttempts: Type.Optional(Type.Number({ description: "Implementation attempts across the tree (default 12)" })),
-  deadlineMinutes: Type.Optional(Type.Number({ description: "Shared minutes from original root creation, including review (default 60); revisions never restart the clock" })),
-  evalTimeoutSeconds: Type.Optional(Type.Number({ description: "Default per-check timeout (default 120)" })),
+  deadlineMinutes: Type.Optional(Type.Number({ description: "Shared execution minutes from successful root seal (default 60); preparation and human review do not start it" })),
+  evalTimeoutSeconds: Type.Optional(Type.Number({ description: "Initial executable preparation watchdog (default 900); execution otherwise uses remaining global time" })),
+  evaluatorAttempts: Type.Optional(Type.Number({description:"Substantive construction proposals per node (default 6); infrastructure errors do not spend them"})),
 });
 
 const EXITCODE_NAMESPACE = {
@@ -88,8 +92,8 @@ type Runtime = {
   rootId: string | undefined;
   pendingGoal: string | undefined;
   nudges: number;
-  discoveryToolsAdded: string[];
-  toolsSuspended: string[];
+  progress: string | undefined;
+  operations: Map<AbortController, Promise<void>>;
 };
 
 type ToolDef = {
@@ -111,10 +115,10 @@ function textResult(text: string, details: unknown, isError = false) {
   return { content: [{ type: "text" as const, text }], details, ...(isError ? { isError: true } : {}) };
 }
 
-function errLines(result: { errors?: string[]; policy?: unknown; deadlineAt?: string; next?: string }): string {
+function errLines(result: { errors?: string[]; policy?: unknown; deadlineAt?: string | null; next?: string }): string {
   const lines = (result.errors ?? ["unknown error"]).map((e) => `- ${e}`);
   if (result.policy) {
-    lines.push(`Effective policy: ${JSON.stringify(result.policy)}`, `Shared deadline: ${result.deadlineAt}`);
+    lines.push(`Effective policy: ${JSON.stringify(result.policy)}`, `Shared deadline: ${result.deadlineAt ?? "starts at root seal"}`);
   }
   if (result.next) lines.push(`next: ${result.next}`);
   return lines.join("\n");
@@ -135,11 +139,11 @@ function cascadeLines(cascade: { events?: string[]; terminal?: { root: string; s
   return lines;
 }
 
-// Each operation owns its usage and cancellation. No background model calls or retries.
-function reviewIo(ctx: ExtensionContext, signal?: AbortSignal) {
-  const usage = { input:0,output:0,cacheRead:0,cacheWrite:0,totalTokens:0,
+// Review retries are bounded in the core. Usage includes each completed provider attempt.
+function reviewIo(ctx: ExtensionContext, signal?: AbortSignal, onProgress?: (progress: any) => void, expectedRootId?: string | null) {
+  const usage = { available:false,input:0,output:0,cacheRead:0,cacheWrite:0,totalTokens:0,
     cost:{input:0,output:0,cacheRead:0,cacheWrite:0,total:0} };
-  const io = core.makeIo(ctx.cwd, { signal: signal ?? ctx.signal, reviewUsage:usage,
+  const io = core.makeIo(ctx.cwd, { signal: signal ?? ctx.signal, reviewUsage:usage,onProgress,expectedRootId,
     review: async (input: any, options: {signal:AbortSignal}) => {
       if (!ctx.model || !ctx.modelRegistry?.streamSimple) throw new Error("selected review model unavailable");
       const encoded=JSON.stringify(input);
@@ -149,13 +153,14 @@ function reviewIo(ctx: ExtensionContext, signal?: AbortSignal) {
         messages:[{role:"user",content:encoded,timestamp:Date.now()}],
       }, {reasoning:ctx.thinkingLevel,maxTokens:core.REVIEW_MAX_TOKENS,signal:options.signal}).result();
       // Provider errors can still carry billable usage.
+      if(result.usage)usage.available=true;
       for(const k of ["input","output","cacheRead","cacheWrite","totalTokens"] as const)
         usage[k]+=result.usage?.[k] ?? 0;
       for(const k of ["input","output","cacheRead","cacheWrite","total"] as const)
         usage.cost[k]+=result.usage?.cost?.[k] ?? 0;
-      if(result.stopReason!=="stop")throw new Error(result.errorMessage ?? `review stopped: ${result.stopReason}`);
+      if(result.stopReason!=="stop")throw Object.assign(new Error(result.errorMessage ?? `review stopped: ${result.stopReason}`),result.stopReason==="aborted"?{code:"CANCELLED"}:result.stopReason==="length"?{code:"REVIEW_RESPONSE_INVALID"}:{});
       const text=result.content.filter(b=>b.type==="text").map(b=>b.text).join("");
-      if(text.length>512*1024)throw new Error("review output exceeds bounded response");
+      if(text.length>512*1024)throw Object.assign(new Error("review output exceeds bounded response"),{code:"REVIEW_RESPONSE_INVALID"});
       return JSON.parse(text);
     },
   });
@@ -163,8 +168,7 @@ function reviewIo(ctx: ExtensionContext, signal?: AbortSignal) {
 }
 
 export default function (pi: ExtensionAPI) {
-  const rt: Runtime = { pi, modeOn: false, rootId: undefined, pendingGoal: undefined, nudges: 0, discoveryToolsAdded: [], toolsSuspended: [] };
-  const DISCOVERY_TOOL_NAMES = core.DISCOVERY_TOOL_NAMES;
+  const rt: Runtime = { pi, modeOn: false, rootId: undefined, pendingGoal: undefined, nudges: 0, progress:undefined, operations:new Map() };
   const TOOL_NAMES = core.EXITCODE_TOOL_NAMES;
 
   const assertMode = () => {
@@ -184,54 +188,17 @@ export default function (pi: ExtensionAPI) {
   };
 
   const persistMode = () => {
-    pi.appendEntry(core.MODE_ENTRY_TYPE, {
-      on: rt.modeOn, rootId: rt.rootId, pendingGoal: rt.pendingGoal,
-      discoveryToolsAdded: rt.discoveryToolsAdded, toolsSuspended: rt.toolsSuspended,
-    });
+    pi.appendEntry(core.MODE_ENTRY_TYPE, { on: rt.modeOn, rootId: rt.rootId, pendingGoal: rt.pendingGoal });
   };
 
-  const restoreDiscoveryTools = () => {
-    if (rt.discoveryToolsAdded.length === 0) return;
-    pi.setActiveTools(pi.getActiveTools().filter((name) => !rt.discoveryToolsAdded.includes(name)));
-    rt.discoveryToolsAdded = [];
-  };
-
-  const restoreExecutionTools = () => {
-    if (rt.toolsSuspended.length === 0) return;
-    pi.setActiveTools([...new Set([...pi.getActiveTools(), ...rt.toolsSuspended])]);
-    rt.toolsSuspended = [];
-  };
-
-  const syncDiscoveryTools = (ctx: ExtensionContext) => {
-    if (!rt.modeOn) return;
-    const snap = core.statusSnapshot(core.makeIo(ctx.cwd));
-    const leafId = snap.stack?.at(-1);
-    const leafStatus = leafId ? (snap.nodes as any)?.[leafId]?.status : undefined;
-    // Only a sealed ACTIVE leaf unlocks execution, including after child drafts.
-    if (snap.status === "ACTIVE" && leafStatus === "ACTIVE") {
-      if (rt.discoveryToolsAdded.length === 0 && rt.toolsSuspended.length === 0) return;
-      restoreDiscoveryTools();
-      restoreExecutionTools();
-      persistMode();
-      return;
-    }
-    const active = pi.getActiveTools();
-    const allowed = [...DISCOVERY_TOOL_NAMES, ...TOOL_NAMES];
-    const suspended = active.filter((name) => !allowed.includes(name));
-    const missing = DISCOVERY_TOOL_NAMES.filter((name) => !active.includes(name));
-    if (missing.length === 0 && suspended.length === 0) return;
-    pi.setActiveTools([...active.filter((name) => allowed.includes(name)), ...missing]);
-    // Pi ignores unavailable/excluded tools. Own only names actually enabled.
-    const enabled = pi.getActiveTools();
-    const added = missing.filter((name) => enabled.includes(name) && !rt.discoveryToolsAdded.includes(name));
-    rt.discoveryToolsAdded = [...rt.discoveryToolsAdded, ...added];
-    rt.toolsSuspended = [...new Set([...rt.toolsSuspended, ...suspended])];
-    if (added.length > 0 || suspended.length > 0) persistMode();
+  // Each unsealed phase keeps its own pre-seal baseline; sealed execution keeps none.
+  const syncBaseline = (ctx: ExtensionContext) => {
+    if (rt.modeOn) core.ensureBaseline(core.makeIo(ctx.cwd,{expectedRootId:rt.rootId}));
   };
 
   const modeStatusText = (io: ReturnType<typeof core.makeIo>) => {
     const snap = core.statusSnapshot(io);
-    if (snap.active) return core.statusText(io);
+    if(snap.active)return `${rt.rootId!==snap.root?"Session does not own this workspace root. Use /exitcode resume to adopt it explicitly.\n":""}${core.statusText(io)}`;
     if (rt.rootId) {
       const root = core.loadRoot(io, rt.rootId);
       return [
@@ -244,26 +211,28 @@ export default function (pi: ExtensionAPI) {
     return [
       "exitcode: DISCOVERY (enforcement on)",
       ...(rt.pendingGoal ? [`Root goal: ${rt.pendingGoal}`] : []),
-      `Inspect with ${DISCOVERY_TOOL_NAMES.join(", ")}. Clarify the goal, then propose its acceptance contract with exitcode_draft.`,
+      "Inspect with any available tools without changing the candidate. Clarify the goal, then propose its acceptance contract with exitcode_draft.",
     ].join("\n");
   };
 
   const enterMode = (ctx: ExtensionContext, pendingGoal?: string) => {
     rt.modeOn = true;
-    rt.nudges = 0;
+    rt.nudges = 0;rt.progress=undefined;
     if (pendingGoal !== undefined) rt.pendingGoal = pendingGoal;
     persistMode();
     applyExposure();
-    syncDiscoveryTools(ctx);
+    // Entry fixes the current tree as the candidate, including edits made while mode was off.
+    if(!rt.operations.size)core.releaseBaseline(ctx.cwd);
+    syncBaseline(ctx);
   };
 
-  const exitMode = () => {
+  const exitMode = (ctx: ExtensionContext) => {
+    for(const operation of rt.operations.keys())operation.abort();
     rt.modeOn = false;
     rt.rootId = undefined;
     rt.pendingGoal = undefined;
-    rt.nudges = 0;
-    restoreDiscoveryTools();
-    restoreExecutionTools();
+    rt.nudges = 0;rt.progress=undefined;
+    if(!rt.operations.size)core.releaseBaseline(ctx.cwd);
     persistMode();
     applyExposure();
   };
@@ -275,7 +244,7 @@ export default function (pi: ExtensionAPI) {
     if (terminal.status === "PASS") {
       const root = core.loadRoot(io, terminal.root);
       if (root?.status !== "PASS" || core.terminalStale(io, terminal.root).stale) return;
-      exitMode();
+      exitMode(ctx);
     }
     if (ctx.hasUI) {
       const summary =
@@ -286,13 +255,29 @@ export default function (pi: ExtensionAPI) {
     }
   };
 
-  const sealContract = async (nodeId: string, ctx: ExtensionContext, userApproval?: string, signal?: AbortSignal) => {
-    const io = reviewIo(ctx,signal);
+  const withOperation = async <T>(ctx: ExtensionContext, signal: AbortSignal | undefined, onUpdate: unknown,
+    work: (io: ReturnType<typeof core.makeIo>) => T | Promise<T>): Promise<T> => {
+    const controller=new AbortController(),parent=signal??ctx.signal;
+    const abort=()=>controller.abort(parent?.reason);
+    if(parent?.aborted)abort();else parent?.addEventListener('abort',abort,{once:true});
+    let complete!: () => void;
+    const done=new Promise<void>(resolve=>{complete=resolve;});
+    rt.operations.set(controller,done);
+    const io=reviewIo(ctx,controller.signal,progress=>{
+      const content=`exitcode: ${progress.phase} / ${progress.stage}${progress.elapsedMs===undefined?'':` (${(progress.elapsedMs/1000).toFixed(1)}s)`}`;
+      if(typeof onUpdate==='function')onUpdate(textResult(content,{progress}));
+      if(ctx.hasUI)ctx.ui.setStatus?.('exitcode',content);
+    },rt.rootId??null);
+    try {return await work(io);}
+    finally {rt.operations.delete(controller);complete();parent?.removeEventListener('abort',abort);if(ctx.hasUI)ctx.ui.setStatus?.('exitcode',undefined);if(!rt.modeOn && !rt.operations.size)core.releaseBaseline(ctx.cwd);}
+  };
+
+  const sealContract = async (nodeId: string, ctx: ExtensionContext, userApproval?: string, signal?: AbortSignal, onUpdate?: unknown) => withOperation(ctx,signal,onUpdate,async io => {
     const result = await core.sealNode(io, nodeId, { userApproval });
     maybeAutoExit(result.cascade ?? result, ctx);
-    syncDiscoveryTools(ctx);
+    syncBaseline(ctx);
     if (!result.ok && !result.events) {
-      const lines = [`seal rejected:`, errLines(result)];
+      const lines = withWarnings([`seal rejected:`, errLines(result)], result.warnings);
       if (typeof result.sealAttemptsLeft === "number") lines.push(`seal proposals left: ${result.sealAttemptsLeft}`);
       return {...textResult(lines.join("\n"), result, true),usage:io.reviewUsage};
     }
@@ -303,8 +288,8 @@ export default function (pi: ExtensionAPI) {
     lines.push(...cascadeLines(result.cascade));
     if (result.next) lines.push(`next: ${result.next}`);
     if (result.terminal) lines.push(`terminal: root ${result.terminal.root} ${result.terminal.status}`);
-    return {...textResult(withWarnings(lines, result.warnings).join("\n"), result),usage:io.reviewUsage};
-  };
+    return {...textResult(withWarnings(lines, result.warnings).join("\n"), result,!result.ok),usage:io.reviewUsage};
+  });
 
   const defs: ToolDef[] = [
     {
@@ -317,7 +302,6 @@ export default function (pi: ExtensionAPI) {
       }),
       execute: async (_id, _params, _signal, _onUpdate, ctx) => {
         assertMode();
-        rt.nudges = 0;
         const io = core.makeIo(ctx.cwd);
         return textResult(modeStatusText(io), { ...core.statusSnapshot(io), modeOn: rt.modeOn, rootId: rt.rootId, pendingGoal: rt.pendingGoal });
       },
@@ -329,7 +313,7 @@ export default function (pi: ExtensionAPI) {
         "Propose or revise a root contract with goal, observable criteria, executable checks, assumptions, exclusions, and verification approach. " +
         "Each behavioral criterion needs setup commands for known-valid and known-invalid fixtures in temporary candidate copies. " +
         "The same check must PASS the valid fixture and FAIL every invalid fixture, not ERROR. Do not change the real candidate while validating the evaluator. " +
-        "Policy corrections are allowed only before first approval or evaluator work; omitted fields retain their effective values. " +
+        "Policy corrections are allowed before first approval; omitted fields retain their effective values. " +
         "Never replace the user's objective with extension housekeeping or a commit reminder. " +
         "Safely prepares and validates before returning review. Repair typed failures internally. Present a validated plan and STOP for user review before sealing or implementation.",
       promptSnippet: "exitcode_draft: propose the root contract (goal + criteria + checks + controls)",
@@ -339,16 +323,16 @@ export default function (pi: ExtensionAPI) {
         criteria: Type.Array(CriterionSchema),
         intentAtoms: Type.Optional(IntentSchema),
         ambiguities: Type.Optional(AmbiguitySchema),
+        specificationPaths: Type.Optional(Type.Array(Type.String({minLength:1}), {description:"Referenced Markdown plans to include in independent review, including explicit hidden paths"})),
+        mutableDependencies: Type.Optional(Type.Boolean({description:"The reviewed task may change product dependencies; devDependencies and evaluator runtimes stay frozen"})),
         policy: Type.Optional(PolicySchema),
         assumptions: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { description: "Resolved product assumptions to show in user review" })),
         exclusions: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { description: "Out-of-scope work to show in user review" })),
         verification: Type.Optional(Type.String({ minLength: 1, description: "Plain-language verification approach; do not dump shell mechanics" })),
         revise: Type.Optional(Type.String({ description: "Existing DRAFT root id to revise (e.g. G1)" })),
       }),
-      execute: async (_id, params, _signal, _onUpdate, ctx) => {
+      execute: async (_id, params, _signal, _onUpdate, ctx) => withOperation(ctx,_signal,_onUpdate,async io => {
         assertMode();
-        rt.nudges = 0;
-        const io = reviewIo(ctx,_signal);
         if (rt.rootId && !core.statusSnapshot(io).active) {
           return textResult("draft rejected:\n- the previous root is terminal or missing; the user must cancel with /exitcode exit before starting a new goal", { ok: false }, true);
         }
@@ -358,6 +342,8 @@ export default function (pi: ExtensionAPI) {
           criteria: params.criteria,
           intentAtoms: params.intentAtoms,
           ambiguities: params.ambiguities,
+          specificationPaths: params.specificationPaths,
+          mutableDependencies: params.mutableDependencies,
           policy: params.policy,
           assumptions: params.assumptions,
           exclusions: params.exclusions,
@@ -368,12 +354,14 @@ export default function (pi: ExtensionAPI) {
         rt.rootId = result.rootId;
         rt.pendingGoal = undefined;
         persistMode();
-        syncDiscoveryTools(ctx);
+        syncBaseline(ctx);
+        io.expectedRootId=result.rootId;
         const prepared = await core.prepareNode(io,result.id);
-        syncDiscoveryTools(ctx);
-        if (!prepared.ok) return {...textResult(`Evaluator preparation needs repair:\n${errLines(prepared)}${prepared.questions?.length ? '\nClarification: '+JSON.stringify(prepared.questions) : ''}`,prepared,true),usage:io.reviewUsage};
-        return {...textResult(prepared.review,prepared),usage:io.reviewUsage};
-      },
+        prepared.warnings=[...(result.warnings??[]),...(prepared.warnings??[])];
+        syncBaseline(ctx);
+        if (!prepared.ok) return {...textResult(withWarnings([`Evaluator preparation needs repair:\n${errLines(prepared)}${prepared.questions?.length ? '\nClarification: '+JSON.stringify(prepared.questions) : ''}`],prepared.warnings).join("\n"),prepared,true),usage:io.reviewUsage};
+        return {...textResult(withWarnings([prepared.review],prepared.warnings).join("\n"),prepared),usage:io.reviewUsage};
+      }),
     },
     {
       name: "exitcode_seal",
@@ -383,7 +371,7 @@ export default function (pi: ExtensionAPI) {
         "For an unapproved root, interpret the user's reply to the current review: acceptance, requested changes, or a question. " +
         "On acceptance (for example 'looks good, go ahead'), supply userApproval quoting the reply. /exitcode approve is an optional shortcut. " +
         "A reply requesting changes is not approval, even with assent. Revise and present the complete contract again. Ask when unclear. Never infer approval. " +
-        "Evaluator failures are repaired before review. A revision after review requires validation and fresh approval. Children need no userApproval. Coding tools unlock after sealing.",
+        "Evaluator failures are repaired before review. A revision after review requires validation and fresh approval. Children need no userApproval. The candidate becomes writable after sealing.",
       promptSnippet: "exitcode_seal: validate the evaluator, seal the contract, record the baseline",
       parameters: Type.Object({
         node: Type.String({ description: "Draft node id (e.g. G1, G1.1)" }),
@@ -391,8 +379,7 @@ export default function (pi: ExtensionAPI) {
       }),
       execute: async (_id, params, _signal, _onUpdate, ctx) => {
         assertMode();
-        rt.nudges = 0;
-        return sealContract(params.node, ctx, params.userApproval,_signal);
+        return sealContract(params.node, ctx, params.userApproval,_signal,_onUpdate);
       },
     },
     {
@@ -406,14 +393,12 @@ export default function (pi: ExtensionAPI) {
       parameters: Type.Object({
         node: Type.Optional(Type.String({ description: "Node id (defaults to the active leaf)" })),
       }),
-      execute: async (_id, params, _signal, _onUpdate, ctx) => {
+      execute: async (_id, params, _signal, _onUpdate, ctx) => withOperation(ctx,_signal,_onUpdate,async io => {
         assertMode();
-        rt.nudges = 0;
-        const io = core.makeIo(ctx.cwd);
         const result = await core.evaluateNode(io, params.node ?? null);
-        if (!result.ok) return textResult(`evaluate rejected:\n${errLines(result)}`, result, true);
+        if (!result.ok) {syncBaseline(ctx);return textResult(`${result.paused?"evaluation paused":"evaluate rejected"}:\n${errLines(result)}`, result, true);}
         maybeAutoExit(result.cascade ?? result, ctx);
-        syncDiscoveryTools(ctx);
+        syncBaseline(ctx);
         const lines = [`${result.node} ${result.status}: ${result.vector}`];
         if (result.stale) lines.push("warning: the tree changed since this terminal result was recorded; the PASS is stale.");
         if (result.regressedRestored) lines.push(`regressed [${result.regressedRestored.join(", ")}]; restored last accepted candidate (attempt consumed).`);
@@ -425,7 +410,7 @@ export default function (pi: ExtensionAPI) {
         if (result.terminal) lines.push(`terminal: root ${result.terminal.root} ${result.terminal.status}`);
         else if (result.next) lines.push(`next: ${result.next}`);
         return textResult(withWarnings(lines, result.warnings).join("\n"), result);
-      },
+      }),
     },
     {
       name: "exitcode_child",
@@ -444,15 +429,14 @@ export default function (pi: ExtensionAPI) {
         criteria: Type.Array(CriterionSchema),
         intentAtoms: Type.Optional(IntentSchema),
         ambiguities: Type.Optional(AmbiguitySchema),
+        specificationPaths: Type.Optional(Type.Array(Type.String({minLength:1}))),
         reason: Type.String({ description: "How this child advances the parent target" }),
         prerequisite: Type.Optional(Type.Boolean({ description: "True to request decomposition before the local repair threshold; requires prerequisiteArtifact" })),
         prerequisiteArtifact: Type.Optional(Type.String({ description: "Observable artifact the prerequisite produces" })),
         revise: Type.Optional(Type.String({ description: "Existing DRAFT child id to revise (e.g. G1.1)" })),
       }),
-      execute: async (_id, params, _signal, _onUpdate, ctx) => {
+      execute: async (_id, params, _signal, _onUpdate, ctx) => withOperation(ctx,_signal,_onUpdate,async io => {
         assertMode();
-        rt.nudges = 0;
-        const io = core.makeIo(ctx.cwd);
         const result = core.draftNode(io, {
           parentId: params.parent,
           target: params.target,
@@ -461,35 +445,34 @@ export default function (pi: ExtensionAPI) {
           criteria: params.criteria,
           intentAtoms: params.intentAtoms,
           ambiguities: params.ambiguities,
+          specificationPaths: params.specificationPaths,
           reason: params.reason,
           prerequisite: params.prerequisite,
           prerequisiteArtifact: params.prerequisiteArtifact,
           revise: params.revise,
         });
         if (!result.ok) return textResult(`child rejected:\n${errLines(result)}`, result, true);
-        syncDiscoveryTools(ctx);
+        syncBaseline(ctx);
         return textResult(
           withWarnings([`child draft ${result.id} accepted (targets ${params.parent}.${params.target}).`, `next: ${result.next}`], result.warnings).join("\n"),
           result,
         );
-      },
+      }),
     },
     {
       name: "exitcode_block",
       label: "Exitcode Block",
       description:
-        "Report a node as BLOCKED with the specific missing requirement or cause. Restores the parent candidate, " +
-        "retains diagnostics, and reruns the parent. Terminal for roots, but enforcement stays on until the user cancels. BLOCKED is not success.",
-      promptSnippet: "exitcode_block: report BLOCKED with the exact missing requirement",
+        "Pause a root for a concrete missing requirement, authority, budget, or infrastructure cause without dropping work or accounting. " +
+        "A declined child path is withdrawn and its parent rerun. Infrastructure ERROR keeps the stack and useful edits. /exitcode resume retries a paused operation. A pause or BLOCKED child is not success.",
+      promptSnippet: "exitcode_block: pause with the exact missing requirement; withdraw only a genuinely failed child path",
       parameters: Type.Object({
         node: Type.Optional(Type.String({ description: "Node id (defaults to the active leaf)" })),
         reason: Type.String({ description: "Specific missing requirement, credential, authorization, or cause" }),
         code: Type.Optional(Type.String({ description: `One of ${core.BLOCK_CODES.join(", ")} (default NO_PATH)` })),
       }),
-      execute: async (_id, params, _signal, _onUpdate, ctx) => {
+      execute: async (_id, params, _signal, _onUpdate, ctx) => withOperation(ctx,_signal,_onUpdate,async io => {
         assertMode();
-        rt.nudges = 0;
-        const io = core.makeIo(ctx.cwd);
         const leaf = params.node ?? null;
         const target = leaf ?? (() => {
           const snap = core.statusSnapshot(io);
@@ -498,13 +481,13 @@ export default function (pi: ExtensionAPI) {
         })();
         if (!target) return textResult("block rejected:\n- no active node", { ok: false }, true);
         const result = await core.blockNode(io, target, { reason: params.reason, code: params.code ?? "NO_PATH" });
-        if (!result.ok) return textResult(`block rejected:\n${errLines(result)}`, result, true);
+        if (!result.ok) {syncBaseline(ctx);return textResult(`${result.paused?"paused":"block rejected"}:\n${errLines(result)}`, result, true);}
         maybeAutoExit(result, ctx);
-        syncDiscoveryTools(ctx);
+        syncBaseline(ctx);
         const lines = [...(result.events ?? [])];
         if (result.terminal) lines.push(`terminal: root ${result.terminal.root} ${result.terminal.status}`, "Enforcement remains on. Only the user can cancel with /exitcode exit.");
         return textResult(lines.join("\n"), result);
-      },
+      }),
     },
   ];
 
@@ -521,39 +504,27 @@ export default function (pi: ExtensionAPI) {
     const mode = core.resolveModeFromBranch(branch);
     rt.modeOn = mode.on;
     rt.rootId = mode.rootId;
-    rt.nudges = 0;
+    rt.nudges = 0;rt.progress=undefined;
     rt.pendingGoal = mode.pendingGoal;
+    // Older versions narrowed the loadout before sealing. Return it once, claiming only borrowed discovery tools.
     const entry = branch.findLast((entry) => entry.type === "custom" && entry.customType === core.MODE_ENTRY_TYPE);
-    const data = (entry as { data?: { discoveryToolsAdded?: unknown; toolsSuspended?: unknown } } | undefined)?.data;
-    const added = data?.discoveryToolsAdded;
-    // Clean up borrowed find from older transcripts without claiming user tools.
-    rt.discoveryToolsAdded = Array.isArray(added) ? added.filter((name) => DISCOVERY_TOOL_NAMES.includes(name) || name === "find") : [];
-    const suspended = data?.toolsSuspended;
-    rt.toolsSuspended = Array.isArray(suspended) ? suspended.filter((name) => typeof name === "string" && ![...DISCOVERY_TOOL_NAMES, ...TOOL_NAMES].includes(name)) : [];
-    const obsolete = rt.discoveryToolsAdded.filter((name) => !DISCOVERY_TOOL_NAMES.includes(name));
-    if (obsolete.length > 0) {
-      pi.setActiveTools(pi.getActiveTools().filter((name) => !obsolete.includes(name)));
-      rt.discoveryToolsAdded = rt.discoveryToolsAdded.filter((name) => !obsolete.includes(name));
+    const legacy = (entry as { data?: { discoveryToolsAdded?: unknown; toolsSuspended?: unknown } } | undefined)?.data ?? {};
+    const borrowed = Array.isArray(legacy.discoveryToolsAdded) ? legacy.discoveryToolsAdded.filter((name) => ["read", "grep", "ls", "find"].includes(name)) : [];
+    const suspended = Array.isArray(legacy.toolsSuspended) ? legacy.toolsSuspended.filter((name) => typeof name === "string") : [];
+    if (borrowed.length > 0 || suspended.length > 0) {
+      pi.setActiveTools([...new Set([...pi.getActiveTools().filter((name) => !borrowed.includes(name)), ...suspended])]);
       persistMode();
     }
-    if (!rt.modeOn) {
-      restoreDiscoveryTools();
-      restoreExecutionTools();
-    }
-    core.resumePreparation(core.makeIo(ctx.cwd));
+    if(rt.modeOn)core.resumePreparation(core.makeIo(ctx.cwd,{expectedRootId:rt.rootId}));
     applyExposure();
-    syncDiscoveryTools(ctx);
+    syncBaseline(ctx);
   });
 
-  // Keep ownership in the branch entry, but restore the retiring loadout so
-  // reload does not mistake borrowed tools for user-selected tools.
-  pi.on("session_shutdown", () => {
-    restoreDiscoveryTools();
-    restoreExecutionTools();
-  });
+  pi.on("input", event => {if(event.source!=="extension"){rt.nudges=0;rt.progress=undefined;}});
 
-  pi.on("input", () => {
-    rt.nudges = 0;
+  pi.on("session_shutdown", async () => {
+    for(const operation of rt.operations.keys())operation.abort();
+    await Promise.all(rt.operations.values());
   });
 
   pi.on("before_agent_start", (event, ctx) => {
@@ -561,7 +532,7 @@ export default function (pi: ExtensionAPI) {
       delete event.systemPromptOptions.sections["exitcode"];
       return;
     }
-    syncDiscoveryTools(ctx);
+    syncBaseline(ctx);
     const io = core.makeIo(ctx.cwd);
     const lines = [core.PROTOCOL_PROMPT, "", modeStatusText(io)];
     event.systemPromptOptions.sections["exitcode"] = lines.join("\n");
@@ -569,18 +540,10 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("tool_call", (event, ctx) => {
     if (!rt.modeOn) return undefined;
-    if (TOOL_NAMES.includes(event.toolName)) {
-      rt.nudges = 0;
-      return undefined;
-    }
-    const io = core.makeIo(ctx.cwd);
-    const snap = core.statusSnapshot(io);
-    const stack = snap.stack ?? [];
-    const leafId = stack.length > 0 ? stack[stack.length - 1] : undefined;
-    const leafStatus = snap.status === "ACTIVE" ? (leafId && (snap.nodes as any)?.[leafId]?.status) || "NO_CONTRACT" : "NO_CONTRACT";
+    if (TOOL_NAMES.includes(event.toolName)) return undefined;
+    // Tools are not classified. Only direct access to supervisor state is denied.
     const verdict = core.guardToolCall({
       modeOn: true,
-      leafStatus,
       cwd: ctx.cwd,
       toolName: event.toolName,
       input: (event as { input?: unknown }).input as Record<string, unknown>,
@@ -590,45 +553,50 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("agent_before_settle", async (_event, ctx) => {
-    if (!rt.modeOn) return undefined;
-    const io = core.makeIo(ctx.cwd);
-    const snap = core.statusSnapshot(io);
-    if (!snap.active) {
-      // Discovery, blockers, and missing state are pauses, not permission to code.
-      const root = rt.rootId ? core.loadRoot(io, rt.rootId) : null;
-      if (root?.status === "PASS") maybeAutoExit({ terminal: { root: root.id, status: root.status, outcome: root.outcome } }, ctx);
+    if(!rt.modeOn)return undefined;
+    const io=core.makeIo(ctx.cwd,{expectedRootId:rt.rootId,signal:ctx.signal});
+    const baseline=core.enforceBaseline(io);
+    if(['OPERATION_BUSY','CANCELLED'].includes(baseline.code))return undefined;
+    const snap=core.statusSnapshot(io);
+    if(snap.active && snap.root!==rt.rootId) {
+      return {entries:[{type:'custom_message' as const,customType:'exitcode-pause',content:'exitcode: session root differs from workspace root. Use /exitcode resume to adopt it explicitly.',display:true}]};
+    }
+    if(!baseline.ok) {
+      if(ctx.hasUI)ctx.ui.notify(`exitcode: ${baseline.message??errLines(baseline)}`,'warning');
+      if(rt.nudges>=core.MAX_SETTLE_NUDGES) {
+        const paused=snap.active?core.pauseNode(io,{reason:'Repeated pre-seal changes made no progress. Inspect the discarded files and resume without modifying the candidate.',code:'NO_PROGRESS',operation:snap.phase==='EXECUTION'?'evaluate':'prepare'}):null;
+        syncBaseline(ctx);
+        return {entries:[{type:'custom_message' as const,customType:'exitcode-pause',content:paused?errLines(paused):'exitcode: repeated pre-seal changes were restored. Discovery is paused; continue inspection without modifying the candidate.',display:true}]};
+      }
+      rt.nudges++;
+      return {entries:[{type:'custom_message' as const,customType:'exitcode-nudge',content:baseline.message??errLines(baseline),display:true}],continue:true};
+    }
+    if(!snap.active) {
+      const root=rt.rootId?core.loadRoot(io,rt.rootId):null;
+      if(root?.status==='PASS')maybeAutoExit({terminal:{root:root.id,status:root.status,outcome:root.outcome}},ctx);
       return undefined;
     }
-    const stack = snap.stack ?? [];
-    const leafId = stack[stack.length - 1];
-    const leafStatus = (snap.nodes as any)?.[leafId]?.status;
-    if (leafStatus !== "ACTIVE" && leafStatus !== "DRAFT") return undefined;
-    if (snap.phase === "CLARIFICATION") return undefined;
-    // The human checkpoint is a review pause, not autonomous work.
-    if (snap.awaitingApproval) return undefined;
-    if (snap.expired) {
-      const result = await core.blockNode(io, leafId, { reason: "shared deadline exceeded", code: "BUDGET_EXHAUSTED" });
-      maybeAutoExit(result, ctx);
-      syncDiscoveryTools(ctx);
-      return {
-        entries: [{ type: "custom_message" as const, customType: "exitcode-nudge", content: (result.events ?? []).join("\n"), display: true }],
-        continue: !result.terminal,
-      };
+    if(snap.status==='PAUSED' || snap.phase==='CLARIFICATION' || snap.awaitingApproval)return undefined;
+    const leafId=snap.stack?.at(-1),leaf=leafId?(snap.nodes as any)?.[leafId]:null;
+    if(!leaf || !['ACTIVE','DRAFT'].includes(leaf.status))return undefined;
+    if(snap.expired) {
+      const paused=core.pauseNode(io,{reason:'shared execution deadline exceeded',code:'BUDGET_EXHAUSTED',operation:leaf.status==='DRAFT'?'prepare':'evaluate'});
+      syncBaseline(ctx);
+      return {entries:[{type:'custom_message' as const,customType:'exitcode-pause',content:errLines(paused),display:true}]};
     }
-    if (rt.nudges >= core.MAX_SETTLE_NUDGES) return undefined;
-    rt.nudges += 1;
-    const leaf = (snap.nodes as any)?.[leafId];
-    return {
-      entries: [
-        {
-          type: "custom_message" as const,
-          customType: "exitcode-nudge",
-          content: `exitcode: ${leafId} remains ${leafStatus} :: ${leaf?.vector ?? "unevaluated"}. next: ${snap.next}`,
-          display: true,
-        },
-      ],
-      continue: true,
-    };
+    let candidate;
+    try{candidate=core.digestTree(ctx.cwd);}catch(e){core.pauseNode(io,{reason:e.message,code:e.code??"IO_ERROR",operation:leaf.status==='DRAFT'?'prepare':'evaluate'});return undefined;}
+    const progress=JSON.stringify({candidate,phase:snap.phase,stack:snap.stack,attempts:snap.consumedAttempts,vector:leaf.vector,
+      intent:snap.intentDigest,evaluator:snap.evaluatorDigest,diagnostics:snap.diagnostics,restored:baseline.restored===true});
+    if(progress!==rt.progress){rt.progress=progress;rt.nudges=0;}
+    if(rt.nudges>=core.MAX_SETTLE_NUDGES) {
+      const paused=core.pauseNode(io,{reason:'No observable progress after repeated continuation requests. Inspect the saved diagnostics, then resume the same root.',code:'NO_PROGRESS',operation:leaf.status==='DRAFT'?'prepare':'evaluate'});
+      syncBaseline(ctx);
+      return {entries:[{type:'custom_message' as const,customType:'exitcode-pause',content:errLines(paused),display:true}]};
+    }
+    rt.nudges++;
+    const content=baseline.ok ? `exitcode: ${leafId} remains ${leaf.status} :: ${leaf.vector}. next: ${snap.next}` : baseline.message??errLines(baseline);
+    return {entries:[{type:'custom_message' as const,customType:'exitcode-nudge',content,display:true}],continue:true};
   });
 
   // --- /exitcode command: the only user entry to the loop -------------------
@@ -639,7 +607,7 @@ export default function (pi: ExtensionAPI) {
       "/exitcode <goal>  enter exitcode mode rooted at your goal (root only; children come from exitcode_child)",
       "/exitcode approve optional shortcut to approve the root draft and start autonomous work",
       "/exitcode status  show the active contract, vectors, and budgets",
-      "/exitcode resume  re-enter mode for the on-disk root, including pending review",
+      "/exitcode resume [Gid] [minutes=N] [attempts=N] [evaluators=N]  retry the same paused operation; optional positive grants require this user command",
       "/exitcode exit    user cancellation only; not successful completion (work on disk is preserved)",
     ].join("\n");
 
@@ -671,20 +639,20 @@ export default function (pi: ExtensionAPI) {
           ctx.ui.notify("Wait for the agent to finish presenting the root contract before approving.", "warning");
           return;
         }
-        const approval = core.approveRoot(io);
+        const approval = core.approveRoot(core.makeIo(ctx.cwd,{expectedRootId:rt.rootId}));
         if (!approval.ok) {
-          ctx.ui.notify(`approval rejected:\n${errLines(approval)}`, "warning");
+          ctx.ui.notify(withWarnings([`approval rejected:\n${errLines(approval)}`], approval.warnings).join("\n"), "warning");
           return;
         }
-        rt.nudges = 0;
+        rt.nudges=0;rt.progress=undefined;
         const sealed = await sealContract(approval.id, ctx);
         const result = sealed.details as any;
         pi.sendMessage({
           customType: "exitcode-approval",
-          content: `User approved root ${approval.id} (digest ${approval.approval.digest}).\n${sealed.content[0].text}`,
+          content: withWarnings([`User approved root ${approval.id} (digest ${approval.approval.digest}).`, sealed.content[0].text], approval.warnings).join("\n"),
           display: true,
           details: result,
-        }, { triggerTurn: rt.modeOn && core.statusSnapshot(io).active });
+        }, { triggerTurn: rt.modeOn && core.statusSnapshot(io).status==="ACTIVE" });
         return;
       }
       if (sub === "exit") {
@@ -696,23 +664,42 @@ export default function (pi: ExtensionAPI) {
           ctx.ui.notify("exitcode mode is already off.", "info");
           return;
         }
-        exitMode();
+        exitMode(ctx);
+        await Promise.all(rt.operations.values());
         ctx.ui.notify("Cancelled exitcode mode without completing the goal. Contracts on disk are preserved; /exitcode resume re-enters an active root.", "info");
         return;
       }
       if (sub === "resume") {
-        if (rt.modeOn) {
-          ctx.ui.notify("Already in exitcode mode.", "info");
-          return;
+        if(!ctx.isIdle()){ctx.ui.notify('Wait for the active operation to finish or cancel before resuming.','warning');return;}
+        const options: {rootId?:string;deadlineMinutes?:number;maxTotalAttempts?:number;evaluatorAttempts?:number}={};
+        for(const arg of text.split(/\s+/).slice(1)) {
+          if(/^G\d+$/.test(arg) && !options.rootId){options.rootId=arg;continue;}
+          const match=arg.match(/^(minutes|attempts|evaluators)=(\d+(?:\.\d+)?)$/);
+          const key=match && ({minutes:'deadlineMinutes',attempts:'maxTotalAttempts',evaluators:'evaluatorAttempts'} as const)[match[1]];
+          if(!key || options[key]!==undefined){ctx.ui.notify('Usage: /exitcode resume [Gid] [minutes=N] [attempts=N] [evaluators=N]','warning');return;}
+          options[key]=Number(match[2]);
         }
-        const snap = core.statusSnapshot(io);
-        if (!snap.active) {
-          ctx.ui.notify("Nothing to resume: no active or pending-review root on disk. Start one with /exitcode <goal>.", "warning");
-          return;
+        if(!options.rootId)options.rootId=core.loadIndex(ctx.cwd).activeRootId??rt.rootId;
+        const resumed=core.resumeRoot(io,options);
+        if(!resumed.ok){ctx.ui.notify(`resume rejected:\n${errLines(resumed)}`,'warning');return;}
+        rt.rootId=resumed.id;
+        if(!rt.modeOn)enterMode(ctx);else {rt.nudges=0;rt.progress=undefined;persistMode();syncBaseline(ctx);}
+        const snap=core.statusSnapshot(io);
+        ctx.ui.notify(`${resumed.warnings?.length?resumed.warnings.join("\n")+"\n":""}Resumed root ${resumed.id}. ${snap.next}${snap.review?`\n\n${snap.review}`:''}`,'info');
+        if(resumed.operation==='prepare' || resumed.operation==='seal' || resumed.operation==='evaluate' || resumed.operation==='block' || resumed.operation==='draft') {
+          await withOperation(ctx,undefined,undefined,async operation=>{
+            let result;
+            if(resumed.operation==='prepare')result=await core.prepareNode(operation,resumed.nodeId);
+            else if(resumed.operation==='seal')result=await core.sealNode(operation,resumed.nodeId);
+            else if(resumed.operation==='evaluate')result=await core.evaluateNode(operation,resumed.nodeId);
+            else if(resumed.operation==='block')result=await core.blockNode(operation,resumed.nodeId,resumed.args);
+            else if(resumed.args)result=core.draftNode(operation,resumed.args);
+            else return;
+            maybeAutoExit(result.cascade??result,ctx);syncBaseline(ctx);
+            pi.sendMessage({customType:'exitcode-resume',content:result.review??withWarnings(result.events??[result.ok?result.next??result.vector??'operation completed':errLines(result)],result.warnings).join('\n'),display:true,details:result},
+              {triggerTurn:rt.modeOn && core.statusSnapshot(operation).status==='ACTIVE' && !core.statusSnapshot(operation).awaitingApproval});
+          });
         }
-        rt.rootId = snap.root;
-        enterMode(ctx);
-        ctx.ui.notify(`Re-entered exitcode mode for root ${snap.root}. ${snap.next}${snap.review ? `\n\n${snap.review}` : ""}`, "info");
         return;
       }
       if (rt.modeOn) {
@@ -721,7 +708,7 @@ export default function (pi: ExtensionAPI) {
       }
       const snap = core.statusSnapshot(io);
       if (snap.active) {
-        ctx.ui.notify(`Root ${snap.root} is still ACTIVE on disk. /exitcode resume to re-enter it.`, "warning");
+        ctx.ui.notify(`Root ${snap.root} is still ${snap.status} on disk. /exitcode resume to re-enter it.`, "warning");
         return;
       }
       enterMode(ctx, text);

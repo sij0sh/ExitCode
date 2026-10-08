@@ -14,8 +14,9 @@
 
 import { createHash, randomUUID } from "node:crypto";
 export { RECIPE_KINDS, MUTATION_KINDS } from "./exitcode-evaluator.mjs";
-import { sandboxCommand, candidateIdentity, evaluatorEnvironment, normalizeEvaluator, runRecipe, diagnostic, fileDigest, inventory } from "./exitcode-evaluator.mjs";
+import { sandboxCommand, candidateIdentity, evaluatorEnvironment, normalizeEvaluator, runRecipe, diagnostic, fileDigest, inventory, fixtureDirectory, captureEvaluatorAssets, verifyEvaluatorAssets, installEvaluatorAssets, restoreEvaluatorAssets, compatibleEnvironment, digest, safePath } from "./exitcode-evaluator.mjs";
 import { prepareGate, emptyMetrics, addMetrics, copyCandidate, releasePreparation } from "./exitcode-preparation.mjs";
+import { ensureRunning, operationSignal, operationError } from "./exitcode-operation.mjs";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -34,6 +35,7 @@ export const NodeState = Object.freeze({
   READY_FOR_APPROVAL: "READY_FOR_APPROVAL",
   CLARIFICATION: "CLARIFICATION",
   ACTIVE: "ACTIVE",
+  PAUSED: "PAUSED",
   PASS: "PASS",
   BLOCKED: "BLOCKED",
 });
@@ -44,14 +46,14 @@ export const DEFAULT_POLICY = Object.freeze({
   maxDepth: 3,
   maxTotalAttempts: 12,
   deadlineMinutes: 60,
-  evalTimeoutSeconds: 120,
+  evalTimeoutSeconds: 900,
   evaluatorAttempts: 6,
 });
 
 /** Evaluator-draft proposals (seal attempts) allowed per node. */
 export const MAX_DRAFT_PROPOSALS = 2;
 
-/** Consecutive settle-nudges before the extension lets the run settle. */
+/** Consecutive no-progress nudges before an explicit resumable pause. */
 export const MAX_SETTLE_NUDGES = 3;
 
 /** Rolling checkpoints kept per node. */
@@ -76,8 +78,10 @@ export const BLOCK_CODES = Object.freeze([
   "NO_PATH",
 ]);
 
-/** Exact agent tool allowlists. Unknown names never inherit supervisor access. */
-export const DISCOVERY_TOOL_NAMES = Object.freeze(["read", "grep", "ls"]);
+/** Discarded pre-seal change sets kept for recovery. */
+export const MAX_DISCARDED_CHANGES = 3;
+
+/** Supervisor tools. Other agent tools are not classified; candidate state is verified instead. */
 export const EXITCODE_TOOL_NAMES = Object.freeze([
   "exitcode_status", "exitcode_draft", "exitcode_seal",
   "exitcode_evaluate", "exitcode_child", "exitcode_block",
@@ -91,11 +95,12 @@ export const PROTOCOL_PROMPT = [
   "Submit recipes, confined fixtures, declared intent outcomes and ambiguity candidates to exitcode_draft. The supervisor safely prepares E0 before returning a validated plan. Repair typed evaluator failures before review; do not ask approval for invalid proposals.",
   "Present the validated plan and wait for explicit user approval. READY_FOR_APPROVAL pauses autonomous continuation.",
   "Repair evaluator proposals before review. Revisions after review require fresh validated-plan approval. Policy and remaining time are in status.",
-  "Policy can change only before the first approval or evaluator work; revisions never reset elapsed time or counters.",
+  "Operational policy can change before approval. Initial discovery, evaluator preparation, E0 and human review spend no execution time. The root execution clock starts once at seal; retries and children never reset it.",
   "Keep the user's original objective above extension housekeeping and commit reminders. Never replace it with a commit-only goal.",
-  `Before sealing, inspect only with ${DISCOVERY_TOOL_NAMES.join(", ")}. Submit contracts through ExitCode tools; all other agent tools are blocked.`,
+  "Before sealing, inspect with any available tools but never change the candidate. Pre-seal changes are discarded and the working tree is restored.",
+  "Supervisor state under .exitcode/ is private. Submit contracts through ExitCode tools only.",
   "The supervisor validates the evaluator before user review. Approval seals that exact validated bundle; stale preparation must be repeated.",
-  "The sealed contract is fixed and cannot be weakened.",
+  "The sealed acceptance program, tests, required cases and expectations are fixed and cannot be weakened. Declare custom acceptance helpers in check.assets and referenced plans in specificationPaths. Declare mutableDependencies only when the approved task must change product dependencies.",
   "PURSUE SUCCESS: Implement the approved goal. Use the sealed criteria to measure whether it has been achieved.",
   "Use evaluator failures as repair feedback and preserve previously passing behavior.",
   "Prefer direct repair. Decompose only when the supervisor permits it and a smaller goal offers a clearer path to a failed parent criterion.",
@@ -104,7 +109,7 @@ export const PROTOCOL_PROMPT = [
   "PROVE SUCCESS: Evaluate after meaningful changes.",
   "Only a fresh supervisor evaluation with all criteria passing completes a goal.",
   "A passing child does not complete its parent; follow the supervisor's returned parent result and next action.",
-  "If no viable autonomous path remains, report the concrete blocker.",
+  "Infrastructure ERROR is inconclusive, not FAIL. Preserve useful edits and retry the same authorized operation or resume its pause. Never retry assertions until green. Report concrete authority, ambiguity, integrity or exhausted-budget blockers.",
   "Only a fresh root PASS exits mode automatically. A blocker or clarification pause keeps enforcement on. Only the user can cancel with /exitcode exit.",
 ].join(" ");
 
@@ -166,12 +171,16 @@ export function storePaths(cwd) {
     nodesDir: path.join(root, "nodes"),
     checkpointsDir: path.join(root, "checkpoints"),
     tmpDir: path.join(root, "tmp"),
+    baselineDir: path.join(root, "baseline"),
+    discardedDir: path.join(root, "discarded"),
+    assetsDir: path.join(root, "assets"),
+    operation: path.join(root, "operation.lock"),
   };
 }
 
 export function ensureStoreDirs(cwd) {
   const p = storePaths(cwd);
-  for (const dir of [p.root, p.rootsDir, p.draftsDir, p.contractsDir, p.nodesDir, p.checkpointsDir, p.tmpDir]) {
+  for (const dir of [p.root, p.rootsDir, p.draftsDir, p.contractsDir, p.nodesDir, p.checkpointsDir, p.tmpDir, p.assetsDir]) {
     fs.mkdirSync(dir, { recursive: true });
   }
   return p;
@@ -194,7 +203,7 @@ export function readJson(file) {
 
 export function writeJsonAtomic(file, value) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  const tmp = `${file}.${process.pid}.tmp`;
+  const tmp = `${file}.${process.pid}.${randomUUID()}.tmp`;
   fs.writeFileSync(tmp, JSON.stringify(value, null, 2) + "\n", "utf8");
   fs.renameSync(tmp, file);
 }
@@ -251,9 +260,10 @@ function validateCheck(check, where, errors) {
   }
   if (!nonEmptyString(check.command) && !isRecord(check.recipe)) errors.push(`${where}: check.command or recipe must be supplied`);
   if (check.command && check.recipe) errors.push(`${where}: choose command or recipe, not both`);
-  if (check.timeoutSeconds !== undefined && !(Number.isFinite(check.timeoutSeconds) && check.timeoutSeconds > 0)) {
+  if (check.timeoutSeconds !== undefined && !(Number.isFinite(check.timeoutSeconds) && check.timeoutSeconds > 0 && Number.isFinite(check.timeoutSeconds*1000))) {
     errors.push(`${where}: check.timeoutSeconds must be a positive number`);
   }
+  if(check.assets !== undefined && (!Array.isArray(check.assets) || !check.assets.every(nonEmptyString)))errors.push(`${where}: check.assets must contain candidate-relative paths`);
   validateExpect(check.expect, `${where}.check`, errors);
 }
 
@@ -304,6 +314,9 @@ export function validateStructure(draft, opts = {}) {
   if (draft.verification !== undefined && !nonEmptyString(draft.verification)) {
     errors.push("verification must be a nonempty description of the verification approach");
   }
+
+  if(draft.specificationPaths !== undefined && (!Array.isArray(draft.specificationPaths) || !draft.specificationPaths.every(nonEmptyString)))errors.push("specificationPaths must be an array of paths");
+  if(draft.mutableDependencies !== undefined && typeof draft.mutableDependencies !== "boolean")errors.push("mutableDependencies must be boolean");
 
   const isChild = draft.parent !== null && draft.parent !== undefined;
   if (!isChild) {
@@ -432,45 +445,33 @@ export const execCommand = sandboxCommand;
 
 export function checkTimeoutMs(criterion, defaultTimeoutMs) {
   const seconds = criterion?.check?.timeoutSeconds;
-  if (typeof seconds === "number" && seconds > 0) return Math.round(seconds * 1000);
+  if(seconds!==undefined){if(!Number.isFinite(seconds)||seconds<=0||!Number.isFinite(seconds*1000))throw operationError("INVALID_SPEC","check timeout must be finite and positive");return seconds*1000;}
   return defaultTimeoutMs;
 }
 
-export async function runCheck(criterion, exec, cwd, defaultTimeoutMs) {
-  const started = Date.now();
-  const timeoutMs = checkTimeoutMs(criterion, defaultTimeoutMs);
-  let run;
+export async function runCheck(criterion, exec, cwd, defaultTimeoutMs, {signal,deadlineAt,nowMs=Date.now,readOnlyPaths=[],capabilities,onExecution}={}) {
+  const started=Date.now();
+  let operation;
   try {
-    run = criterion.check.recipe
-      ? await runRecipe(criterion.check.recipe, {cwd, timeoutMs, exec})
-      : await exec(criterion.check.command, { cwd, timeoutMs });
-  } catch (error) {
-    return {
-      criterionId: criterion.id,
-      status: "ERROR",
-      exit: null,
-      timedOut: false,
-      reasons: [`runner threw: ${error?.message ?? String(error)}`],
-      stdoutTail: "",
-      stderrTail: "",
-      durationMs: Date.now() - started,
-    };
-  }
-  const { pass, reasons } = matchesExpect(
-    { exit: run.exit, stdout: run.stdout ?? "", timedOut: Boolean(run.timedOut), error: run.error },
-    criterion.check.expect,
-  );
-  const status = run.timedOut || run.error ? "ERROR" : pass ? "PASS" : "FAIL";
-  return {
-    criterionId: criterion.id,
-    status,
-    exit: run.exit,
-    timedOut: Boolean(run.timedOut),
-    reasons,
-    stdoutTail: tailText(run.stdout ?? "").text,
-    stderrTail: tailText(run.stderr ?? "").text,
-    durationMs: Date.now() - started,
-  };
+    const requested=checkTimeoutMs(criterion,defaultTimeoutMs);
+    const timeoutMs=Number.isFinite(deadlineAt)?Math.min(requested,Math.max(0,deadlineAt-nowMs())):requested;
+    ensureRunning(signal,deadlineAt,nowMs);
+    operation=operationSignal(signal,{timeoutMs,deadlineAt,nowMs});
+    const options={cwd,timeoutMs,signal:operation.signal,deadlineAt,nowMs,writable:true,readOnlyPaths};
+    // The default sandbox resolves only after process-group exit. Trusted executors
+    // must honor cancellation and settle only after their executable has stopped.
+    const execute=()=>criterion.check.recipe ? runRecipe(criterion.check.recipe,{...options,exec,capabilities,onExecution}) : (onExecution?.(),exec(criterion.check.command,options));
+    const run=await execute();
+    ensureRunning(operation.signal,deadlineAt,nowMs);
+    if(run?.truncated && criterion.check.expect?.stdoutNotContains?.length)throw operationError("OUTPUT_INCOMPLETE","truncated output cannot prove the absence of forbidden content");
+    if(!isRecord(run) || !run.error && !run.timedOut && (!Number.isInteger(run.exit) || run.exit<0 || run.exit>255))throw operationError("RUNNER_ERROR","runner did not report a complete process exit");
+    const {pass,reasons}=matchesExpect({exit:run.exit,stdout:run.stdout??"",timedOut:Boolean(run.timedOut),error:run.error},criterion.check.expect);
+    return {criterionId:criterion.id,status:run.timedOut||run.error?"ERROR":pass?"PASS":"FAIL",exit:run.exit,timedOut:Boolean(run.timedOut),
+      ...(run.errorCode?{errorCode:run.errorCode}:{}),reasons,stdoutTail:tailText(run.stdout??"").text,stderrTail:tailText(run.stderr??"").text,durationMs:Date.now()-started};
+  } catch(error) {
+    return {criterionId:criterion.id,status:"ERROR",exit:null,timedOut:error.code==="CHECK_TIMEOUT",errorCode:error.code??"RUNNER_ERROR",
+      reasons:[`runner error: ${error.message}`],stdoutTail:"",stderrTail:"",durationMs:Date.now()-started};
+  } finally {operation?.dispose();}
 }
 
 export function outcomesById(resultOrBaseline) {
@@ -483,12 +484,12 @@ export function allPass(outcomes) {
   return outcomes.length > 0 && outcomes.every((o) => o.status === "PASS");
 }
 
-/** PASS -> non-PASS transitions between two outcome vectors. */
+/** Only a conclusive PASS -> FAIL establishes a regression. */
 export function detectRegression(prevOutcomes, nextOutcomes) {
   const prev = new Map(prevOutcomes.map((o) => [o.criterionId, o.status]));
   const regressed = [];
   for (const outcome of nextOutcomes) {
-    if (prev.get(outcome.criterionId) === "PASS" && outcome.status !== "PASS") regressed.push(outcome.criterionId);
+    if (prev.get(outcome.criterionId) === "PASS" && outcome.status === "FAIL") regressed.push(outcome.criterionId);
   }
   return regressed;
 }
@@ -501,25 +502,13 @@ export function formatVector(outcomes) {
 // Candidate identity and environment
 // ---------------------------------------------------------------------------
 
-export const SNAPSHOT_IGNORE = Object.freeze([".git", "node_modules", EXITCODE_DIR]);
+export const SNAPSHOT_IGNORE = Object.freeze([".git", EXITCODE_DIR]);
 
-function* walkFiles(dir, base = "") {
-  const entries = fs.readdirSync(dir, { withFileTypes: true });
-  entries.sort((a, b) => a.name.localeCompare(b.name));
-  for (const entry of entries) {
-    const rel = base ? `${base}/${entry.name}` : entry.name;
-    const top = rel.split("/")[0];
-    if (SNAPSHOT_IGNORE.includes(top)) continue;
-    const full = path.join(dir, entry.name);
-    if (entry.isDirectory()) yield* walkFiles(full, rel);
-    else if (entry.isFile()) yield { rel, full };
-  }
-}
-
-function hashFile(full) { return fileDigest(full); }
+/** Legacy attempt accounting excluded installed dependencies. Keep that rule on sealed legacy roots. */
+function legacyCandidateIdentity(cwd){return digest(inventory(cwd).map(({rel,sha,size,mode,link})=>({rel,sha,size,mode,link})));}
 
 /** Full relevant candidate content identity, including modes and symlink targets. */
-export function digestTree(cwd) { return candidateIdentity(cwd); }
+export function digestTree(cwd,options) { return candidateIdentity(cwd,options); }
 
 export function envIdentity(cwd) {
   const env = { platform: os.platform(), node: process.version };
@@ -538,79 +527,273 @@ export function envIdentity(cwd) {
 // Checkpoints (file-tree snapshots; restore on regression)
 // ---------------------------------------------------------------------------
 
-export function snapshotTree(cwd, destDir, { maxBytes = SNAPSHOT_MAX_BYTES, writeManifest = true } = {}) {
+export function snapshotTree(cwd, destDir, { maxBytes = SNAPSHOT_MAX_BYTES, writeManifest = true, signal, deadlineAt, nowMs=Date.now } = {}) {
   try {
-    // Check logical size before copying any content, including on non-reflink filesystems.
-    const entries = [];
-    let totalBytes = 0;
-    for (const { rel, full, link } of inventory(cwd)) {
-      const size = link !== undefined ? 0 : fs.statSync(full).size;
-      totalBytes += size;
-      entries.push({ rel, full, size, link });
+    ensureRunning(signal,deadlineAt,nowMs);
+    const entries = inventory(cwd,{dependencies:true,signal,deadlineAt,nowMs});
+    const totalBytes=entries.reduce((n,f)=>n+(f.size??0),0);
+    if(totalBytes>maxBytes)throw operationError("CAPACITY_UNAVAILABLE",`working tree exceeds snapshot cap (${maxBytes} bytes): ${totalBytes} bytes across ${entries.length} files; fixture setup cannot reduce the pre-copy size`);
+    // Metadata is never stored inside the candidate payload.
+    const payload=writeManifest?path.join(destDir,"tree"):destDir;
+    fs.mkdirSync(payload,{recursive:true});
+    const files=[];
+    for(const entry of entries) {
+      ensureRunning(signal,deadlineAt,nowMs);
+      const dest=path.join(payload,entry.rel);fs.mkdirSync(path.dirname(dest),{recursive:true});
+      if(entry.link!==undefined){fs.symlinkSync(entry.link,dest);files.push({path:entry.rel,link:entry.link,bytes:0});continue;}
+      fs.copyFileSync(entry.full,dest,fs.constants.COPYFILE_FICLONE);fs.chmodSync(dest,entry.mode);
+      if(fs.statSync(dest).size!==entry.size || fileDigest(dest,{signal,deadlineAt,nowMs})!==entry.sha)throw operationError("CANDIDATE_MUTATED",`file changed while snapshotting ${entry.rel}`);
+      files.push({path:entry.rel,bytes:entry.size,sha:entry.sha,mode:entry.mode});
     }
-    if (totalBytes > maxBytes) {
-      fs.rmSync(destDir, { recursive: true, force: true });
-      return { ok: false, reason: `working tree exceeds snapshot cap (${maxBytes} bytes): ${totalBytes} bytes across ${entries.length} files; fixture setup cannot reduce the pre-copy size` };
-    }
-    fs.mkdirSync(destDir, { recursive: true });
-    const files = [];
-    for (const { rel, full, size, link } of entries) {
-      const dest = path.join(destDir, rel);
-      fs.mkdirSync(path.dirname(dest), { recursive: true });
-      if (link !== undefined) {fs.symlinkSync(link,dest);files.push({path:rel,link,bytes:0});continue;}
-      // Reflinks are independent files; Node falls back to a normal copy when unsupported.
-      fs.copyFileSync(full, dest, fs.constants.COPYFILE_FICLONE);
-      fs.chmodSync(dest,fs.statSync(full).mode & 0o777);
-      if (fs.statSync(dest).size !== size) throw new Error(`file size changed while snapshotting ${rel}`);
-      files.push({ path: rel, bytes: size, sha: hashFile(dest, size), mode: fs.statSync(full).mode & 0o777 });
-    }
-    const manifest = { version: 1, at: new Date().toISOString(), totalBytes, files };
-    if (writeManifest) fs.writeFileSync(path.join(destDir, "manifest.json"), JSON.stringify(manifest, null, 2) + "\n");
-    return { ok: true, manifest };
-  } catch (error) {
-    fs.rmSync(destDir, { recursive: true, force: true });
-    return { ok: false, reason: `snapshot failed (${error?.code ?? "IO_ERROR"}): ${error?.message ?? String(error)}` };
+    const manifest={version:2,at:new Date().toISOString(),totalBytes,files,...(writeManifest?{payload:"tree"}:{})};
+    if(writeManifest)writeJsonAtomic(path.join(destDir,"manifest.json"),manifest);
+    return {ok:true,manifest};
+  } catch(error) {
+    fs.rmSync(destDir,{recursive:true,force:true});
+    return {ok:false,errorCode:error.code??"IO_ERROR",reason:`snapshot failed (${error.code??"IO_ERROR"}): ${error.message}`};
   }
 }
 
-/** Restore cwd to a snapshot: rewrite manifest files, delete files added later. */
-export function restoreTree(cwd, snapDir, manifest) {
+/** Validate the entire restoration point before deleting any candidate files. */
+function checkpointPayload(snapDir,manifest,{signal,deadlineAt,nowMs=Date.now}={}) {
+  ensureRunning(signal,deadlineAt,nowMs);
+  if(!manifest || !Array.isArray(manifest.files) || (manifest.payload!==undefined && manifest.payload!=="tree"))throw operationError("CHECKPOINT_INVALID","invalid checkpoint manifest");
+  const source=manifest.payload?path.join(snapDir,manifest.payload):snapDir,seen=new Set();
+  for(const file of manifest.files) {
+    ensureRunning(signal,deadlineAt,nowMs);
+    if(seen.has(file.path))throw operationError("CHECKPOINT_INVALID","duplicate checkpoint path");seen.add(file.path);
+    const full=safePath(source,file.path,{allowFinalSymlink:true,allowConfig:true}),stat=fs.lstatSync(full);
+    if(file.link!==undefined) {
+      if(!stat.isSymbolicLink() || fs.readlinkSync(full)!==file.link)throw operationError("CHECKPOINT_INVALID",`checkpoint symlink changed: ${file.path}`);
+    } else if(!stat.isFile() || stat.size!==file.bytes || fileDigest(full,{signal,deadlineAt,nowMs})!==file.sha || file.mode!==undefined && (stat.mode&0o777)!==file.mode)
+      throw operationError("CHECKPOINT_INVALID",`checkpoint bytes changed: ${file.path}`);
+  }
+  ensureRunning(signal,deadlineAt,nowMs);
+  return source;
+}
+
+/** A manifest file still matches a current inventory entry. */
+function sameEntry(file, entry) {
+  return file.link !== undefined ? entry.link === file.link
+    : entry.link === undefined && entry.sha === file.sha && entry.mode === file.mode;
+}
+
+/** Restore cwd to a snapshot: rewrite changed manifest files, delete files added later. */
+export function restoreTree(cwd, snapDir, manifest,options={}) {
+  const running=()=>ensureRunning(options.signal,options.deadlineAt,options.nowMs);
+  const payload=checkpointPayload(snapDir,manifest,options);
   const wanted = new Map((manifest?.files ?? []).map((f) => [f.path, f]));
   const restored = [];
   const removed = [];
-  for (const { rel, full } of inventory(cwd)) {
-    if (!wanted.has(rel)) {
-      fs.rmSync(full, { force: true });
-      removed.push(rel);
+  const current = new Map();
+  for (const entry of inventory(cwd,{...options,dependencies:true})) {
+    running();
+    if (wanted.has(entry.rel)) {
+      current.set(entry.rel, entry);
+      continue;
+    }
+    fs.rmSync(entry.full, { force: true });
+    removed.push(entry.rel);
+  }
+  // Prune only directories emptied by removals, before restored files may need their paths.
+  for (const rel of removed) {
+    for (let dir = path.dirname(path.join(cwd, rel)); dir !== cwd && dir.startsWith(cwd + path.sep); dir = path.dirname(dir)) {
+      try { fs.rmdirSync(dir); } catch { break; }
     }
   }
   for (const file of wanted.values()) {
+    running();
+    // Unchanged files keep their inode and timestamps.
+    if (current.has(file.path) && sameEntry(file, current.get(file.path))) continue;
     const dest = path.join(cwd, file.path);
     // Never follow an added symlink when restoring trusted checkpoint bytes.
     let parent = path.dirname(dest);
     const parents=[];
     while(parent!==cwd&&parent.startsWith(cwd+path.sep)){parents.unshift(parent);parent=path.dirname(parent);}
     for(const dir of parents){try{if(fs.lstatSync(dir).isSymbolicLink())fs.unlinkSync(dir);}catch(e){if(e.code!=="ENOENT")throw e;}fs.mkdirSync(dir,{recursive:true});}
-    try{if(fs.lstatSync(dest).isSymbolicLink())fs.unlinkSync(dest);}catch(e){if(e.code!=="ENOENT")throw e;}
-    if(file.link!==undefined){fs.rmSync(dest,{force:true,recursive:true});fs.symlinkSync(file.link,dest);restored.push(file.path);continue;}
-    fs.copyFileSync(path.join(snapDir, file.path), dest, fs.constants.COPYFILE_FICLONE);
+    try{const stat=fs.lstatSync(dest);if(stat.isSymbolicLink() || stat.isFile())fs.unlinkSync(dest);else if(stat.isDirectory())fs.rmSync(dest,{recursive:true});}catch(e){if(e.code!=="ENOENT")throw e;}
+    if(file.link!==undefined){fs.symlinkSync(file.link,dest);restored.push(file.path);continue;}
+    fs.copyFileSync(path.join(payload, file.path), dest, fs.constants.COPYFILE_FICLONE);
     if(file.mode!==undefined)fs.chmodSync(dest,file.mode);
     restored.push(file.path);
   }
-  pruneEmptyDirs(cwd);
+  for(const file of wanted.values()) {
+    running();
+    const full=path.join(cwd,file.path);
+    if(file.link!==undefined?fs.readlinkSync(full)!==file.link:fileDigest(full,options)!==file.sha || file.mode!==undefined && (fs.statSync(full).mode&0o777)!==file.mode)throw operationError("RESTORATION_FAILED",`restored identity differs: ${file.path}`);
+  }
+  running();
   return { ok: true, restored, removed };
 }
 
-function pruneEmptyDirs(dir) {
-  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-    if (!entry.isDirectory()) continue;
-    if (SNAPSHOT_IGNORE.includes(entry.name)) continue;
-    const full = path.join(dir, entry.name);
-    pruneEmptyDirs(full);
-    try {
-      if (fs.readdirSync(full).length === 0) fs.rmdirSync(full);
-    } catch {}
+// ---------------------------------------------------------------------------
+// Pre-seal baseline. Agent tools are not classified. Until the current phase
+// seals, any candidate change is detected at supervisor boundaries, saved for
+// recovery, and restored. External side effects are out of scope.
+// ---------------------------------------------------------------------------
+
+function baselinePaths(cwd) {
+  const dir = storePaths(cwd).baselineDir;
+  return { dir, record: path.join(dir, "baseline.json"), manifest: path.join(dir, "manifest.json"), tree: path.join(dir, "tree") };
+}
+
+/**
+ * Key of the current unsealed phase, or null while a sealed ACTIVE leaf
+ * permits candidate changes. Discovery and a terminal pause use the next
+ * root slot, which a new root draft continues; each child draft is its own
+ * phase. Missing or unexpected state never grants execution.
+ */
+export function baselineScope(io) {
+  const index = loadIndex(io.cwd);
+  if (!index.activeRootId) return `G${index.rootCounter + 1}`;
+  const root = loadRoot(io, index.activeRootId);
+  if (![NodeState.ACTIVE,NodeState.PAUSED].includes(root?.status)) return index.activeRootId;
+  const leafId = leafOf(root) ?? root.id;
+  return root.status===NodeState.ACTIVE && loadNodeState(io, leafId)?.status === NodeState.ACTIVE ? null : leafId;
+}
+
+/** Record the candidate that must stay unchanged until the phase seals. */
+export function captureBaseline(io, scope = baselineScope(io)) {
+  return workspaceOperation(io,"baseline",locked => recordBaseline(locked,scope));
+}
+
+function recordBaseline(io,scope) {
+  const p = baselinePaths(io.cwd);
+  fs.rmSync(p.dir, { recursive: true, force: true });
+  // The manifest describes exactly what a restore reproduces.
+  const snap = snapshotTree(io.cwd, p.tree, { writeManifest: false });
+  if (snap.ok) writeJsonAtomic(p.manifest, snap.manifest);
+  // Without a restorable copy, the identity still detects changes. Unreadable trees also fail preparation.
+  let digest = null;
+  try { digest = digestTree(io.cwd); } catch {}
+  const record = { scope, digest, ...(snap.ok ? {} : { unrestorable: snap.reason }) };
+  writeJsonAtomic(p.record, { version: 1, at: new Date().toISOString(), ...record });
+  return record;
+}
+
+export function releaseBaseline(cwd) {
+  fs.rmSync(storePaths(cwd).baselineDir, { recursive: true, force: true });
+}
+
+/** Start the current unsealed phase's baseline once; sealed execution keeps none. */
+export function ensureBaseline(io) {
+  return workspaceOperation(io,"baseline",locked => startBaseline(locked));
+}
+
+function startBaseline(io) {
+  const scope = baselineScope(io);
+  if (scope === null) {
+    releaseBaseline(io.cwd);
+    return null;
   }
+  const record = readJson(baselinePaths(io.cwd).record);
+  return record?.scope === scope ? record : captureBaseline(io, scope);
+}
+
+function candidateChanges(cwd, manifest,options) {
+  const wanted = new Map(manifest.files.map((f) => [f.path, f]));
+  const changes = { modified: [], added: [], removed: [] };
+  for (const entry of inventory(cwd,{...options,dependencies:true})) {
+    const file = wanted.get(entry.rel);
+    wanted.delete(entry.rel);
+    if (!file) changes.added.push(entry);
+    else if (!sameEntry(file, entry)) changes.modified.push(entry);
+  }
+  changes.removed = [...wanted.keys()];
+  return changes;
+}
+
+const unchanged = (changes) => changes.modified.length + changes.added.length + changes.removed.length === 0;
+
+function describeChanges(changes) {
+  const list = (label, rels) => rels.length === 0 ? [] :
+    [`${label} ${rels.slice(0, 8).join(", ")}${rels.length > 8 ? ` and ${rels.length - 8} more` : ""}`];
+  return [...list("modified", changes.modified.map((f) => f.rel)), ...list("added", changes.added.map((f) => f.rel)),
+    ...list("removed", changes.removed)].join("; ") || "unlisted changes";
+}
+
+/** Keep the changed and added files of a discarded change set; only the latest few remain. */
+function saveDiscarded(cwd, changes) {
+  const root = storePaths(cwd).discardedDir;
+  fs.mkdirSync(root, { recursive: true });
+  const sets = fs.readdirSync(root).sort();
+  const dir = path.join(root, `d-${String((parseInt(sets.at(-1)?.slice(2), 10) || 0) + 1).padStart(6, "0")}`);
+  try {
+    for (const entry of [...changes.modified, ...changes.added]) {
+      const dest = path.join(dir, "files", entry.rel);
+      fs.mkdirSync(path.dirname(dest), { recursive: true });
+      if (entry.link !== undefined) fs.symlinkSync(entry.link, dest);
+      else fs.copyFileSync(entry.full, dest, fs.constants.COPYFILE_FICLONE);
+    }
+    writeJsonAtomic(path.join(dir, "changes.json"), { at: new Date().toISOString(),
+      modified: changes.modified.map((f) => f.rel), added: changes.added.map((f) => f.rel), removed: changes.removed });
+  } catch (error) {
+    fs.rmSync(dir, { recursive: true, force: true });
+    throw error;
+  }
+  for (const old of [...sets, path.basename(dir)].slice(0, -MAX_DISCARDED_CHANGES)) {
+    fs.rmSync(path.join(root, old), { recursive: true, force: true });
+  }
+  return path.relative(cwd, dir);
+}
+
+/**
+ * Before sealing, the candidate is immutable regardless of which tools ran.
+ * Restore any change since the phase baseline after saving it for recovery.
+ * Returns { ok: true } when unchanged, otherwise { ok: false, restored, message }.
+ */
+export function enforceBaseline(io) {
+  return workspaceOperation(io,"baseline",locked => restoreBaseline(locked));
+}
+
+function restoreBaseline(io) {
+  const scope = baselineScope(io);
+  if (scope === null) return { ok: true };
+  const index=loadIndex(io.cwd),root=index.activeRootId?loadRoot(io,index.activeRootId):null;
+  const options={signal:io.signal,deadlineAt:root?.deadlineAt,nowMs:io.nowMs};
+  const p = baselinePaths(io.cwd);
+  const record = readJson(p.record);
+  if (record?.scope !== scope) {
+    captureBaseline(io, scope);
+    return { ok: true };
+  }
+  const manifest = record.unrestorable ? null : readJson(p.manifest);
+  if (!manifest) {
+    if (record.digest == null || digestTree(io.cwd) === record.digest) return { ok: true };
+    // Digest-bound preparation evidence for the previous candidate is already stale.
+    captureBaseline(io, scope);
+    return { ok: false, restored: false, message: `Candidate changed before sealing and cannot be restored (${record.unrestorable ?? "baseline snapshot missing"}). The change is kept as the new pre-seal baseline; prepare the evaluator again.` };
+  }
+  const changes = candidateChanges(io.cwd, manifest,options);
+  if (unchanged(changes)) return { ok: true };
+  const summary = describeChanges(changes);
+  let saved;
+  try {
+    saved = saveDiscarded(io.cwd, changes);
+  } catch (error) {
+    return { ok: false, restored: false, message: `Candidate changed before sealing (${summary}), but the changed files could not be saved for recovery (${error.message}), so they were left in place. Revert them, or the user can cancel with /exitcode exit.` };
+  }
+  let failure = null;
+  try {
+    restoreTree(io.cwd, p.tree, manifest,options);
+    const left = candidateChanges(io.cwd, manifest,options);
+    if (!unchanged(left)) failure = `still ${describeChanges(left)}`;
+  } catch (error) {
+    failure = error.message;
+  }
+  if (failure) {
+    return { ok: false, restored: false, discarded: saved, message: `Candidate changed before sealing (${summary}) and restoration failed (${failure}). The changed files are saved in ${saved}. Revert the remaining changes, or the user can cancel with /exitcode exit.` };
+  }
+  return { ok: false, restored: true, discarded: saved, message: `Candidate changes are not permitted before the contract is sealed (${summary}). The working tree was restored to the pre-seal baseline; the discarded files are saved in ${saved} for the user. Continue inspection without modifying the candidate.` };
+}
+
+/** Pre-seal operations run on the baseline candidate and report any discarded change. */
+function onBaseline(io, operation) {
+  const guard = enforceBaseline(io);
+  if (!guard.ok && !guard.restored) return { ok: false, errors: [guard.message] };
+  const report = (result) => guard.ok ? result : { ...result, warnings: [guard.message, ...(result.warnings ?? [])] };
+  const result = operation();
+  return typeof result?.then === "function" ? result.then(report) : report(result);
 }
 
 // ---------------------------------------------------------------------------
@@ -638,8 +821,8 @@ async function runControlProbe(criterion, setup, deps) {
     const copy = snapshotTree(deps.cwd, fixture, { writeManifest: false });
     if (!copy.ok) return { error: copy.reason };
     const prepared = await runCheck(
-      { ...criterion, check: { ...criterion.check, command: setup, expect: { exit: 0 } } },
-      (command, opts) => deps.exec(command,{...opts,writable:true}), fixture, deps.defaultTimeoutMs,
+      { ...criterion, check: { command: setup, timeoutSeconds:criterion.check.timeoutSeconds, expect: { exit: 0 } } },
+      deps.exec, fixture, deps.defaultTimeoutMs,
     );
     if (prepared.status !== "PASS") {
       return { error: `setup ${prepared.status}: ${prepared.reasons.join("; ")}` };
@@ -740,14 +923,14 @@ export function deadlineAtMs(createdAtMs, policy) {
 }
 
 export function isExpired(root, nowMs) {
-  return nowMs >= root.deadlineAt;
+  return Number.isFinite(root.deadlineAt) && nowMs >= root.deadlineAt;
 }
 
 /** Shared-budget check before consuming work (attempt, child, seal). */
 export function budgetsOk(root, nowMs) {
   if (isExpired(root, nowMs)) return { ok: false, reason: "shared deadline exceeded" };
-  if ((root.consumedAttempts ?? 0) >= (root.policy.maxTotalAttempts ?? DEFAULT_POLICY.maxTotalAttempts)) {
-    return { ok: false, reason: `total attempt budget exhausted (${root.policy.maxTotalAttempts})` };
+  if ((root.consumedAttempts ?? 0) >= (root.attemptLimit ?? root.policy.maxTotalAttempts ?? DEFAULT_POLICY.maxTotalAttempts)) {
+    return { ok: false, reason: `total attempt budget exhausted (${root.attemptLimit??root.policy.maxTotalAttempts})` };
   }
   return { ok: true };
 }
@@ -756,7 +939,7 @@ export function budgetsOk(root, nowMs) {
  * Deterministic child gates. Semantic fit ("will this help?") stays with the
  * model; being wrong surfaces as no parent progress.
  */
-export function childGates({ root, parentState, parentResult, target, goal, siblings, nowMs }) {
+export function childGates({ root, parentState, parentResult, target, goal, siblings, nowMs, environmentIdentity }) {
   const errors = [];
   if (!parentState || parentState.status !== NodeState.ACTIVE) {
     errors.push("parent must be sealed and ACTIVE before it can have a child");
@@ -766,7 +949,7 @@ export function childGates({ root, parentState, parentResult, target, goal, sibl
   }
   const budget = budgetsOk(root, nowMs);
   if (!budget.ok) errors.push(budget.reason);
-  const activeSibling = (siblings ?? []).find((s) => s.status === NodeState.ACTIVE || s.status === NodeState.DRAFT);
+  const activeSibling = (siblings ?? []).find((s) => [NodeState.ACTIVE,NodeState.DRAFT,NodeState.PAUSED].includes(s.status));
   if (activeSibling) {
     const hint = activeSibling.status === NodeState.DRAFT ? `; pass revise:"${activeSibling.id}" to revise it` : "";
     errors.push(`only one active child at a time (${activeSibling.id} is ${activeSibling.status}${hint})`);
@@ -776,9 +959,10 @@ export function childGates({ root, parentState, parentResult, target, goal, sibl
     if (!outcome) errors.push(`target ${target} is not a parent criterion`);
     else if (outcome.status === "PASS") errors.push(`target ${target} currently passes; a child must target a failing criterion`);
   }
-  const digest = fingerprintGoal(goal);
+  const goalDigest = fingerprintGoal(goal);
   const repeat = (siblings ?? []).find(
-    (s) => s.status === NodeState.BLOCKED && s.target === target && s.goalDigest === digest && s.candidateDigest === parentState?.lastCandidateDigest,
+    (s) => s.status === NodeState.BLOCKED && s.target === target && s.goalDigest === goalDigest && s.candidateDigest === parentState?.lastCandidateDigest &&
+      (environmentIdentity === undefined || s.environmentIdentity === environmentIdentity),
   );
   if (repeat) errors.push(`identical child already blocked on unchanged evidence (${repeat.id}); try a different path`);
   return { ok: errors.length === 0, errors };
@@ -797,27 +981,23 @@ export function isPathUnder(filePath, dir) {
   return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
 }
 
+/** Built-in tools whose path argument ExitCode can interpret. */
+const PATH_TOOL_NAMES = Object.freeze(["read", "write", "edit", "grep", "find", "ls"]);
+
 /**
- * Decide whether a tool call is permitted.
+ * Decide whether a tool call is permitted. Tools are not classified: before
+ * sealing, candidate immutability is verified by enforceBaseline. In every
+ * phase, direct access to supervisor-owned .exitcode/ state is denied.
  * Returns null to allow, or { block: true, reason } to deny.
  */
-export function guardToolCall({ modeOn, leafStatus, cwd, toolName, input }) {
+export function guardToolCall({ modeOn, cwd, toolName, input }) {
   if (!modeOn) return null;
   if (EXITCODE_TOOL_NAMES.includes(toolName)) return null;
   const storeRoot = path.join(cwd, EXITCODE_DIR);
 
-  if (leafStatus !== NodeState.ACTIVE) {
-    if (DISCOVERY_TOOL_NAMES.includes(toolName)) return null;
-    return {
-      block: true,
-      reason: `exitcode: ${toolName} is blocked until the contract is sealed and ACTIVE (state ${leafStatus ?? "NO_CONTRACT"}). Inspect with ${DISCOVERY_TOOL_NAMES.join(", ")}. Use exitcode_draft or exitcode_child to submit contracts and exitcode_status for the required next action. The supervisor runs isolated evaluator probes during preparation.`,
-    };
-  }
-
-  if (toolName === "write" || toolName === "edit") {
-    const target = resolveWithin(cwd, String(input?.path ?? ""));
-    if (isPathUnder(target, storeRoot)) {
-      return { block: true, reason: "exitcode: supervisor-owned artifacts under .exitcode/ are read-only to coding tools. Use exitcode_* tools to update supervisor state." };
+  if (PATH_TOOL_NAMES.includes(toolName) && typeof input?.path === "string") {
+    if (isPathUnder(resolveWithin(cwd, input.path), storeRoot) || /(^|[\\/])\.exitcode([\\/]|$)/.test(input.path)) {
+      return { block: true, reason: "exitcode: supervisor-owned state under .exitcode/ is private to ExitCode tools. Use exitcode_status to inspect contract state." };
     }
     return null;
   }
@@ -850,6 +1030,151 @@ export function resolveModeFromBranch(branch) {
 // exec defaults to execCommand; nowMs defaults to Date.now.
 // ---------------------------------------------------------------------------
 
+/** One state-changing operation per workspace, including across Pi sessions. */
+function workspaceOperation(io,kind,work) {
+  let fd,token;
+  const file=storePaths(io.cwd).operation;
+  try {
+    ensureStoreDirs(io.cwd);
+    const owner=readJson(file);
+    if(io.operationToken && owner?.token===io.operationToken && owner.pid===process.pid)return work(io);
+    ensureRunning(io.signal);
+    const activeRootId=loadIndex(io.cwd).activeRootId;
+    if(Object.hasOwn(io,"expectedRootId") && activeRootId!==(io.expectedRootId??null) && !(kind==="baseline" && !activeRootId) && !(kind==="recover" && !activeRootId && io.expectedRootId && loadRoot(io,io.expectedRootId)?.closingStack))return {ok:false,code:"ROOT_MISMATCH",errors:["session root differs from active workspace root; resume the current root explicitly"]};
+    try {fd=fs.openSync(file,"wx");}
+    catch(e) {
+      if(e.code!=="EEXIST")throw e;
+      if(!Number.isInteger(owner?.pid))return {ok:false,code:"OPERATION_BUSY",errors:["workspace operation lock has no trustworthy owner; restore supervisor storage before retrying"]};
+      try {process.kill(owner.pid,0);}
+      catch(e) {
+        if(e.code!=="ESRCH" && e.code!=="EPERM")throw e;
+        if(e.code==="ESRCH"){fs.rmSync(file);fd=fs.openSync(file,"wx");}
+      }
+      if(fd===undefined)return {ok:false,code:"OPERATION_BUSY",errors:[`workspace operation ${owner.kind} is already in progress`]};
+    }
+    token=randomUUID();
+    fs.writeFileSync(fd,JSON.stringify({pid:process.pid,token,kind,at:io.nowMs()}));
+    const locked={...io,operationToken:token};
+    const finish=()=>{fs.closeSync(fd);fd=undefined;fs.rmSync(file,{force:true});};
+    const failed=e=>{
+      const index=loadIndex(io.cwd),root=index.activeRootId?loadRoot(io,index.activeRootId):null;
+      const reason=`${kind} failed (${e.code??"IO_ERROR"}): ${e.message}`;
+      return root && root.status!==NodeState.PASS ? pauseRoot(locked,root,{code:e.code??"IO_ERROR",reason,nodeId:leafOf(root),operation:kind}) : {ok:false,errors:[reason]};
+    };
+    try {
+      const result=work(locked);
+      if(result?.then)return result.catch(failed).finally(finish);
+      finish();return result;
+    } catch(e) {try{return failed(e);}finally{if(fd!==undefined)finish();}}
+  } catch(e) {
+    if(fd!==undefined){fs.closeSync(fd);if(token)fs.rmSync(file,{force:true});}
+    return {ok:false,code:e.code??"IO_ERROR",errors:[`${kind} boundary failed (${e.code??"IO_ERROR"}): ${e.message}`]};
+  }
+}
+
+function operationIo(io, root) {
+  const operation=operationSignal(io.signal,{deadlineAt:root.deadlineAt,nowMs:io.nowMs});
+  return {io:{...io,signal:operation.signal,deadlineAt:root.deadlineAt},dispose:operation.dispose};
+}
+
+function ensureBudget(io,root) {ensureRunning(io.signal,root.deadlineAt,io.nowMs);}
+
+/** A pause is not terminal and never drops approval, candidates, counters, or the stack. */
+function pauseRoot(io,root,{code,reason,nodeId=leafOf(root),operation="evaluate",args,details}) {
+  if(root.closingStack)root.stack=[...root.closingStack];
+  root.status=NodeState.PAUSED;
+  root.pause={code,reason,nodeId,operation,phase:loadNodeState(io,nodeId)?.phase??"EXECUTION",at:io.nowMs(),
+    ...(args?{args}:{}),...(details?{details}:{})};
+  root.pauseHistory??=[];root.pauseHistory.push(root.pause);
+  saveRoot(io,root);
+  const leaf=loadNodeState(io,leafOf(root));
+  if(leaf?.status===NodeState.ACTIVE){
+    // A sealed pause freezes its useful work, never an old preparation candidate.
+    try{captureBaseline(io,leaf.id);}catch(e){root.pause.baselineError=`${e.code??"IO_ERROR"}: ${e.message}`;saveRoot(io,root);}
+  }
+  return {ok:false,paused:true,root:root.id,status:NodeState.PAUSED,pause:root.pause,errors:[reason],
+    events:[`${root.id} PAUSED (${code}): ${reason}`],next:"restore the prerequisite, then /exitcode resume"};
+}
+
+export function pauseNode(io,{reason,code="NO_PROGRESS",operation="evaluate"}) {
+  return workspaceOperation(io,"pause",io=>{
+    const index=loadIndex(io.cwd),root=index.activeRootId?loadRoot(io,index.activeRootId):null;
+    return root?pauseRoot(io,root,{reason,code,operation}):{ok:false,errors:["no root to pause"]};
+  });
+}
+
+/** Only the user-facing adapter may grant more execution time or attempts. */
+export function resumeRoot(io,{deadlineMinutes,maxTotalAttempts,evaluatorAttempts,rootId}={}) {
+  return workspaceOperation(io,"resume",io=>{
+    const index=loadIndex(io.cwd),id=rootId??index.activeRootId;
+    const root=id?loadRoot(io,id):null;
+    if(!root)return {ok:false,errors:["no active or paused root to resume"]};
+    if(index.activeRootId && index.activeRootId!==root.id)return {ok:false,errors:["another root is active"]};
+    recoverClosing(io,index,root);
+    if(![NodeState.ACTIVE,NodeState.PAUSED,NodeState.BLOCKED].includes(root.status))return {ok:false,errors:[`root ${root.id} is ${root.status}`]};
+    for(const [key,value] of Object.entries({deadlineMinutes,maxTotalAttempts,evaluatorAttempts}))if(value!==undefined &&
+      (!Number.isFinite(value)||value<=0||key!=="deadlineMinutes"&&!Number.isSafeInteger(value)))return {ok:false,errors:[`${key} grant must be finite and positive`]};
+    const node=loadNodeState(io,root.id),draft=readJson(draftFile(io.cwd,root.id))?.draft;
+    if(!node || !draft)return {ok:false,errors:["root draft or node is missing; restore supervisor evidence before resuming"]};
+    const sealed=fs.readdirSync(storePaths(io.cwd).contractsDir).some(name=>name===`${root.id}.sealed.json` || name.startsWith(root.id+'.') && name.endsWith('.sealed.json'));
+    const migrate=root.clockVersion!==2 && !sealed && (root.consumedAttempts??0)===0 &&
+      (node.attempts??0)===0 && (node.sealAttempts??0)===0 && !node.lastResult && !node.lastCandidateDigest && (node.children?.length??0)===0 &&
+      (root.stack??[]).every(id=>id===root.id) && (node.status===NodeState.DRAFT || root.status===NodeState.BLOCKED && ["EXTERNAL_BLOCKED","EVALUATOR_UNBUILDABLE","BUDGET_EXHAUSTED"].includes(root.outcome?.code));
+    if(root.status===NodeState.BLOCKED && !migrate)return {ok:false,errors:["legacy terminal execution cannot be resumed safely; preserve its contract and evidence"]};
+    if((deadlineMinutes!==undefined || maxTotalAttempts!==undefined) && (!sealed || !Number.isFinite(root.deadlineAt)))
+      return {ok:false,errors:["execution grants require a sealed execution clock"]};
+    const deadline=deadlineMinutes!==undefined?Math.max(root.deadlineAt,io.nowMs())+deadlineMinutes*60000:root.deadlineAt;
+    if(deadlineMinutes!==undefined && !Number.isFinite(new Date(deadline).getTime()))return {ok:false,errors:["execution grant exceeds supported deadline range"]};
+    const attemptLimit=(root.attemptLimit??root.policy.maxTotalAttempts)+(maxTotalAttempts??0);
+    if(!Number.isSafeInteger(attemptLimit))return {ok:false,errors:["attempt grant exceeds supported accounting range"]};
+    if(!migrate && isExpired({deadlineAt:deadline},io.nowMs()))return {ok:false,errors:["execution budget exhausted; /exitcode resume minutes=N records an explicit user grant"]};
+    if(root.pause?.code==="BUDGET_EXHAUSTED" && root.consumedAttempts>=attemptLimit)return {ok:false,errors:["attempt budget exhausted; /exitcode resume attempts=N records an explicit user grant"]};
+    const leaf=loadNodeState(io,leafOf(root)??root.id);
+    if(evaluatorAttempts!==undefined && (!leaf || leaf.status!==NodeState.DRAFT && !migrate))return {ok:false,errors:["evaluator grants require an unsealed leaf"]};
+    const evaluatorLimit=(leaf?.evaluatorAttemptLimit??root.policy.evaluatorAttempts??DEFAULT_POLICY.evaluatorAttempts)+(evaluatorAttempts??0);
+    if(!Number.isSafeInteger(evaluatorLimit))return {ok:false,errors:["evaluator grant exceeds supported accounting range"]};
+    if(root.pause?.code==="EVALUATOR_UNBUILDABLE" && (leaf?.evaluatorMetrics?.e0Attempts??0)>=evaluatorLimit)return {ok:false,errors:["evaluator construction budget exhausted; /exitcode resume evaluators=N records an explicit user grant"]};
+    if(migrate) {
+      root.legacyTiming={deadlineAt:root.deadlineAt,policyLocked:root.policyLocked,approval:root.approval??null,outcome:root.outcome??null,migratedAt:io.nowMs()};
+      delete root.outcome;delete root.approval;delete root.validatedBundleDigest;
+      root.clockVersion=2;root.deadlineAt=null;root.executionStartedAt=null;root.policyLocked=false;root.stack=[root.id];
+      node.status=NodeState.DRAFT;node.phase="EVALUATOR_PREPARATION";delete node.prepared;delete node.preparing;
+      saveNodeState(io,node);root.reviewDigest=rootReviewDigest(root,draft);
+    }
+    if(deadlineMinutes!==undefined || maxTotalAttempts!==undefined || evaluatorAttempts!==undefined) {
+      root.executionGrants??=[];
+      root.executionGrants.push({approvedBy:"user",at:io.nowMs(),deadlineMinutes,maxTotalAttempts,evaluatorAttempts,nodeId:leaf?.id??root.id,
+        previousDeadline:root.deadlineAt,previousAttemptLimit:root.attemptLimit??root.policy.maxTotalAttempts,previousEvaluatorLimit:evaluatorLimit-(evaluatorAttempts??0)});
+      // Duration and count grants are separate from the immutable approved policy.
+      if(deadlineMinutes!==undefined)root.deadlineAt=deadline;
+      if(maxTotalAttempts!==undefined)root.attemptLimit=attemptLimit;
+      saveRoot(io,root);
+      if(evaluatorAttempts!==undefined){const current=loadNodeState(io,leaf?.id??root.id);current.evaluatorAttemptLimit=evaluatorLimit;saveNodeState(io,current);}
+    }
+    const baseline=enforceBaseline(io);
+    if(!baseline.ok && !baseline.restored)return {ok:false,errors:[baseline.message]};
+    const restored=[];
+    for(const id of root.stack) {
+      const state=loadNodeState(io,id);
+      if(state?.status!==NodeState.ACTIVE)continue;
+      const bundle=loadBundle(io,id),verified=verifyBundle(bundle,state);
+      if(!verified.ok)return {ok:false,errors:[verified.reason]};
+      if(bundle.assets){
+        try{verifyEvaluatorAssets(io.cwd,bundle.assetsDirectory,bundle.assets);}
+        catch(e){if(e.code!=='EVALUATOR_DRIFT')throw e;restored.push({nodeId:id,...restoreEvaluatorAssets(io.cwd,bundle.assetsDirectory,bundle.assets)});}
+      }
+    }
+    ensureBudget(io,root);
+    if(restored.length){root.acceptanceRestorations??=[];root.acceptanceRestorations.push({at:io.nowMs(),restored});}
+    const pending=root.pause;
+    delete root.pause;root.status=NodeState.ACTIVE;
+    for(const id of root.stack)clearInterruptedPreparation(io,id);
+    index.activeRootId=root.id;saveRoot(io,root);saveIndex(io.cwd,index);
+    return {ok:true,id:root.id,migrated:migrate,acceptanceRestored:restored,warnings:baseline.ok?[]:[baseline.message],operation:pending?.operation??"continue",nodeId:pending?.nodeId??leafOf(root),args:pending?.args,
+      next:nextAction(root,loadNodeState(io,leafOf(root)),draft,io.nowMs())};
+  });
+}
+
 export function makeIo(cwd, overrides = {}) {
   return { cwd, exec: execCommand, nowMs: () => Date.now(), ...overrides };
 }
@@ -878,10 +1203,13 @@ export function loadBundle(io, nodeId) {
   return readJson(sealedFile(io.cwd, nodeId));
 }
 
-function verifyBundle(bundle) {
+function verifyBundle(bundle,node) {
   if (!bundle) return { ok: false, reason: "missing sealed bundle" };
-  const digest = sha256Hex(stableStringify(bundle.contract));
-  if (digest !== bundle.digest) return { ok: false, reason: "sealed bundle digest mismatch (tampering or disk corruption)" };
+  if(node?.sealedBundleDigest && node.sealedBundleDigest!==sha256Hex(stableStringify(bundle)) || bundle.version===2 && !node?.sealedBundleDigest)return {ok:false,reason:"sealed evaluator differs from its supervisor identity"};
+  const contractDigest = sha256Hex(stableStringify(bundle.contract));
+  if (contractDigest !== bundle.digest) return { ok: false, reason: "sealed bundle digest mismatch (tampering or disk corruption)" };
+  if(bundle.integrityDigest && bundle.integrityDigest!==sha256Hex(stableStringify({contractDigest:bundle.digest,assets:bundle.assets,env:bundle.env,candidateDigest:bundle.candidateDigest})))
+    return {ok:false,reason:"sealed evaluator identity mismatch"};
   return { ok: true };
 }
 
@@ -896,9 +1224,10 @@ function defaultTimeoutMs(root) {
 function takeCheckpoint(io, node, note) {
   const id = `cp-${Date.now().toString(36)}-${randomUUID().slice(0, 4)}`;
   const dir = path.join(storePaths(io.cwd).checkpointsDir, node.id, id);
-  const snap = snapshotTree(io.cwd, dir);
+  const snap = snapshotTree(io.cwd, dir, {signal:io.signal,deadlineAt:io.deadlineAt,nowMs:io.nowMs});
   if (!snap.ok) return { ok: false, warning: `checkpoint skipped: ${snap.reason}` };
-  const checkpoint = { id, dir, note, at: new Date().toISOString(), candidateDigest: digestTree(io.cwd) };
+  const checkpoint = { id, dir, note, at: new Date().toISOString(), candidateDigest: digestTree(path.join(dir,"tree")),manifestDigest:sha256Hex(stableStringify(snap.manifest)) };
+  if(checkpoint.candidateDigest!==digestTree(io.cwd)){fs.rmSync(dir,{recursive:true,force:true});return {ok:false,warning:"candidate changed while checkpointing"};}
   node.checkpoints.push(checkpoint);
   pruneCheckpoints(io, node);
   return { ok: true, checkpoint };
@@ -934,7 +1263,15 @@ function restoreCheckpoint(io, node, predicate) {
   const checkpoint = candidates[candidates.length - 1];
   const manifest = readJson(path.join(checkpoint.dir, "manifest.json"));
   if (!manifest) return { ok: false, reason: `checkpoint ${checkpoint.id} manifest missing` };
-  const restored = restoreTree(io.cwd, checkpoint.dir, manifest);
+  if(checkpoint.manifestDigest && checkpoint.manifestDigest!==sha256Hex(stableStringify(manifest)))throw operationError("CHECKPOINT_INVALID","checkpoint manifest differs from its supervisor identity");
+  const source=checkpointPayload(checkpoint.dir,manifest,io);
+  const identity=digest(manifest.files.map(f=>({rel:f.path,sha:f.sha,size:f.link===undefined?f.bytes:undefined,mode:f.mode,link:f.link})));
+  if(identity!==checkpoint.candidateDigest || manifest.payload && digestTree(source)!==checkpoint.candidateDigest)
+    throw operationError("CHECKPOINT_INVALID","checkpoint cannot reproduce its recorded candidate identity");
+  const restored = restoreTree(io.cwd, checkpoint.dir, manifest,io);
+  if((manifest.version===2?digestTree(io.cwd):legacyCandidateIdentity(io.cwd))!==checkpoint.candidateDigest)throw operationError("RESTORATION_FAILED","restored checkpoint identity differs");
+  // A supervisor restore moves the candidate; any unsealed phase restarts from it.
+  releaseBaseline(io.cwd);
   return { ok: true, checkpoint, ...restored };
 }
 
@@ -947,10 +1284,14 @@ async function refreshStack(io, root, candidateDigest, timeoutMs) {
   for (const id of root.stack) {
     const state = loadNodeState(io, id);
     const bundle = loadBundle(io, id);
-    if (!state || state.status !== NodeState.ACTIVE || !bundle || !verifyBundle(bundle).ok) continue;
-    const result = await freshEvaluate(io, bundle, candidateDigest, timeoutMs);
+    if (!state || state.status !== NodeState.ACTIVE)continue;
+    const verified=verifyBundle(bundle,state);if(!verified.ok)throw operationError("EVALUATOR_DRIFT",verified.reason);
+    ensureBudget(io,root);
+    const result = await freshEvaluate(io, bundle, candidateDigest, root.clockVersion===2?root.deadlineAt-io.nowMs():timeoutMs);
+    requireIdentity(io,root,result);
     state.lastResult = result;
     state.lastCandidateDigest = candidateDigest;
+    state.lastEnvironmentIdentity=result.environmentIdentity;state.lastAccountingDigest=root.clockVersion===2?candidateDigest:legacyCandidateIdentity(io.cwd);delete state.reservedCandidateDigest;delete state.reservedAccountingDigest;
     saveNodeState(io, state);
     fresh[id] = result;
   }
@@ -964,12 +1305,14 @@ async function refreshStack(io, root, candidateDigest, timeoutMs) {
 async function restoreAndRefresh(io, root, restoreNodeId, predicate) {
   const restoreNode = loadNodeState(io, restoreNodeId);
   if (!restoreNode) return { ok: false, reason: `unknown node ${restoreNodeId}` };
+  ensureBudget(io,root);
   const restored = restoreCheckpoint(io, restoreNode, predicate);
   if (!restored.ok) return restored;
   const digest = digestTree(io.cwd);
   const fresh = await refreshStack(io, root, digest, defaultTimeoutMs(root));
   const reloaded = loadNodeState(io, restoreNodeId);
   const snap = takeCheckpoint(io, reloaded, "eval");
+  ensureBudget(io,root);
   saveNodeState(io, reloaded);
   return { ok: true, checkpoint: restored.checkpoint, digest, fresh, warning: snap.ok ? null : snap.warning };
 }
@@ -981,26 +1324,26 @@ function mergePolicy(overrides, base = DEFAULT_POLICY) {
   for (const [key, value] of Object.entries(overrides)) {
     if (!Object.hasOwn(DEFAULT_POLICY, key)) return { ok: false, error: `unknown policy key ${key}` };
     if (!Number.isFinite(value) || !(value > 0)) return { ok: false, error: `policy.${key} must be a positive finite number` };
+    if(key==="evalTimeoutSeconds"&&!Number.isFinite(value*1000))return {ok:false,error:"policy.evalTimeoutSeconds exceeds supported timeout range"};
     if (["evaluatorAttempts", "maxTotalAttempts", "maxDepth", "localRepairs"].includes(key) && !Number.isInteger(value)) return {ok:false,error:`policy.${key} must be an integer`};
     policy[key] = value;
   }
   return { ok: true, policy };
 }
 
-/** Legacy roots without an explicit unlocked marker keep their fixed policy. */
+/** New roots permit operational corrections before approval, not during execution. */
 function policyEditable(root, node) {
   return root.policyLocked === false && root.status === NodeState.ACTIVE &&
     node?.status === NodeState.DRAFT && !node.parentId && !root.approval &&
-    root.consumedAttempts === 0 && node.attempts === 0 && node.sealAttempts === 0 &&
-    !node.lastResult && !node.lastCandidateDigest &&
-    node.checkpoints?.length === 0 && node.children?.length === 0 &&
-    root.stack?.length === 1 && root.stack[0] === node.id;
+    root.executionStartedAt == null && root.consumedAttempts === 0 && (node.attempts??0)===0 && node.sealAttempts === 0 &&
+    !node.lastResult && !node.lastCandidateDigest && (node.children?.length??0)===0 && (node.checkpoints?.length??0)===0;
 }
 
-/** Bind separately stored effective limits and the original clock to review. */
+/** Approval binds duration, not an already-running countdown, for new roots. */
 function rootReviewDigest(root, draft) {
-  return sha256Hex(stableStringify({ draft, policy: root.policy,
-    createdAt: root.createdAt, deadlineAt: root.deadlineAt, validatedBundleDigest: root.validatedBundleDigest }));
+  return sha256Hex(stableStringify({ draft, policy: root.policy, createdAt: root.createdAt,
+    ...(root.clockVersion === 2 ? {clockVersion:2,preSealDeadline:root.executionStartedAt==null?root.deadlineAt:null} : {deadlineAt:root.deadlineAt}),
+    validatedBundleDigest: root.validatedBundleDigest }));
 }
 
 function policyStatus(root, node, nowMs) {
@@ -1008,8 +1351,10 @@ function policyStatus(root, node, nowMs) {
     policy: { ...root.policy },
     policyEditable: policyEditable(root, node),
     createdAt: root.createdAt,
-    deadlineAt: new Date(root.deadlineAt).toISOString(),
-    remainingMs: Math.max(0, root.deadlineAt - nowMs),
+    executionStartedAt: root.executionStartedAt ?? null,
+    deadlineAt: Number.isFinite(root.deadlineAt) ? new Date(root.deadlineAt).toISOString() : null,
+    remainingMs: Number.isFinite(root.deadlineAt) ? Math.max(0, root.deadlineAt - nowMs) : root.policy.deadlineMinutes * 60000,
+    clockStarted: Number.isFinite(root.deadlineAt),
     expired: isExpired(root, nowMs),
   };
 }
@@ -1040,6 +1385,10 @@ function popStack(root, nodeId) {
  * prerequisite?, prerequisiteArtifact? }. Roots: { policy? }.
  */
 export function draftNode(io, args) {
+  return workspaceOperation(io,"draft",locked => onBaseline(locked,() => {const result=createDraft(locked,args);if(result?.paused){const root=loadRoot(locked,result.root);root.pause.args=args;root.pause.operation="draft";saveRoot(locked,root);}return result;}));
+}
+
+function createDraft(io, args) {
   ensureStoreDirs(io.cwd);
   const index = loadIndex(io.cwd);
   const nowMs = io.nowMs();
@@ -1048,23 +1397,26 @@ export function draftNode(io, args) {
   if (!nonEmptyString(goal)) return { ok: false, errors: ["goal must be a nonempty string"] };
   if (!Array.isArray(criteria) || criteria.length === 0) return { ok: false, errors: ["criteria must be a nonempty array"] };
   if (args.revise) return reviseDraft(io, index, args);
-  const withIds = normalizeEvaluator({criteria:assignCriterionIds(criteria)},args.policy?.evalTimeoutSeconds??DEFAULT_POLICY.evalTimeoutSeconds).draft.criteria;
+  const withIds = normalizeEvaluator({criteria:assignCriterionIds(criteria)}).draft.criteria;
 
   if (args.parentId) {
     if (args.policy !== undefined) return { ok: false, errors: ["children inherit the root policy and cannot override it"] };
     const root = index.activeRootId ? loadRoot(io, index.activeRootId) : null;
     if (!root || root.status !== NodeState.ACTIVE) return { ok: false, errors: ["no active root; start one with /exitcode <goal>"] };
+    ensureBudget(io,root);
+    if(leafOf(root)!==args.parentId)return {ok:false,errors:["only the active leaf may create a child"]};
     const parentState = loadNodeState(io, args.parentId);
     const parentBundle = loadBundle(io, args.parentId);
     if (!parentState || !parentBundle) return { ok: false, errors: [`parent ${args.parentId} is unknown`] };
-    const verified = verifyBundle(parentBundle);
+    const verified = verifyBundle(parentBundle,parentState);
     if (!verified.ok) return { ok: false, errors: [verified.reason] };
+    if(args.mutableDependencies!==undefined && args.mutableDependencies!==(parentBundle.contract.mutableDependencies===true))return {ok:false,errors:["children inherit the approved product dependency boundary"]};
     const parentResult = parentState.lastResult ?? resultFromBaseline(parentBundle);
     const siblings = (parentState.children ?? []).map((id) => {
       const s = loadNodeState(io, id);
-      return s ? { id: s.id, status: s.status, target: s.target, goalDigest: s.goalDigest, candidateDigest: s.blockedCandidateDigest } : null;
+      return s ? { id: s.id, status: s.status, target: s.target, goalDigest: s.goalDigest, candidateDigest: s.blockedCandidateDigest, environmentIdentity:s.blockedEnvironmentIdentity } : null;
     }).filter(Boolean);
-    const gates = childGates({ root, parentState, parentResult, target: args.target, goal, siblings, nowMs });
+    const gates = childGates({ root, parentState, parentResult, target: args.target, goal, siblings, nowMs, environmentIdentity:digest(evaluatorEnvironment(io.cwd)) });
     if (!gates.ok) return { ok: false, errors: gates.errors };
     if (!nonEmptyString(args.reason)) return { ok: false, errors: ["reason must explain how the child advances its parent"] };
     const repairs = root.policy.localRepairs ?? DEFAULT_POLICY.localRepairs;
@@ -1088,6 +1440,8 @@ export function draftNode(io, args) {
       criteria: withIds,
     ...(args.intentAtoms !== undefined ? {intentAtoms: args.intentAtoms} : {}),
     ...(args.ambiguities !== undefined ? {ambiguities: args.ambiguities} : {}),
+    ...(args.specificationPaths !== undefined ? {specificationPaths:args.specificationPaths} : {}),
+    mutableDependencies:parentBundle.contract.mutableDependencies===true,
     };
     const validation = validateStructure(draft, {
       parent: parentBundle,
@@ -1097,7 +1451,6 @@ export function draftNode(io, args) {
     });
     if (!validation.ok) return { ok: false, errors: validation.errors };
 
-    writeJsonAtomic(draftFile(io.cwd, id), { draft });
     const node = {
       id,
       rootId: root.id,
@@ -1120,24 +1473,28 @@ export function draftNode(io, args) {
     };
     // Checkpoint the parent candidate before child work begins.
     const snap = takeCheckpoint(io, parentState, `pre-child:${id}`);
-    const warnings = snap.ok ? [] : [snap.warning];
+    if(!snap.ok)return pauseRoot(io,root,{code:"CHECKPOINT_UNAVAILABLE",reason:snap.warning,nodeId:parentState.id,operation:"draft",args});
+    writeJsonAtomic(draftFile(io.cwd,id),{draft});
+    const warnings = [];
     node.preChildCheckpointId = snap.ok ? snap.checkpoint.id : null;
     parentState.children.push(id);
     saveNodeState(io, parentState);
     saveNodeState(io, node);
     root.stack.push(id);
     saveRoot(io, root);
+    // The parent's work so far is the child's immutable pre-seal candidate.
+    ensureBaseline(io);
     return { ok: true, id, rootId: root.id, draft, warnings, next: `seal ${id} with exitcode_seal` };
   }
 
   if (index.activeRootId) {
     const active = loadRoot(io, index.activeRootId);
-    if (active && active.status === NodeState.ACTIVE) {
+    if (active && [NodeState.ACTIVE,NodeState.PAUSED].includes(active.status)) {
       const activeNode = loadNodeState(io, active.id);
       if (activeNode && activeNode.status === NodeState.DRAFT) {
         return { ok: false, errors: [`root ${active.id} already has a draft; pass revise:"${active.id}" to revise it`] };
       }
-      return { ok: false, errors: [`root ${active.id} is still ACTIVE; finish, block, or exit it first`] };
+      return { ok: false, errors: [`root ${active.id} is still ${active.status}; resume it or the user must cancel before starting another goal`] };
     }
   }
   const merged = mergePolicy(args.policy);
@@ -1155,6 +1512,8 @@ export function draftNode(io, args) {
     criteria: withIds,
     ...(args.intentAtoms !== undefined ? {intentAtoms: args.intentAtoms} : {}),
     ...(args.ambiguities !== undefined ? {ambiguities: args.ambiguities} : {}),
+    ...(args.specificationPaths !== undefined ? {specificationPaths:args.specificationPaths} : {}),
+    ...(args.mutableDependencies !== undefined ? {mutableDependencies:args.mutableDependencies} : {}),
     ...(args.assumptions !== undefined ? { assumptions: args.assumptions } : {}),
     ...(args.exclusions !== undefined ? { exclusions: args.exclusions } : {}),
     ...(args.verification !== undefined ? { verification: args.verification } : {}),
@@ -1173,7 +1532,9 @@ export function draftNode(io, args) {
     policy: merged.policy,
     policyLocked: false,
     createdAt,
-    deadlineAt: deadlineAtMs(createdAt, merged.policy),
+    clockVersion: 2,
+    executionStartedAt: null,
+    deadlineAt: null,
     consumedAttempts: 0,
     stack: [id],
     status: NodeState.ACTIVE,
@@ -1198,6 +1559,8 @@ export function draftNode(io, args) {
     checkpoints: [],
     children: [],
   });
+  // Normally captured when discovery began; the root draft continues that phase.
+  ensureBaseline(io);
   const node = loadNodeState(io, id);
   return { ok: true, id, rootId: id, draft, warnings: [], ...policyStatus(root, node, nowMs),
     next: nextAction(root, node, draft, nowMs) };
@@ -1212,7 +1575,7 @@ function reviseDraft(io, index, args) {
   if (!root || node.rootId !== root.id || root.status !== NodeState.ACTIVE) {
     return { ok: false, errors: [`${node.id} does not belong to the active root`] };
   }
-  const withIds = normalizeEvaluator({criteria:assignCriterionIds(args.criteria)},root.policy.evalTimeoutSeconds??DEFAULT_POLICY.evalTimeoutSeconds).draft.criteria;
+  const withIds = normalizeEvaluator({criteria:assignCriterionIds(args.criteria)}).draft.criteria;
   const previous = readJson(draftFile(io.cwd, node.id))?.draft;
   const warnings = [];
   const nowMs = io.nowMs();
@@ -1225,13 +1588,13 @@ function reviseDraft(io, index, args) {
     if (!merged.ok) return { ok: false, errors: [merged.error] };
     if (stableStringify(merged.policy) !== stableStringify(root.policy)) {
       if (!editable) {
-        return { ok: false, errors: ["root policy is locked after first approval or evaluator work; legacy roots also keep fixed policies"],
+        return { ok: false, errors: ["root policy is locked after approval; sealed and legacy roots keep their fixed policies"],
           ...policyStatus(root, node, nowMs),
           next: "keep the effective policy, or the user must cancel with /exitcode exit and start a fresh root with fresh review" };
       }
       effectivePolicy = merged.policy;
-      effectiveDeadline = deadlineAtMs(root.createdAt, effectivePolicy);
-      if (!Number.isFinite(new Date(effectiveDeadline).getTime())) {
+      effectiveDeadline = root.clockVersion === 2 ? null : deadlineAtMs(root.createdAt, effectivePolicy);
+      if (!Number.isFinite(new Date(deadlineAtMs(nowMs,effectivePolicy)).getTime())) {
         return { ok: false, errors: ["policy.deadlineMinutes exceeds the supported deadline range"] };
       }
     }
@@ -1251,6 +1614,7 @@ function reviseDraft(io, index, args) {
     }
     const parentBundle = loadBundle(io, node.parentId);
     const parentState = loadNodeState(io, node.parentId);
+    if(args.mutableDependencies!==undefined && args.mutableDependencies!==(parentBundle?.contract.mutableDependencies===true))return {ok:false,errors:["children inherit the approved product dependency boundary"]};
     const parentResult = parentState?.lastResult ?? (parentBundle ? resultFromBaseline(parentBundle) : null);
     draft = {
       version: 1,
@@ -1263,6 +1627,8 @@ function reviseDraft(io, index, args) {
       criteria: withIds,
     ...(args.intentAtoms !== undefined ? {intentAtoms: args.intentAtoms} : {}),
     ...(args.ambiguities !== undefined ? {ambiguities: args.ambiguities} : {}),
+    ...(args.specificationPaths !== undefined ? {specificationPaths:args.specificationPaths} : {}),
+    mutableDependencies:parentBundle?.contract.mutableDependencies===true,
     };
     validation = validateStructure(draft, {
       parent: parentBundle,
@@ -1270,9 +1636,7 @@ function reviseDraft(io, index, args) {
       parentLastResult: parentResult,
       policy: root.policy,
     });
-    if (nonEmptyString(args.reason)) node.reason = args.reason.trim();
-    node.goalDigest = fingerprintGoal(args.goal);
-    saveNodeState(io, node);
+    if(validation.ok){if(nonEmptyString(args.reason))node.reason=args.reason.trim();node.goalDigest=fingerprintGoal(args.goal);}
   } else {
     draft = {
       version: 1,
@@ -1283,8 +1647,10 @@ function reviseDraft(io, index, args) {
       criteria: withIds,
     ...(args.intentAtoms !== undefined ? {intentAtoms: args.intentAtoms} : {}),
     ...(args.ambiguities !== undefined ? {ambiguities: args.ambiguities} : {}),
+    ...(args.specificationPaths !== undefined ? {specificationPaths:args.specificationPaths} : {}),
+    ...(args.mutableDependencies !== undefined ? {mutableDependencies:args.mutableDependencies} : {}),
     };
-    for (const key of ["assumptions", "exclusions", "verification", "intentAtoms", "ambiguities"]) {
+    for (const key of ["assumptions", "exclusions", "verification", "intentAtoms", "ambiguities", "specificationPaths", "mutableDependencies"]) {
       const value = args[key] !== undefined ? args[key] : previous?.[key];
       if (value !== undefined) draft[key] = value;
     }
@@ -1330,7 +1696,11 @@ function approvalMatches(root, draft) {
 }
 
 /** Record user approval, directly or from a reply interpreted by the agent. */
-export function approveRoot(io, { userReply } = {}) {
+export function approveRoot(io, options = {}) {
+  return workspaceOperation(io,"approve",locked => onBaseline(locked, () => approveDraft(locked, options)));
+}
+
+function approveDraft(io, { userReply } = {}) {
   if (userReply !== undefined && !nonEmptyString(userReply)) {
     return { ok: false, errors: ["user approval reply must be a nonempty string"] };
   }
@@ -1377,67 +1747,120 @@ function intentDigestOf(draft) {
 }
 function evaluatorDigestOf(draft) { return sha256Hex(stableStringify(draft.criteria.map(c=>({id:c.id,check:c.check,controls:c.controls})))); }
 function preparationMatches(io,node) {
-  const draft=readJson(draftFile(io.cwd,node.id))?.draft,p=node.prepared;
-  const root=loadRoot(io,node.rootId);
-  return Boolean(p && draft && (node.parentId ? node.preparedDigest : root.validatedBundleDigest)===sha256Hex(stableStringify(p)) && p.draftDigest===sha256Hex(stableStringify(draft)) && p.candidateDigest===digestTree(io.cwd) && stableStringify(p.environment)===stableStringify(evaluatorEnvironment(io.cwd)));
+  try {
+    const draft=readJson(draftFile(io.cwd,node.id))?.draft,p=node.prepared,root=loadRoot(io,node.rootId);
+    if(!p || !draft || (node.parentId?node.preparedDigest:root.validatedBundleDigest)!==sha256Hex(stableStringify(p)) ||
+      p.draftDigest!==sha256Hex(stableStringify(draft)) || p.candidateDigest!==digestTree(io.cwd) || stableStringify(p.environment)!==stableStringify(evaluatorEnvironment(io.cwd)))return false;
+    if(!p.assets)return false;
+    verifyEvaluatorAssets(io.cwd,p.assetsDirectory,p.assets);return true;
+  } catch{return false;}
 }
 
 /** Safe evaluator preparation is separate from human approval and execution. */
 export async function prepareNode(io, nodeId = null) {
+  return workspaceOperation(io,"prepare",locked => onBaseline(locked, () => prepareDraft(locked, nodeId)));
+}
+
+async function prepareDraft(io, nodeId) {
   const index=loadIndex(io.cwd),root=index.activeRootId?loadRoot(io,index.activeRootId):null;
   const node=root?loadNodeState(io,nodeId??leafOf(root)):null;
-  if(!root||!node||node.rootId!==root.id||node.status!==NodeState.DRAFT)return {ok:false,errors:["no editable DRAFT evaluator"]};
+  if(node && leafOf(root)!==node.id)return {ok:false,errors:["prepare the active leaf before its ancestors"]};
+  if(!root||root.status!==NodeState.ACTIVE||!node||node.rootId!==root.id||node.status!==NodeState.DRAFT)return {ok:false,errors:["no editable DRAFT evaluator; resume any infrastructure pause first"]};
   const stored=readJson(draftFile(io.cwd,node.id));if(!stored?.draft)return {ok:false,errors:["missing draft"]};
-  if(isExpired(root,io.nowMs()))return expiredDraftResult(root,node,stored.draft,io.nowMs());
-  if(node.preparing)return {ok:false,errors:["evaluator preparation already in progress"]};
+  if(isExpired(root,io.nowMs()))return pauseRoot(io,root,{code:"BUDGET_EXHAUSTED",reason:"shared execution deadline exceeded",operation:"prepare",nodeId:node.id});
+  if(node.preparing)return {ok:false,errors:["evaluator preparation already in progress; resume interrupted work first"]};
   node.evaluatorMetrics??=emptyMetrics();
-  if(node.evaluatorMetrics.e0Attempts >= (root.policy.evaluatorAttempts??DEFAULT_POLICY.evaluatorAttempts))return blockNode(io,node.id,{reason:"evaluator preparation budget exhausted",code:"EVALUATOR_UNBUILDABLE"});
-  const normalized=normalizeEvaluator(stored.draft,root.policy.evalTimeoutSeconds??DEFAULT_POLICY.evalTimeoutSeconds);
-  let draft=normalized.draft;
-  const repairs=normalized.repairs;
-  // Legacy shell drafts have no coverage map. Make migration explicit in evidence.
-  if(!draft.intentAtoms && (node.parentId || draft.criteria.every(c=>c.check.command))){
+  if(node.evaluatorMetrics.e0Attempts >= (node.evaluatorAttemptLimit??root.policy.evaluatorAttempts??DEFAULT_POLICY.evaluatorAttempts))return pauseRoot(io,root,{reason:"evaluator preparation budget exhausted; diagnose or revise the proposal before retrying",code:"EVALUATOR_UNBUILDABLE",nodeId:node.id,operation:"prepare"});
+  const {draft,repairs}=normalizeEvaluator(stored.draft);
+  if(!draft.intentAtoms && (node.parentId || draft.criteria.every(c=>c.check.command))) {
     draft.intentAtoms=draft.criteria.map(c=>({id:`legacy-${c.id}`,outcome:c.requirement,criteria:[c.id]}));
-    repairs.push({repair:"Migrated legacy declared coverage; semantic audit remains the agent's responsibility"});
+    repairs.push({repair:"Migrated declared coverage; independent semantic review remains required"});
   }
   writeJsonAtomic(draftFile(io.cwd,node.id),{draft});
-  root.policyLocked=true;if(!node.parentId){delete root.approval;delete root.validatedBundleDigest;root.reviewDigest=rootReviewDigest(root,draft);}saveRoot(io,root);
-  node.phase="EVALUATOR_PREPARATION";node.preparing=true;node.evaluatorMetrics.e0Attempts++;delete node.prepared;saveNodeState(io,node);
-  const draftDigest=sha256Hex(stableStringify(draft)), reviewDigest=root.reviewDigest, environment=evaluatorEnvironment(io.cwd);let result;
-  try{
+  if(!node.parentId){delete root.approval;delete root.validatedBundleDigest;root.reviewDigest=rootReviewDigest(root,draft);}saveRoot(io,root);
+  const draftDigest=sha256Hex(stableStringify(draft)),reviewDigest=root.reviewDigest;
+  node.phase="EVALUATOR_PREPARATION";node.preparing=true;node.evaluatorMetrics.e0Attempts++;node.preparationReservation={at:io.nowMs(),attempt:node.evaluatorMetrics.e0Attempts};delete node.prepared;saveNodeState(io,node);
+  const owned=operationIo(io,root),operation=owned.io;
+  let environment,candidateDigest,assets,result;
+  const directory=path.join(storePaths(io.cwd).assetsDir,`${node.id}.prepared`);
+  try {
+    ensureBudget(operation,root);
+    environment=evaluatorEnvironment(io.cwd);candidateDigest=digestTree(io.cwd);
     const parentBundle=node.parentId?loadBundle(io,node.parentId):null;
     const validation=validateStructure(draft,{policy:root.policy,parent:parentBundle,parentDepth:node.parentId?depthOf(node.parentId):-1,parentLastResult:node.parentId?loadNodeState(io,node.parentId)?.lastResult:null});
-    if(!validation.ok)result={ok:false,errors:validation.errors,diagnostics:validation.errors.map(e=>diagnostic('INVALID_STRUCTURE','lint',null,e,'Correct evaluator structure')),stages:[],metrics:{...emptyMetrics(),e0Attempts:1}};
-    else result=await prepareGate({...draft,...(parentBundle?{parentRequirement:parentBundle.contract.criteria.find(c=>c.id===node.target)?.requirement}: {})},{cwd:io.cwd,exec:io.exec,runCheck,defaultTimeoutMs:defaultTimeoutMs(root),environment,maxBytes:SNAPSHOT_MAX_BYTES,candidateDigest:digestTree(io.cwd),review:io.review,signal:io.signal,reviewTimeoutMs:io.reviewTimeoutMs});
-  }catch(e){result={ok:false,errors:[e.message],diagnostics:[diagnostic('PREPARATION_FAILED','baseline',null,e.message,'Correct evaluator inputs')],stages:[],metrics:{...emptyMetrics(),e0Attempts:1}};}
-  if(result.ok && stableStringify(environment)!==stableStringify(evaluatorEnvironment(io.cwd))){result.ok=false;result.diagnostics.push(diagnostic('ENVIRONMENT_CHANGED','baseline',node.id,'Environment changed during preparation','Reprepare against a stable environment'));result.errors.push('Environment changed during preparation');}
-  if(result.ok && isExpired(root,io.nowMs())){result.ok=false;result.diagnostics.push(diagnostic('DEADLINE_EXCEEDED','baseline',node.id,'Deadline elapsed during preparation','Cancel and start a new run'));result.errors.push('shared deadline exceeded');}
-  const current=loadNodeState(io,node.id),currentRoot=loadRoot(io,root.id),currentDraft=readJson(draftFile(io.cwd,node.id))?.draft;
-  if(currentRoot.status!==NodeState.ACTIVE||currentRoot.reviewDigest!==reviewDigest||(!node.parentId && rootReviewDigest(currentRoot,currentDraft)!==reviewDigest)||current.status!==NodeState.DRAFT||sha256Hex(stableStringify(currentDraft))!==draftDigest){
-    delete current.preparing;saveNodeState(io,current);
-    return {ok:false,errors:["contract changed during preparation"],diagnostics:[diagnostic('CONTRACT_CHANGED','baseline',node.id,'Concurrent revision','Reprepare current draft')]};
+    if(!validation.ok)result={ok:false,errors:validation.errors,diagnostics:validation.errors.map(e=>diagnostic("INVALID_STRUCTURE","lint",null,e,"Correct evaluator structure")),stages:[],metrics:emptyMetrics()};
+    else {
+      fs.rmSync(directory,{recursive:true,force:true});
+      assets=captureEvaluatorAssets(io.cwd,draft,directory);
+      result=await prepareGate({...draft,...(parentBundle?{parentRequirement:parentBundle.contract.criteria.find(c=>c.id===node.target)?.requirement}:{})},
+        {cwd:io.cwd,exec:io.exec,runCheck:(c,exec,cwd,timeout,opts)=>runCheck(c,exec,cwd,timeout,{...opts,deadlineAt:root.deadlineAt,nowMs:io.nowMs}),
+          defaultTimeoutMs:defaultTimeoutMs(root),environment,maxBytes:SNAPSHOT_MAX_BYTES,candidateDigest,review:io.review,signal:operation.signal,
+          reviewTimeoutMs:io.reviewTimeoutMs,assets,assetsDirectory:directory,onProgress:io.onProgress,deadlineAt:root.deadlineAt,nowMs:io.nowMs});
+      ensureBudget(operation,root);
+      if(stableStringify(environment)!==stableStringify(evaluatorEnvironment(io.cwd)))throw operationError("ENVIRONMENT_CHANGED","Environment changed during preparation");
+      verifyEvaluatorAssets(io.cwd,directory,assets);
+      if(digestTree(io.cwd)!==candidateDigest)throw operationError("CANDIDATE_MUTATED","Candidate changed during preparation");
+    }
+  } catch(e) {
+    result??={ok:false,errors:[],diagnostics:[],stages:[],metrics:emptyMetrics()};result.ok=false;
+    result.errors.push(e.message);result.diagnostics.push(diagnostic(e.code??"PREPARATION_FAILED","preparation",null,e.message,"Restore the authorized environment and resume","supervisor"));
+  } finally {
+    owned.dispose();
+    const current=loadNodeState(io,node.id);if(current){delete current.preparing;saveNodeState(io,current);}
   }
-  if(io.reviewUsage)result.metrics.tokenUsage={available:true,...io.reviewUsage};
-  delete current.preparing;addMetrics(current.evaluatorMetrics,{...result.metrics,e0Attempts:0});current.diagnostics=result.diagnostics;current.repairs=repairs;
-  if(result.ok && !isExpired(currentRoot,io.nowMs())){
+  const after=enforceBaseline(io);
+  if(!after.ok){result.ok=false;result.warnings=[after.message];if(!result.diagnostics.some(d=>d.code==="CANDIDATE_MUTATED")){result.diagnostics.push(diagnostic("CANDIDATE_MUTATED","baseline",null,"Candidate changed during preparation","Reprepare stable candidate"));result.errors.push("Candidate changed during preparation");}}
+  const current=loadNodeState(io,node.id),currentRoot=loadRoot(io,root.id),currentDraft=readJson(draftFile(io.cwd,node.id))?.draft;
+  if(currentRoot.status!==NodeState.ACTIVE||currentRoot.reviewDigest!==reviewDigest||(!node.parentId && rootReviewDigest(currentRoot,currentDraft)!==reviewDigest)||current.status!==NodeState.DRAFT||sha256Hex(stableStringify(currentDraft))!==draftDigest) {
+    fs.rmSync(directory,{recursive:true,force:true});
+    return {ok:false,errors:["contract changed during preparation"],diagnostics:[diagnostic("CONTRACT_CHANGED","baseline",node.id,"Concurrent revision","Reprepare current draft")]};
+  }
+  try{ensureBudget(io,currentRoot);}catch(e){result.ok=false;result.errors.push(e.message);result.diagnostics.push(diagnostic(e.code,"preparation",node.id,e.message,"Resume with remaining authorized budget","supervisor"));}
+  // Transport, storage, cancellation, or runner faults do not spend quality proposals.
+  const infrastructure=result.diagnostics.some(d=>d.repairability==="supervisor" || ["CANDIDATE_MUTATED","ENVIRONMENT_CHANGED"].includes(d.code));
+  result.metrics.e0Attempts=infrastructure?0:1;
+  if(infrastructure && current.preparationReservation)current.evaluatorMetrics.e0Attempts--;
+  delete current.preparationReservation;
+  addMetrics(current.evaluatorMetrics,{...result.metrics,e0Attempts:0,...(io.reviewUsage?.available?{tokenUsage:io.reviewUsage}:{})});
+  current.diagnostics=result.diagnostics;current.repairs=repairs;
+  if(result.ok) {
     current.phase="READY_FOR_APPROVAL";
-    current.prepared={draftDigest,candidateDigest:digestTree(io.cwd),environment:evaluatorEnvironment(io.cwd),intentDigest:intentDigestOf(draft),evaluatorDigest:evaluatorDigestOf(draft),stages:result.stages,baseline:result.baseline,capabilities:result.capabilities};
-    if(!node.parentId){currentRoot.validatedBundleDigest=sha256Hex(stableStringify(current.prepared));currentRoot.reviewDigest=rootReviewDigest(currentRoot,draft);saveRoot(io,currentRoot);}
+    current.prepared={draftDigest,candidateDigest,environment,assets,assetsDirectory:directory,intentDigest:intentDigestOf(draft),evaluatorDigest:evaluatorDigestOf(draft),stages:result.stages,baseline:result.baseline,capabilities:result.capabilities};
     current.preparedDigest=sha256Hex(stableStringify(current.prepared));
-    if(!node.parentId){current.evaluatorMetrics.reviewTurns++;result.review=rootReviewText(draft,currentRoot,io.nowMs());}
-  }else current.phase=result.questions?.length?"CLARIFICATION":"EVALUATOR_PREPARATION";
+    if(!node.parentId){currentRoot.validatedBundleDigest=current.preparedDigest;currentRoot.reviewDigest=rootReviewDigest(currentRoot,draft);saveRoot(io,currentRoot);current.evaluatorMetrics.reviewTurns++;result.review=rootReviewText(draft,currentRoot,io.nowMs());}
+  } else {current.phase=result.questions?.length?"CLARIFICATION":"EVALUATOR_PREPARATION";fs.rmSync(directory,{recursive:true,force:true});}
   saveNodeState(io,current);
+  if(infrastructure) {
+    const d=result.diagnostics.find(d=>d.repairability==="supervisor")??result.diagnostics[0];
+    return {...result,...pauseRoot(io,currentRoot,{code:d.code,reason:result.errors.join("; "),nodeId:node.id,operation:"prepare"}),diagnostics:result.diagnostics,metrics:result.metrics};
+  }
   return {...result,id:node.id,phase:current.phase,repairs,next:nextAction(currentRoot,current,draft,io.nowMs())};
 }
 
 // --- seal ----------------------------------------------------------------
 
-export async function sealNode(io, nodeId, { userApproval } = {}) {
+export async function sealNode(io, nodeId, options = {}) {
+  return workspaceOperation(io,"seal",locked => onBaseline(locked, () => sealDraft(locked, nodeId, options)));
+}
+
+async function sealDraft(io,nodeId,options) {
+  const index=loadIndex(io.cwd),root=index.activeRootId?loadRoot(io,index.activeRootId):null;
+  if(!root)return {ok:false,errors:["no active root"]};
+  const owned=operationIo(io,root);
+  try {return await sealPrepared(owned.io,nodeId,options);}
+  finally {owned.dispose();}
+}
+
+async function sealPrepared(io, nodeId, { userApproval } = {}) {
   ensureStoreDirs(io.cwd);
   const index = loadIndex(io.cwd);
   const root = index.activeRootId ? loadRoot(io, index.activeRootId) : null;
   const node = loadNodeState(io, nodeId);
+  ensureBudget(io,root);
   if (!root || !node || node.rootId !== root.id) return { ok: false, errors: [`unknown node ${nodeId}`] };
+  if(leafOf(root)!==nodeId)return {ok:false,errors:["only the active leaf may be sealed"]};
+  if(root.status!==NodeState.ACTIVE)return {ok:false,errors:[`root ${root.id} is ${root.status}; resume its pause first`]};
+  if(node.status===NodeState.ACTIVE && verifyBundle(loadBundle(io,nodeId),node).ok){releasePreparation(io.cwd);releaseBaseline(io.cwd);return {ok:true,sealed:nodeId,alreadySealed:true,baseline:formatVector(node.lastResult?.outcomes??[]),next:nextAction(root,node,null,io.nowMs())};}
   if (node.status !== NodeState.DRAFT) return { ok: false, errors: [`${nodeId} is ${node.status}; only DRAFT nodes can be sealed`] };
   if (root.status !== NodeState.ACTIVE) return { ok: false, errors: [`root ${root.id} is ${root.status}`] };
 
@@ -1446,7 +1869,7 @@ export async function sealNode(io, nodeId, { userApproval } = {}) {
   const draft = JSON.parse(stableStringify(stored.draft)); // immutable gate copy
   if (userApproval !== undefined) {
     if (node.parentId) return { ok: false, errors: ["children do not require user approval"] };
-    const approval = approveRoot(io, { userReply: userApproval });
+    const approval = approveDraft(io, { userReply: userApproval });
     if (!approval.ok) return approval;
     root.approval = approval.approval;
     root.policyLocked = true;
@@ -1460,46 +1883,96 @@ export async function sealNode(io, nodeId, { userApproval } = {}) {
     };
   }
 
-  if (isExpired(root,io.nowMs())) return blockNode(io,nodeId,{reason:"shared deadline exceeded during drafting",code:"BUDGET_EXHAUSTED"});
-  if (node.parentId && !preparationMatches(io,node)) {
-    const prepared=await prepareNode(io,nodeId);
-    if(!prepared.ok)return prepared;
+  if(isExpired(root,io.nowMs()))return pauseRoot(io,root,{code:"BUDGET_EXHAUSTED",reason:"shared execution deadline exceeded",nodeId,operation:"seal"});
+  if(node.parentId && !preparationMatches(io,node)) {
+    const prepared=await prepareDraft(io,nodeId);if(!prepared.ok)return prepared;
     Object.assign(node,loadNodeState(io,nodeId));
   }
   if(!preparationMatches(io,node))return {ok:false,errors:["validated bundle is stale; prepare again before approval"]};
-  const prepared=node.prepared;
-  const validatedDraft=readJson(draftFile(io.cwd,nodeId)).draft;
-  const bundle={version:1,contract:validatedDraft,digest:sha256Hex(stableStringify(validatedDraft)),env:prepared.environment,candidateDigest:prepared.candidateDigest,sealedAt:new Date().toISOString(),baseline:prepared.baseline,intentDigest:prepared.intentDigest,evaluatorDigest:prepared.evaluatorDigest,validation:prepared.stages};
+  const prepared=node.prepared,validatedDraft=readJson(draftFile(io.cwd,nodeId)).draft;
+  ensureBudget(io,root);
+  const directory=path.join(storePaths(io.cwd).assetsDir,`${nodeId}.sealed`);
+  verifyEvaluatorAssets(io.cwd,prepared.assetsDirectory,prepared.assets);
+  // Do not unlock implementation without a verified restoration point.
+  const snap=takeCheckpoint(io,node,"seal");
+  if(!snap.ok)return pauseRoot(io,root,{code:"CHECKPOINT_UNAVAILABLE",reason:snap.warning,nodeId,operation:"seal"});
+  fs.rmSync(directory,{recursive:true,force:true});
+  fs.cpSync(prepared.assetsDirectory,directory,{recursive:true,verbatimSymlinks:true});
+  verifyEvaluatorAssets(io.cwd,directory,prepared.assets);
+  ensureBudget(io,root);
+  const bundle={version:2,contract:validatedDraft,digest:sha256Hex(stableStringify(validatedDraft)),env:prepared.environment,candidateDigest:prepared.candidateDigest,
+    sealedAt:new Date(io.nowMs()).toISOString(),baseline:prepared.baseline,intentDigest:prepared.intentDigest,evaluatorDigest:prepared.evaluatorDigest,
+    validation:prepared.stages,assets:prepared.assets,assetsDirectory:directory};
+  bundle.integrityDigest=sha256Hex(stableStringify({contractDigest:bundle.digest,assets:bundle.assets,env:bundle.env,candidateDigest:bundle.candidateDigest}));
+  ensureBudget(io,root);
+  root.policyLocked=true;
   writeJsonAtomic(sealedFile(io.cwd,nodeId),bundle);
+  node.sealedBundleDigest=sha256Hex(stableStringify(bundle));
   node.status=NodeState.ACTIVE;node.phase="EXECUTION";node.sealAttempts++;
   node.lastResult=resultFromBaseline(bundle);node.lastCandidateDigest=bundle.candidateDigest;
-  const snap=takeCheckpoint(io,node,"seal");saveNodeState(io,node);releasePreparation(io.cwd);
-  return {ok:true,sealed:nodeId,baseline:formatVector(bundle.baseline.outcomes),warnings:snap.ok?[]:[snap.warning],next:nextAction(root,node,null,io.nowMs())};
+  node.lastEnvironmentIdentity=digest(bundle.env);
+  if(digestTree(io.cwd)!==bundle.candidateDigest || stableStringify(evaluatorEnvironment(io.cwd))!==stableStringify(bundle.env))throw operationError("CANDIDATE_MUTATED","candidate or environment changed while sealing");
+  ensureBudget(io,root);
+  if(!node.parentId && root.clockVersion===2 && root.executionStartedAt===null) {
+    root.executionStartedAt=io.nowMs();root.deadlineAt=deadlineAtMs(root.executionStartedAt,root.policy);
+  }
+  // Commit the clock before unlocking the leaf. An interrupted seal cannot gain time on retry.
+  saveRoot(io,root);saveNodeState(io,node);ensureBudget(io,root);releasePreparation(io.cwd);releaseBaseline(io.cwd);
+  return {ok:true,sealed:nodeId,baseline:formatVector(bundle.baseline.outcomes),warnings:[],next:nextAction(root,node,null,io.nowMs())};
 }
 
 // --- evaluate ------------------------------------------------------------
 
 async function freshEvaluate(io, bundle, candidateDigest, timeoutMs) {
-  const outcomes = [];
-  const metrics=emptyMetrics();
-  for (const criterion of bundle.contract.criteria) {
-    const fixture=fs.mkdtempSync(path.join(os.tmpdir(),"exitcode-fresh-"));
-    try {
-      metrics.fixtureBytes+=copyCandidate(io.cwd,fixture,SNAPSHOT_MAX_BYTES);metrics.fixtureCopies++;
-      if(fs.existsSync(path.join(io.cwd,"node_modules")))fs.cpSync(path.join(io.cwd,"node_modules"),path.join(fixture,"node_modules"),{recursive:true});
-      metrics.probeExecutions++;
-      outcomes.push(await runCheck(criterion,async(command,opts)=>{metrics.shellExecutions++;return io.exec(command,opts);},fixture,timeoutMs));
-    } finally {fs.rmSync(fixture,{recursive:true,force:true});}
-  }
-  return {
-    metrics,
-    runId: newRunId(),
-    bundleDigest: bundle.digest,
-    candidateDigest,
-    outcomes,
-    allPass: allPass(outcomes),
-    at: new Date().toISOString(),
-  };
+  const outcomes=[],metrics=emptyMetrics();
+  let base;
+  ensureRunning(io.signal,io.deadlineAt,io.nowMs);
+  const environment=evaluatorEnvironment(io.cwd,io);
+  if(!compatibleEnvironment(bundle.env,environment,bundle.contract.mutableDependencies===true,bundle.assets))
+    throw operationError("ENVIRONMENT_CHANGED","sealed evaluator environment changed; restore its trusted runtime or frozen dependencies");
+  if(!bundle.assets) {
+    // Legacy contracts remain byte-for-byte intact, but cannot acquire missing seal-time evidence from mutable current tests.
+    const conventional=inventory(io.cwd).some(f=>/(?:^|\/)(?:test|tests|fixtures)(?:\/|$)|(?:\.test|\.spec)\.[^/]+$/.test(f.rel));
+    if(conventional || bundle.contract.criteria.some(c=>c.check.assets?.length || c.check.command || !["file_exists","file_contains","file_not_contains","json_value"].includes(c.check.recipe?.kind)))
+      throw operationError("LEGACY_EVIDENCE_MISSING","legacy sealed evaluator has no trustworthy frozen acceptance assets; a superseding approved contract is required");
+  } else verifyEvaluatorAssets(io.cwd,bundle.assetsDirectory,bundle.assets);
+  try {
+    base=fixtureDirectory(io.cwd,"exitcode-fresh-base-");
+    metrics.fixtureBytes+=copyCandidate(io.cwd,base,SNAPSHOT_MAX_BYTES,io.signal,io);metrics.fixtureCopies++;
+    if(digestTree(base,io)!==candidateDigest || digestTree(io.cwd,io)!==candidateDigest)throw operationError("CANDIDATE_MUTATED","candidate changed while taking evaluation snapshot");
+    for(const criterion of bundle.contract.criteria) {
+      ensureRunning(io.signal,io.deadlineAt,io.nowMs);
+      const fixture=fixtureDirectory(io.cwd,"exitcode-fresh-");
+      try {
+        metrics.fixtureBytes+=copyCandidate(base,fixture,SNAPSHOT_MAX_BYTES,io.signal,io);metrics.fixtureCopies++;
+        if(bundle.assets)installEvaluatorAssets(fixture,bundle.assetsDirectory,bundle.assets);
+        metrics.probeExecutions++;
+        outcomes.push(await runCheck(criterion,io.exec,fixture,timeoutMs,
+          {signal:io.signal,deadlineAt:io.deadlineAt,nowMs:io.nowMs,readOnlyPaths:bundle.assets?.readOnlyPaths,onExecution:()=>metrics.shellExecutions++}));
+        ensureRunning(io.signal,io.deadlineAt,io.nowMs);
+        if(bundle.assets)verifyEvaluatorAssets(fixture,bundle.assetsDirectory,bundle.assets);
+      } finally {fs.rmSync(fixture,{recursive:true,force:true});}
+    }
+    if(digestTree(io.cwd,io)!==candidateDigest)throw operationError("CANDIDATE_MUTATED","candidate changed during evaluation; checked evidence is stale");
+    if(stableStringify(evaluatorEnvironment(io.cwd,io))!==stableStringify(environment))throw operationError("ENVIRONMENT_CHANGED","environment changed during evaluation");
+    if(bundle.assets)verifyEvaluatorAssets(io.cwd,bundle.assetsDirectory,bundle.assets);
+    return {metrics,runId:newRunId(),nodeId:bundle.contract.id,bundleDigest:bundle.digest,candidateDigest,environment,environmentIdentity:digest(environment),outcomes,
+      allPass:allPass(outcomes),at:new Date(io.nowMs()).toISOString()};
+  } finally {if(base)fs.rmSync(base,{recursive:true,force:true});}
+}
+
+function requireConclusive(result) {
+  const errors=result.outcomes.filter(o=>o.status==="ERROR");
+  if(errors.length)throw operationError(errors[0].errorCode??"RUNNER_ERROR",errors.map(o=>`${o.criterionId}: ${o.reasons.join("; ")}`).join("; "));
+}
+
+function requireIdentity(io,root,result) {
+  ensureBudget(io,root);
+  requireConclusive(result);
+  if(result.nodeId){const bundle=loadBundle(io,result.nodeId),verified=verifyBundle(bundle,loadNodeState(io,result.nodeId));if(!verified.ok || bundle.digest!==result.bundleDigest)throw operationError("EVALUATOR_DRIFT",verified.reason??"evaluated bundle identity changed");}
+  if(digestTree(io.cwd,io)!==result.candidateDigest)throw operationError("CANDIDATE_MUTATED","candidate changed after evaluation");
+  if(result.environment && stableStringify(result.environment)!==stableStringify(evaluatorEnvironment(io.cwd,io)))throw operationError("ENVIRONMENT_CHANGED","environment changed after evaluation");
+  ensureBudget(io,root);
 }
 
 function evaluationDiagnostics(result) {
@@ -1514,6 +1987,19 @@ function evaluationDiagnostics(result) {
 }
 
 export async function evaluateNode(io, nodeId = null) {
+  return workspaceOperation(io,"evaluate",async io => {
+    const index=loadIndex(io.cwd),root=index.activeRootId?loadRoot(io,index.activeRootId):null;
+    if(!root || root.status!==NodeState.ACTIVE)return {ok:false,errors:["no ACTIVE root; resume any infrastructure pause first"]};
+    const owned=operationIo(io,root);
+    try {return await evaluateActive(owned.io,nodeId);}
+    catch(e) {
+      const current=loadRoot(io,root.id);
+      return pauseRoot(io,current,{code:e.code??"IO_ERROR",reason:e.message,nodeId:nodeId??leafOf(current),operation:"evaluate"});
+    } finally {owned.dispose();}
+  });
+}
+
+async function evaluateActive(io, nodeId) {
   ensureStoreDirs(io.cwd);
   const index = loadIndex(io.cwd);
   const root = index.activeRootId ? loadRoot(io, index.activeRootId) : null;
@@ -1522,6 +2008,7 @@ export async function evaluateNode(io, nodeId = null) {
   const targetId = nodeId ?? leafOf(root);
   const node = targetId ? loadNodeState(io, targetId) : null;
   if (!node || node.rootId !== root.id) return { ok: false, errors: [`unknown node ${targetId}`] };
+  if (node.id!==leafOf(root) && node.status===NodeState.ACTIVE)return {ok:false,errors:["evaluate the active leaf before its ancestors"]};
   if (node.status === NodeState.DRAFT) return { ok: false, errors: [`${node.id} is DRAFT; seal it with exitcode_seal first`] };
   if (node.status !== NodeState.ACTIVE) {
     const current = digestTree(io.cwd);
@@ -1529,25 +2016,35 @@ export async function evaluateNode(io, nodeId = null) {
     return { ok: true, node: node.id, status: node.status, stale: Boolean(stale), vector: node.lastResult ? formatVector(node.lastResult.outcomes) : "none" };
   }
   const bundle = loadBundle(io, node.id);
-  const verified = verifyBundle(bundle);
-  if (!verified.ok) return blockNode(io, node.id, { reason: verified.reason, code: "NO_PATH" });
+  const verified = verifyBundle(bundle,node);
+  if (!verified.ok) throw operationError("EVALUATOR_DRIFT",verified.reason);
 
+  ensureBudget(io,root);
   const candidateDigest = digestTree(io.cwd);
-  const changed = candidateDigest !== node.lastCandidateDigest;
+  const accountingDigest=root.clockVersion===2?candidateDigest:legacyCandidateIdentity(io.cwd);
+  const reservation=root.candidateReservation?.nodeId===node.id?root.candidateReservation:null;
+  if(reservation)node.attempts=Math.max(node.attempts,reservation.nodeAttempts);
+  const changed = accountingDigest !== (reservation?.accountingDigest??node.reservedAccountingDigest??node.lastAccountingDigest??node.reservedCandidateDigest??node.lastCandidateDigest);
   const nowMs = io.nowMs();
   if (changed) {
     if (isExpired(root, nowMs)) {
-      return blockNode(io, node.id, { reason: "shared deadline exceeded", code: "BUDGET_EXHAUSTED" });
+      throw operationError("DEADLINE_EXCEEDED","shared execution deadline exceeded");
     }
-    if ((root.consumedAttempts ?? 0) >= (root.policy.maxTotalAttempts ?? DEFAULT_POLICY.maxTotalAttempts)) {
-      return blockNode(io, node.id, { reason: `total attempt budget exhausted (${root.policy.maxTotalAttempts})`, code: "BUDGET_EXHAUSTED" });
+    if ((root.consumedAttempts ?? 0) >= (root.attemptLimit ?? root.policy.maxTotalAttempts ?? DEFAULT_POLICY.maxTotalAttempts)) {
+      throw operationError("BUDGET_EXHAUSTED",`total attempt budget exhausted (${root.attemptLimit??root.policy.maxTotalAttempts})`);
     }
     root.consumedAttempts += 1;
     node.attempts += 1;
+    node.reservedCandidateDigest=candidateDigest;node.reservedAccountingDigest=accountingDigest;
+    root.candidateReservation={nodeId:node.id,candidateDigest,accountingDigest,nodeAttempts:node.attempts,at:io.nowMs()};
+    // Persist reservations before snapshots, IO, or executable work.
+    saveRoot(io,root);saveNodeState(io,node);
   }
 
-  const timeoutMs = defaultTimeoutMs(root);
+  const timeoutMs = root.clockVersion===2?Math.max(0,root.deadlineAt-io.nowMs()):defaultTimeoutMs(root);
   let result = await freshEvaluate(io, bundle, candidateDigest, timeoutMs);
+  requireIdentity(io,root,result);
+  const verifiedStack={[node.id]:result};
 
   // Own-vector regression: restore the last verified-clean candidate,
   // re-evaluate the stack, and keep the consumed attempt.
@@ -1555,10 +2052,11 @@ export async function evaluateNode(io, nodeId = null) {
     const regressed = detectRegression(node.lastResult.outcomes, result.outcomes);
     if (regressed.length > 0) {
       const fixed = await restoreAndRefresh(io, root, node.id, ROLLING_CP);
+      if(fixed.ok)delete root.candidateReservation;
       saveRoot(io, root);
       if (!fixed.ok) {
         saveNodeState(io, node);
-        return blockNode(io, node.id, { reason: `regressed ${regressed.join(", ")} with ${fixed.reason}`, code: "NO_PATH" });
+        throw operationError("RESTORATION_FAILED",`regressed ${regressed.join(", ")} with ${fixed.reason}`);
       }
       const current = loadNodeState(io, node.id);
       const fresh = fixed.fresh[node.id] ?? current.lastResult;
@@ -1576,6 +2074,7 @@ export async function evaluateNode(io, nodeId = null) {
   }
   node.lastResult = result;
   node.lastCandidateDigest = candidateDigest;
+  node.lastEnvironmentIdentity=result.environmentIdentity;node.lastAccountingDigest=accountingDigest;delete node.reservedCandidateDigest;delete node.reservedAccountingDigest;
 
   // Ancestor regression: run the relevant ancestor evaluators, not just this
   // node's checks. Restore this node's last accepted candidate on regression.
@@ -1583,15 +2082,19 @@ export async function evaluateNode(io, nodeId = null) {
   for (const ancestorId of ancestors) {
     const ancestorState = loadNodeState(io, ancestorId);
     const ancestorBundle = loadBundle(io, ancestorId);
-    if (!ancestorState?.lastResult || !ancestorBundle) continue;
+    if(!ancestorState?.lastResult || !ancestorBundle)throw operationError("EVALUATOR_DRIFT",`ancestor ${ancestorId} lost trusted evidence`);
+    const verified=verifyBundle(ancestorBundle,ancestorState);if(!verified.ok)throw operationError("EVALUATOR_DRIFT",verified.reason);
     const ancestorResult = await freshEvaluate(io, ancestorBundle, candidateDigest, timeoutMs);
+    requireIdentity(io,root,ancestorResult);
+    verifiedStack[ancestorId]=ancestorResult;
     const regressed = detectRegression(ancestorState.lastResult.outcomes, ancestorResult.outcomes);
     if (regressed.length > 0) {
       const fixed = await restoreAndRefresh(io, root, ancestorId, ROLLING_CP);
+      if(fixed.ok)delete root.candidateReservation;
       saveRoot(io, root);
       if (!fixed.ok) {
         saveNodeState(io, node);
-        return blockNode(io, node.id, { reason: `regressed ancestor ${ancestorId} (${regressed.join(", ")}) with ${fixed.reason}`, code: "NO_PATH" });
+        throw operationError("RESTORATION_FAILED",`regressed ancestor ${ancestorId} (${regressed.join(", ")}) with ${fixed.reason}`);
       }
       const current = loadNodeState(io, node.id);
       const fresh = fixed.fresh[node.id] ?? current.lastResult;
@@ -1608,17 +2111,23 @@ export async function evaluateNode(io, nodeId = null) {
     }
     ancestorState.lastResult = ancestorResult;
     ancestorState.lastCandidateDigest = candidateDigest;
+    ancestorState.lastAccountingDigest=root.clockVersion===2?candidateDigest:legacyCandidateIdentity(io.cwd);
+    ancestorState.lastEnvironmentIdentity=ancestorResult.environmentIdentity;
     saveNodeState(io, ancestorState);
   }
 
+  requireIdentity(io,root,result);
   const snap = takeCheckpoint(io, node, "eval");
+  requireIdentity(io,root,result);
   const warnings = snap.ok ? [] : [snap.warning];
+  delete root.candidateReservation;
+  saveNodeState(io,node);
   saveRoot(io, root);
-  saveNodeState(io, node);
 
+  ensureBudget(io,root);
   if (result.allPass) {
-    const cascade = await closePassCascade(io, index, root, node.id);
-    return { ok: true, node: node.id, status: NodeState.PASS, vector: formatVector(result.outcomes), warnings, cascade };
+    const cascade = await closePassCascade(io, index, root, node.id, verifiedStack);
+    return { ok: true, node: node.id, status: cascade.paused?NodeState.PAUSED:loadNodeState(io,node.id).status, vector: formatVector(result.outcomes), warnings, cascade };
   }
   return {
     ok: true,
@@ -1644,140 +2153,103 @@ function stackAncestors(root, nodeId) {
  * Child success never closes the parent: only the parent's own fresh
  * evaluation can. Boundary parent reruns are free (no attempt consumed).
  */
-async function closePassCascade(io, index, root, nodeId) {
-  const events = [];
-  let current = loadNodeState(io, nodeId);
-  current.status = NodeState.PASS;
-  saveNodeState(io, current);
-  popStack(root, nodeId);
-  events.push(`${nodeId} PASS`);
-  saveRoot(io, root);
-
-  for (;;) {
-    const parentId = leafOf(root);
-    if (!parentId) {
-      const outcome = { candidateDigest: digestTree(io.cwd), at: new Date().toISOString() };
-      markTerminal(io, index, root, NodeState.PASS, outcome);
-      events.push(`root ${root.id} PASS`);
-      return { events, terminal: { root: root.id, status: NodeState.PASS, outcome } };
-    }
-    const parent = loadNodeState(io, parentId);
-    const bundle = loadBundle(io, parentId);
-    const verified = verifyBundle(bundle);
-    if (!verified.ok) {
-      const blocked = await blockNode(io, parentId, { reason: verified.reason, code: "NO_PATH" });
-      events.push(`${parentId} BLOCKED (${verified.reason})`);
-      return { events, terminal: blocked.terminal ?? null };
-    }
-    const candidateDigest = digestTree(io.cwd);
-    const result = await freshEvaluate(io, bundle, candidateDigest, defaultTimeoutMs(root));
-    parent.lastResult = result;
-    parent.lastCandidateDigest = candidateDigest;
-    saveNodeState(io, parent);
-    events.push(`${parentId} rerun: ${formatVector(result.outcomes)}`);
-
-    // Ancestor chain above the parent must still hold after integration.
-    let restored = false;
-    for (const ancestorId of stackAncestors(root, parentId)) {
-      const ancestorState = loadNodeState(io, ancestorId);
-      const ancestorBundle = loadBundle(io, ancestorId);
-      if (!ancestorState?.lastResult || !ancestorBundle) continue;
-      const ancestorResult = await freshEvaluate(io, ancestorBundle, candidateDigest, defaultTimeoutMs(root));
-      const regressed = detectRegression(ancestorState.lastResult.outcomes, ancestorResult.outcomes);
-      if (regressed.length > 0) {
-        const fixed = await restoreAndRefresh(io, root, ancestorId, ROLLING_CP);
-        if (!fixed.ok) {
-          await blockNode(io, parentId, { reason: `regressed ancestor ${ancestorId} (${regressed.join(", ")}) with ${fixed.reason}`, code: "NO_PATH" });
-          events.push(`${parentId} BLOCKED (ancestor regression, unrestorable)`);
-          return { events, terminal: parentId === root.id ? { root: root.id, status: NodeState.BLOCKED } : null };
-        }
-        // The integrated work is withdrawn: the path failed at the parent level.
-        current.status = NodeState.BLOCKED;
-        current.blockedReason = `reverted: regressed ancestor ${ancestorId} (${regressed.join(", ")})`;
-        current.blockedCode = "NO_PATH";
-        current.blockedCandidateDigest = fixed.digest;
-        saveNodeState(io, current);
-        events.push(`${current.id} reverted and BLOCKED (ancestor regression)`);
-        restored = true;
-        break;
-      }
-      ancestorState.lastResult = ancestorResult;
-      ancestorState.lastCandidateDigest = candidateDigest;
-      saveNodeState(io, ancestorState);
-    }
-    if (restored) return { events, terminal: null };
-
-    if (result.allPass) {
-      current = parent;
-      current.status = NodeState.PASS;
-      saveNodeState(io, current);
-      popStack(root, parentId);
-      events.push(`${parentId} PASS`);
-      saveRoot(io, root);
-      continue;
-    }
-    saveRoot(io, root);
-    return { events, terminal: null };
+async function closePassCascade(io,index,root,nodeId,verifiedStack) {
+  const events=[],passing=[],stack=[...root.stack],nextStack=[...stack];
+  // Stage all verdicts. No node is provisionally accepted while an ancestor
+  // evaluator, candidate/environment identity, or deadline is inconclusive.
+  for(const result of Object.values(verifiedStack))requireIdentity(io,root,result);
+  while(nextStack.length) {
+    const id=nextStack.at(-1),result=verifiedStack[id];
+    if(!result?.allPass)break;
+    const state=loadNodeState(io,id),verified=verifyBundle(loadBundle(io,id),state);
+    if(!verified.ok)throw operationError("EVALUATOR_DRIFT",verified.reason);
+    passing.push(state);nextStack.pop();
+    if(id!==nodeId)events.push(`${id} rerun: ${formatVector(result.outcomes)}`);
+    events.push(`${id} PASS`);
   }
+  const result=verifiedStack[root.id]??verifiedStack[nodeId];
+  requireIdentity(io,root,result);
+  // Persist the original stack so reload can recover an interrupted multi-file
+  // commit. A closing record is not a completed terminal verdict.
+  root.closingStack=stack;saveRoot(io,root);
+  try {
+    for(const state of passing){state.status=NodeState.PASS;saveNodeState(io,state);}
+    ensureBudget(io,root);
+    root.stack=nextStack;
+    let terminal=null;
+    if(!nextStack.length) {
+      const outcome={candidateDigest:result.candidateDigest,environment:result.environment,environmentIdentity:result.environmentIdentity,runId:result.runId,at:result.at};
+      markTerminal(io,index,root,NodeState.PASS,outcome);
+      terminal={root:root.id,status:NodeState.PASS,outcome};events.push(`root ${root.id} PASS`);
+    } else {
+      const parent=nextStack.at(-1),parentResult=verifiedStack[parent];
+      if(parentResult)events.push(`${parent} rerun: ${formatVector(parentResult.outcomes)}`);
+      saveRoot(io,root);
+    }
+    requireIdentity(io,root,result);
+    delete root.closingStack;saveRoot(io,root);ensureBudget(io,root);
+    return {events,terminal};
+  } catch(e) {
+    root.closingStack=stack;
+    recoverClosing(io,index,root);
+    throw e;
+  }
+}
+
+/** Recover only an incomplete verdict commit, never replace fresh evaluation. */
+function recoverClosing(io,index,root) {
+  if(!root?.closingStack)return false;
+  root.stack=[...root.closingStack];root.status=NodeState.ACTIVE;delete root.outcome;
+  for(const id of root.stack){const state=loadNodeState(io,id);if(state?.status===NodeState.PASS){state.status=NodeState.ACTIVE;saveNodeState(io,state);}}
+  delete root.closingStack;saveRoot(io,root);index.activeRootId=root.id;saveIndex(io.cwd,index);
+  return true;
 }
 
 // --- block ---------------------------------------------------------------
 
-export async function blockNode(io, nodeId, { reason, code = "NO_PATH" }) {
-  ensureStoreDirs(io.cwd);
-  const index = loadIndex(io.cwd);
-  const root = index.activeRootId ? loadRoot(io, index.activeRootId) : null;
-  const node = nodeId ? loadNodeState(io, nodeId) : null;
-  if (!root || !node || node.rootId !== root.id) return { ok: false, errors: [`unknown node ${nodeId}`] };
-  if (!nonEmptyString(reason)) return { ok: false, errors: ["reason must name the specific missing requirement or cause"] };
-  if (!BLOCK_CODES.includes(code)) return { ok: false, errors: [`code must be one of ${BLOCK_CODES.join(", ")}`] };
-  if (node.status === NodeState.PASS || node.status === NodeState.BLOCKED) {
-    return { ok: true, node: node.id, status: node.status, terminal: root.status !== NodeState.ACTIVE ? { root: root.id, status: root.status } : null };
-  }
-
-  node.status = NodeState.BLOCKED;
-  node.blockedReason = reason.trim();
-  node.blockedCode = code;
-  const events = [`${node.id} BLOCKED (${code}): ${reason.trim()}`];
-
-  if (!node.parentId) {
-    node.blockedCandidateDigest = node.lastCandidateDigest;
-    saveNodeState(io, node);
-    const outcome = { reason: node.blockedReason, code, at: new Date().toISOString() };
-    markTerminal(io, index, root, NodeState.BLOCKED, outcome);
-    return { ok: true, node: node.id, status: NodeState.BLOCKED, events, terminal: { root: root.id, status: NodeState.BLOCKED, outcome } };
-  }
-
-  // Persist the terminal state first so the refresh below skips this node.
-  saveNodeState(io, node);
-  // Restore the parent candidate from before this child's work, then
-  // re-evaluate the stack so no vector stays stale on the restored tree.
-  const parent = loadNodeState(io, node.parentId);
-  const fix = parent ? restoreCheckpoint(io, parent, (c) => c.note === `pre-child:${node.id}`) : { ok: false, reason: "missing parent" };
-  const fallback = fix.ok ? fix : parent ? restoreCheckpoint(io, parent) : fix;
-  if (fallback.ok) {
-    events.push(`restored ${parent.id} to ${fix.ok ? "pre-child" : "latest"} checkpoint`);
-    const afterDigest = digestTree(io.cwd);
-    node.blockedCandidateDigest = afterDigest;
-    const fresh = await refreshStack(io, root, afterDigest, defaultTimeoutMs(root));
-    if (fresh[parent.id]) events.push(`${parent.id} rerun: ${formatVector(fresh[parent.id].outcomes)}`);
-    const reloaded = loadNodeState(io, parent.id);
-    const snap = takeCheckpoint(io, reloaded, "eval");
-    saveNodeState(io, reloaded);
-    if (!snap.ok) events.push(`warning: ${snap.warning}`);
-  } else {
-    node.blockedCandidateDigest = node.lastCandidateDigest ?? parent?.lastCandidateDigest ?? digestTree(io.cwd);
-    events.push(`warning: kept working tree (${fallback.reason})`);
-  }
-  saveNodeState(io, node);
-  popStack(root, node.id);
-  saveRoot(io, root);
-  return { ok: true, node: node.id, status: NodeState.BLOCKED, events, terminal: null };
+export async function blockNode(io,nodeId,args) {
+  return workspaceOperation(io,"block",async io=>{
+    const index=loadIndex(io.cwd),root=index.activeRootId?loadRoot(io,index.activeRootId):null;
+    if(!root)return {ok:false,errors:["no active root"]};
+    const owned=operationIo(io,root);
+    try {return await blockActive(owned.io,nodeId,args);}
+    catch(e){return pauseRoot(io,loadRoot(io,root.id),{code:e.code??"IO_ERROR",reason:e.message,nodeId,operation:"block",args});}
+    finally {owned.dispose();}
+  });
 }
 
-// --- status ----------------------------------------------------------------
+async function blockActive(io,nodeId,{reason,code="NO_PATH"}) {
+  const index=loadIndex(io.cwd),root=index.activeRootId?loadRoot(io,index.activeRootId):null;
+  const node=nodeId?loadNodeState(io,nodeId):null;
+  if(!root||!node||node.rootId!==root.id)return {ok:false,errors:[`unknown node ${nodeId}`]};
+  if(!nonEmptyString(reason))return {ok:false,errors:["reason must name the specific missing requirement or cause"]};
+  if(!BLOCK_CODES.includes(code))return {ok:false,errors:[`code must be one of ${BLOCK_CODES.join(", ")}`]};
+  if([NodeState.PASS,NodeState.BLOCKED].includes(node.status))return {ok:true,node:node.id,status:node.status};
+  if(root.status===NodeState.PAUSED)return {ok:false,errors:["resume the saved pause before replacing its operation"]};
+  if(!node.parentId || code!=="NO_PATH")
+    return pauseRoot(io,root,{code,reason:reason.trim(),nodeId:leafOf(root),operation:loadNodeState(io,leafOf(root))?.status===NodeState.DRAFT?"prepare":"evaluate",details:{blockedNodeId:node.id}});
+  if(leafOf(root)!==node.id)return {ok:false,errors:["only the active leaf may be withdrawn"]};
+  ensureBudget(io,root);
+  // A declined child path can be withdrawn. Infrastructure faults do not use this path.
+  const parent=loadNodeState(io,node.parentId);
+  const fix=parent?restoreCheckpoint(io,parent,c=>c.id===node.preChildCheckpointId && c.note===`pre-child:${node.id}`):{ok:false,reason:"missing parent"};
+  if(!fix.ok)throw operationError("RESTORATION_FAILED",`cannot withdraw child safely: ${fix.reason}`);
+  const digestAfter=digestTree(io.cwd),events=[`${node.id} BLOCKED (${code}): ${reason.trim()}`,`restored ${parent.id} to pre-child checkpoint`];
+  // Exclude the withdrawn leaf during refresh, but do not pop or terminally mark it until every parent result is conclusive.
+  const refreshed=await refreshStack(io,{...root,stack:root.stack.filter(id=>id!==node.id)},digestAfter,defaultTimeoutMs(root));
+  if(refreshed[parent.id])events.push(`${parent.id} rerun: ${formatVector(refreshed[parent.id].outcomes)}`);
+  for(const result of Object.values(refreshed))requireIdentity(io,root,result);
+  node.status=NodeState.BLOCKED;node.blockedReason=reason.trim();node.blockedCode=code;node.blockedCandidateDigest=digestAfter;node.blockedEnvironmentIdentity=digest(evaluatorEnvironment(io.cwd));
+  saveNodeState(io,node);popStack(root,node.id);saveRoot(io,root);
+  const reloaded=loadNodeState(io,parent.id),snap=takeCheckpoint(io,reloaded,"eval");saveNodeState(io,reloaded);
+  if(!snap.ok)events.push(`warning: ${snap.warning}`);
+  return {ok:true,node:node.id,status:NodeState.BLOCKED,events,terminal:null};
+}
+
+// --- status --------------------------------------------------------------
 
 export function nextAction(root, node, draft = null, nowMs = Date.now()) {
+  if(root?.status===NodeState.PAUSED)return `PAUSED (${root.pause?.code}): ${root.pause?.reason}. Restore the prerequisite, then /exitcode resume. Execution budget never resets.`;
   if (!node) return "no active node";
   if (node.status === NodeState.DRAFT) {
     if (isExpired(root, nowMs)) {
@@ -1793,7 +2265,7 @@ export function nextAction(root, node, draft = null, nowMs = Date.now()) {
   if (node.status !== NodeState.ACTIVE) return `${node.id} is ${node.status}`;
   const failing = (node.lastResult?.outcomes ?? []).filter((o) => o.status !== "PASS").map((o) => o.criterionId);
   const repairs = root.policy.localRepairs ?? DEFAULT_POLICY.localRepairs;
-  const attempts = `attempts ${root.consumedAttempts ?? 0}/${root.policy.maxTotalAttempts}`;
+  const attempts = `attempts ${root.consumedAttempts ?? 0}/${root.attemptLimit??root.policy.maxTotalAttempts}`;
   if ((node.attempts ?? 0) < repairs) {
     return `repair ${node.id} to achieve its goal; use failures [${failing.join(", ") || "none"}] as feedback, then exitcode_evaluate (${attempts})`;
   }
@@ -1829,11 +2301,14 @@ export function statusSnapshot(io) {
     stack: root.stack,
     nodes,
     consumedAttempts: root.consumedAttempts,
-    maxTotalAttempts: root.policy.maxTotalAttempts,
+    maxTotalAttempts: root.attemptLimit??root.policy.maxTotalAttempts,
     ...policyStatus(root, rootNode, io.nowMs()),
     approval: root.approval ?? null,
+    pause: root.pause??null,
+    executionGrants: root.executionGrants??[],
+    acceptanceRestorations:root.acceptanceRestorations??[],
     awaitingApproval,
-    phase: leaf?.phase ?? (leaf?.status === NodeState.DRAFT ? "EVALUATOR_PREPARATION" : "EXECUTION"),
+    phase: root.status===NodeState.PAUSED?"PAUSED":leaf?.phase ?? (leaf?.status === NodeState.DRAFT ? "EVALUATOR_PREPARATION" : "EXECUTION"),
     intentDigest: rootDraft ? intentDigestOf(rootDraft) : loadBundle(io,root.id)?.intentDigest,
     evaluatorDigest: rootDraft ? evaluatorDigestOf(rootDraft) : loadBundle(io,root.id)?.evaluatorDigest,
     evaluatorMetrics: rootNode?.evaluatorMetrics ?? emptyMetrics(),
@@ -1854,10 +2329,11 @@ export function statusText(io) {
     lines.push(`  ${id} ${node.status} attempts=${node.attempts} :: ${node.vector}`);
     if (node.goal) lines.push(`    goal: ${node.goal.slice(0, 160)}`);
   }
-  lines.push(`  budget: ${snap.consumedAttempts}/${snap.maxTotalAttempts} attempts, deadline ${snap.deadlineAt}${snap.expired ? " (EXPIRED)" : ""}`);
+  lines.push(`  budget: ${snap.consumedAttempts}/${snap.maxTotalAttempts} attempts, deadline ${snap.clockStarted?snap.deadlineAt:"starts at root seal"}${snap.expired ? " (EXPIRED)" : ""}`);
   lines.push(`  effective policy: ${JSON.stringify(snap.policy)}`);
-  lines.push(`  remaining: ${(snap.remainingMs / 60000).toFixed(2)} minutes; policy ${snap.policyEditable ? "editable before first approval" : "locked"}`);
-  lines.push(`  phase: ${snap.phase}`, `  evaluator metrics: ${JSON.stringify(snap.evaluatorMetrics)}`, `  intent digest: ${snap.intentDigest}`, `  evaluator digest: ${snap.evaluatorDigest}`, `  diagnostics: ${JSON.stringify(snap.diagnostics)}`, `  evaluator evidence: ${JSON.stringify(snap.evaluatorEvidence)}`, `  contract: ${JSON.stringify(snap.contract)}`);
+  lines.push(`  remaining: ${(snap.remainingMs / 60000).toFixed(2)} minutes; policy ${snap.policyEditable ? "editable before approval" : "locked"}${snap.clockStarted?"":"; execution clock not started"}`);
+  lines.push(`  execution grants: ${JSON.stringify(snap.executionGrants)}`,`  acceptance restorations: ${JSON.stringify(snap.acceptanceRestorations)}`);
+  lines.push(`  phase: ${snap.phase}`, ...(snap.pause?[`  pause: ${JSON.stringify(snap.pause)}`]:[]), `  evaluator metrics: ${JSON.stringify(snap.evaluatorMetrics)}`, `  intent digest: ${snap.intentDigest}`, `  evaluator digest: ${snap.evaluatorDigest}`, `  diagnostics: ${JSON.stringify(snap.diagnostics)}`, `  evaluator evidence: ${JSON.stringify(snap.evaluatorEvidence)}`, `  contract: ${JSON.stringify(snap.contract)}`);
   lines.push(`  next: ${snap.next}`);
   if (snap.review) lines.push("", snap.review);
   return lines.join("\n");
@@ -1867,14 +2343,25 @@ export function statusText(io) {
 export function terminalStale(io, rootId) {
   const root = loadRoot(io, rootId);
   if (!root || root.status !== NodeState.PASS) return { stale: false };
-  const current = digestTree(io.cwd);
-  return { stale: current !== root.outcome?.candidateDigest, recorded: root.outcome?.candidateDigest, current };
+  if(root.closingStack)return {stale:true,reason:"interrupted verdict commit requires fresh evaluation"};
+  const current = root.clockVersion===2 || root.outcome?.environment ? digestTree(io.cwd) : legacyCandidateIdentity(io.cwd);
+  return { stale: Boolean(current !== root.outcome?.candidateDigest || root.outcome?.environment && stableStringify(evaluatorEnvironment(io.cwd))!==stableStringify(root.outcome.environment)), recorded: root.outcome?.candidateDigest, current };
 }
 
 /** Interrupted preparation never restores approval or unlocks coding. */
+function clearInterruptedPreparation(io,id) {
+  const node=loadNodeState(io,id);
+  if(node?.preparing){delete node.preparing;node.phase="EVALUATOR_PREPARATION";delete node.prepared;saveNodeState(io,node);}
+  if(node?.status===NodeState.PASS){node.status=NodeState.ACTIVE;saveNodeState(io,node);}
+}
+
 export function resumePreparation(io) {
-  const index=loadIndex(io.cwd), root=index.activeRootId?loadRoot(io,index.activeRootId):null;
-  for(const id of root?.stack??[]){const node=loadNodeState(io,id);if(node?.preparing){delete node.preparing;node.phase="EVALUATOR_PREPARATION";delete node.prepared;saveNodeState(io,node);}}
+  return workspaceOperation(io,"recover",io=>{
+    const index=loadIndex(io.cwd),id=index.activeRootId??io.expectedRootId,root=id?loadRoot(io,id):null;
+    if(recoverClosing(io,index,root))return pauseRoot(io,root,{reason:"Interrupted verdict commit; fresh evaluation is required",code:"INTERRUPTED",operation:"evaluate"});
+    for(const id of root?.stack??[])clearInterruptedPreparation(io,id);
+    return {ok:true};
+  });
 }
 
 export { reviewPrompt, REVIEW_TIMEOUT_MS, REVIEW_MAX_TOKENS } from './exitcode-quality.mjs';

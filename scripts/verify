@@ -1,6 +1,8 @@
 #!/bin/sh
 set -eu
 cd "$(dirname "$0")/.."
+node --check exitcode-operation.mjs
+node --check exitcode-recovery.test.mjs
 node --check exitcode-core.mjs
 node --check exitcode-evaluator.mjs
 node --check exitcode-preparation.mjs
