@@ -1163,6 +1163,10 @@ function workspaceOperation(io,kind,work) {
       const reason=`${kind} failed (${e.code??"IO_ERROR"}): ${e.message}`;
       const node=root?loadNodeState(locked,leafOf(root)):null;
       if(root?.status===NodeState.ACTIVE && isUnsealedRootDraft(locked,root,node) && ["draft","prepare","stage"].includes(kind)) {
+        if(node.preparationReservation?.operationToken===locked.operationToken) {
+          node.evaluatorMetrics.e0Attempts--;
+          delete node.preparationReservation;delete node.preparing;
+        }
         node.phase="EVALUATOR_PREPARATION";
         node.diagnostics??=[];
         node.diagnostics.push(diagnostic(e.code??"IO_ERROR",kind,node.id,reason,"Repair the draft or environment, stage tests, or retry preparation","supervisor"));
@@ -1208,13 +1212,17 @@ function pauseRecovery(io,root,pause) {
 function recoverEditableDraft(io,root,node) {
   if(root?.status!==NodeState.PAUSED || !isUnsealedRootDraft(io,root,node) || leafOf(root)!==node.id) return false;
   const pause=root.pause;
-  if(!pause || pause.nodeId!==node.id || !["draft","prepare","stage"].includes(pause.operation)) return false;
+  if(!pause || pause.nodeId!==node.id || !(["draft","prepare","stage"].includes(pause.operation) ||
+    pause.recovery==="repair" || ["EVALUATOR_PREPARATION","READY_FOR_APPROVAL","TEST_STAGING"].includes(pause.phase))) return false;
   // Unlocking editing grants no execution or evaluator budget. Preparation still
   // checks the counters, credentials, and other prerequisites on the next call.
   root.pauseHistory??=[];
   if(!root.pauseHistory.some(p=>stableStringify(p)===stableStringify(pause)))root.pauseHistory.push(structuredClone(pause));
   delete root.pause;root.status=NodeState.ACTIVE;
   node.phase="EVALUATOR_PREPARATION";
+  // The workspace lock excludes a live preparation owner. Its interrupted
+  // reservation stays charged, but a stale flag cannot prevent the next retry.
+  delete node.preparing;
   saveRoot(io,root);saveNodeState(io,node);
   return true;
 }
@@ -1924,7 +1932,7 @@ async function prepareDraft(io, nodeId) {
   writeJsonAtomic(draftFile(io.cwd,node.id),{draft});
   if(!node.parentId){delete root.approval;delete root.validatedBundleDigest;root.reviewDigest=rootReviewDigest(root,draft);}saveRoot(io,root);
   const draftDigest=sha256Hex(stableStringify(draft)),reviewDigest=root.reviewDigest;
-  node.phase="EVALUATOR_PREPARATION";node.preparing=true;node.evaluatorMetrics.e0Attempts++;node.preparationReservation={at:io.nowMs(),attempt:node.evaluatorMetrics.e0Attempts};delete node.prepared;saveNodeState(io,node);
+  node.phase="EVALUATOR_PREPARATION";node.preparing=true;node.evaluatorMetrics.e0Attempts++;node.preparationReservation={at:io.nowMs(),attempt:node.evaluatorMetrics.e0Attempts,operationToken:io.operationToken};delete node.prepared;saveNodeState(io,node);
   const owned=operationIo(io,root),operation=owned.io;
   let environment,candidateDigest,assets,result;
   const directory=path.join(storePaths(io.cwd).assetsDir,`${node.id}.prepared`);
@@ -1948,13 +1956,26 @@ async function prepareDraft(io, nodeId) {
     }
   } catch(e) {
     result??={ok:false,errors:[],diagnostics:[],stages:[],metrics:emptyMetrics()};result.ok=false;
-    result.errors.push(e.message);result.diagnostics.push(diagnostic(e.code??"PREPARATION_FAILED","preparation",null,e.message,"Restore the authorized environment and resume","supervisor"));
+    result.errors.push(e.message);result.diagnostics.push(diagnostic(e.code??"PREPARATION_FAILED","preparation",null,e.message,"Repair the draft or authorized environment and retry preparation","supervisor"));
   } finally {
     owned.dispose();
     const current=loadNodeState(io,node.id);if(current){delete current.preparing;saveNodeState(io,current);}
   }
   const after=enforceBaseline(io);
-  if(!after.ok){result.ok=false;result.warnings=[after.message];if(!result.diagnostics.some(d=>d.code==="CANDIDATE_MUTATED")){result.diagnostics.push(diagnostic("CANDIDATE_MUTATED","baseline",null,"Candidate changed during preparation","Reprepare stable candidate"));result.errors.push("Candidate changed during preparation");}}
+  if(!after.ok) {
+    result.ok=false;
+    if(after.code) {
+      const reason=(after.errors??[]).join("; ") || "Baseline verification failed";
+      result.diagnostics.push(diagnostic(after.code,"baseline",node.id,reason,"Restore supervisor storage and retry preparation","supervisor"));
+      result.errors.push(reason);
+    } else {
+      result.warnings=[after.message];
+      if(!result.diagnostics.some(d=>d.code==="CANDIDATE_MUTATED")) {
+        result.diagnostics.push(diagnostic("CANDIDATE_MUTATED","baseline",null,"Candidate changed during preparation","Reprepare stable candidate"));
+        result.errors.push("Candidate changed during preparation");
+      }
+    }
+  }
   const current=loadNodeState(io,node.id),currentRoot=loadRoot(io,root.id),currentDraft=readJson(draftFile(io.cwd,node.id))?.draft;
   if(currentRoot.status!==NodeState.ACTIVE||currentRoot.reviewDigest!==reviewDigest||(!node.parentId && rootReviewDigest(currentRoot,currentDraft)!==reviewDigest)||current.status!==NodeState.DRAFT||sha256Hex(stableStringify(currentDraft))!==draftDigest) {
     fs.rmSync(directory,{recursive:true,force:true});

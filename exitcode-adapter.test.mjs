@@ -200,12 +200,15 @@ test("adapter: stage-tests opens a bounded test-only window without leaving mode
   for (const approval of ["reply", "command"]) await t.test(approval, async (t) => {
     const h = harness(t);
     const registry=reviewRegistry();h.ctx.modelRegistry=registry;
-    fs.writeFileSync(path.join(h.cwd, "proof.test.mjs"), "old acceptance");
-    const literalCriteria = [
-      { id: "C1", requirement: "Artifact says done", check: { recipe: { kind: "file_contains", path: "feature.txt", value: "done" } } },
+    const oldProof="import {test} from 'node:test'; test('old behavior',()=>{});";
+    const stagedProof="import {test} from 'node:test'; import assert from 'node:assert/strict'; import {readFileSync} from 'node:fs'; test('new behavior',()=>assert.equal(readFileSync('feature.txt','utf8'),'done\\n'));";
+    fs.writeFileSync(path.join(h.cwd, "proof.test.mjs"), oldProof);
+    const stagedCriteria = [
+      { id: "C1", requirement: "Artifact says done", check: { recipe: { kind: "existing_test", path: "proof.test.mjs", selector: "new behavior" } },
+        controls:{accept:writes("feature.txt","done\n"),reject:[writes("feature.txt","todo\n")]} },
       { id: "C2", type: "regression", requirement: "Artifact remains", check: { recipe: { kind: "file_exists", path: "feature.txt" } } },
     ];
-    const request = await draft(h, { criteria: literalCriteria,testStaging:{reason:"Update the acceptance assertion for the requested behavior",paths:["proof.test.mjs"]} });
+    const request = await draft(h, { criteria: stagedCriteria,testStaging:{reason:"Update the acceptance assertion for the requested behavior",paths:["proof.test.mjs"]} });
     assert.equal(request.details.testStaging.status, "requested");
     assert.equal(registry.calls.length,0,"staging request defers the first E0");
     assert.equal(core.loadNodeState(io(h),"G1").evaluatorMetrics.e0Attempts,0);
@@ -239,19 +242,21 @@ test("adapter: stage-tests opens a bounded test-only window without leaving mode
     await h.reload();
     assert.equal(core.statusSnapshot(io(h)).staging.status, "open");
     assert.equal((await settle(h)).continue, true, "an authorized staging window continues work");
-    fs.writeFileSync(path.join(h.cwd, "proof.test.mjs"), "new acceptance");
+    fs.writeFileSync(path.join(h.cwd, "proof.test.mjs"), stagedProof);
     fs.writeFileSync(path.join(h.cwd, "feature.txt"), "premature implementation");
     assert.equal((await settle(h)).continue, true);
     assert.equal(feature(h), "todo\n");
-    assert.equal(fs.readFileSync(path.join(h.cwd, "proof.test.mjs"), "utf8"), "new acceptance");
+    assert.equal(fs.readFileSync(path.join(h.cwd, "proof.test.mjs"), "utf8"), stagedProof);
     const completed = await h.tool("exitcode_stage_tests", { complete: true });
     assert.deepEqual(completed.details.staged.files, ["proof.test.mjs"]);
     assert.equal(core.statusSnapshot(io(h)).staging, null);
     const premature = await h.tool("exitcode_seal", { node: "G1", userApproval: "old acceptance" });
     assert.equal(premature.isError, true);
     assert.match(premature.content[0].text, /prepared and validated/);
-    const prepared = await h.tool("exitcode_draft", { goal: "Finish the feature", criteria: literalCriteria, revise: "G1" });
+    const prepared = await h.tool("exitcode_draft", { goal: "Finish the feature", criteria: stagedCriteria, revise: "G1" });
     assert.equal(prepared.details.ok, true);
+    assert.equal(core.loadNodeState(io(h),"G1").phase,"READY_FOR_APPROVAL");
+    assert.equal(core.loadNodeState(io(h),"G1").evaluatorMetrics.e0Attempts,1);
     assert.equal(await settle(h), undefined);
     const sealed = await h.tool("exitcode_seal", { node: "G1", userApproval: "Approve the validated plan" });
     assert.equal(sealed.details.ok, true);

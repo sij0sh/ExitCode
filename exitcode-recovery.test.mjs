@@ -78,6 +78,10 @@ test('recovery: infrastructure faults during root preparation remain editable wi
     ['runner', f => { f.io.exec = async (command, options) => command === 'observe:feature' && read(options.cwd, 'feature') === 'pending'
       ? run(null, { error: 'temporary runner failure', errorCode: 'RUNNER_ERROR' }) : f.exec(command, options); }, 'RUNNER_ERROR'],
     ['runtime IO', f => { fs.writeFileSync(path.join(f.cwd, 'node_modules'), 'not a directory'); core.releaseBaseline(f.cwd); }, 'ENOTDIR'],
+    ['late supervisor IO', f => { f.io.review=async input=>{
+      if(input.phase==='assess')fs.writeFileSync(path.join(core.storePaths(f.cwd).baselineDir,'manifest.json'),'{');
+      return structuralReview(input);
+    }; }, 'IO_ERROR'],
     ['missing specification', f => { assert.equal(core.draftNode(f.io, { ...f.args, revise: 'G1', specificationPaths: ['.agents/artifacts/missing.md'] }).ok, true); }, 'SPECIFICATION_UNAVAILABLE'],
   ]) {
     const f = project(t, { commands: true });
@@ -85,7 +89,7 @@ test('recovery: infrastructure faults during root preparation remain editable wi
     const failed = await core.prepareNode(f.io);
     assert.equal(failed.ok,false,label);
     assert.equal(core.loadRoot(f.io,'G1').status, 'ACTIVE', label);
-    assert.ok(failed.diagnostics.some(d=>d.code===code),label);
+    assert.ok(failed.diagnostics.some(d=>d.code===code),`${label}: ${JSON.stringify(failed.diagnostics)}`);
     const node = core.loadNodeState(f.io, 'G1');
     assert.deepEqual([node.status,node.phase],['DRAFT','EVALUATOR_PREPARATION'],label);
     assert.equal(node.evaluatorMetrics.e0Attempts, 0, label);
@@ -96,7 +100,7 @@ test('recovery: infrastructure faults during root preparation remain editable wi
 });
 
 test('recovery: legacy unsealed pauses unlock every editing boundary without resetting budgets or evidence', async t => {
-  for(const boundary of ['revise','request','approve','complete','prepare','budget','external'])await t.test(boundary,async t=>{
+  for(const boundary of ['revise','request','approve','complete','prepare','budget','external','no-progress'])await t.test(boundary,async t=>{
     const f=project(t,{policy:{evaluatorAttempts:1}});
     assert.equal((await core.prepareNode(f.io)).ok,true);
     const diagnostics=[{code:'REVIEW_TOO_LARGE',stage:'quality',evidence:'length',repairability:'supervisor'}];
@@ -107,15 +111,17 @@ test('recovery: legacy unsealed pauses unlock every editing boundary without res
     }
     const node=core.loadNodeState(f.io,'G1');
     node.phase='EVALUATOR_PREPARATION';node.diagnostics=diagnostics;
+    node.preparing=true;node.preparationReservation={at:100,attempt:1,operationToken:'interrupted-operation'};
     delete node.prepared;delete node.preparedDigest;
     core.saveNodeState(f.io,node);
     const root=core.loadRoot(f.io,'G1');
     root.status='PAUSED';root.pause={code:boundary==='budget'?'EVALUATOR_UNBUILDABLE':boundary==='external'?'REVIEW_CONFIGURATION':'REVIEW_RESPONSE_INVALID',reason:'legacy preparation failure',nodeId:'G1',operation:'prepare',phase:'EVALUATOR_PREPARATION',at:101};
+    if(boundary==='no-progress')Object.assign(root.pause,{code:'NO_PROGRESS',operation:'evaluate',recovery:'repair'});
     root.pauseHistory=[structuredClone(root.pause)];
     root.executionGrants=[{approvedBy:'user',evaluatorAttempts:1,at:99}];
     core.saveRoot(f.io,root);
     let result;
-    if(['revise','external'].includes(boundary))result=core.draftNode(f.io,{...f.args,revise:'G1'});
+    if(['revise','external','no-progress'].includes(boundary))result=core.draftNode(f.io,{...f.args,revise:'G1'});
     if(['request','budget'].includes(boundary))result=core.requestTestStaging(f.io,'G1',{reason:'Write focused tests',paths:['proof.test.mjs']});
     if(boundary==='approve')result=core.approveTestStaging(f.io,'G1',{userApproval:'Yes, write the tests'});
     if(boundary==='complete')result=core.completeTestStaging(f.io,'G1');
@@ -127,9 +133,11 @@ test('recovery: legacy unsealed pauses unlock every editing boundary without res
     assert.equal(result.ok,true,JSON.stringify(result));
     const recovered=core.loadRoot(f.io,'G1'),state=core.loadNodeState(f.io,'G1');
     assert.equal(recovered.status,'ACTIVE');assert.equal(recovered.pause,undefined);
+    assert.equal(state.preparing,undefined,'recovery clears only the interrupted in-progress flag');
+    if(boundary!=='prepare')assert.deepEqual(state.preparationReservation,node.preparationReservation,'the interrupted reservation is not refunded');
     for(const key of ['policy','consumedAttempts','deadlineAt','executionGrants','pauseHistory','stack'])assert.deepEqual(recovered[key],root[key],key);
     assert.equal(state.evaluatorMetrics.e0Attempts,boundary==='prepare'?2:1);
-    if(['revise','request','approve','external','budget'].includes(boundary))assert.deepEqual(state.diagnostics,diagnostics,'recovery retains diagnostics');
+    if(['revise','request','approve','external','budget','no-progress'].includes(boundary))assert.deepEqual(state.diagnostics,diagnostics,'recovery retains diagnostics');
     assert.equal(recovered.approval,undefined,'recovery grants no approval');
     if(boundary!=='prepare')assert.equal(core.approveRoot(f.io).ok,false,'unprepared recovery cannot be approved');
     if(boundary==='prepare')assert.equal(state.phase,'READY_FOR_APPROVAL');
