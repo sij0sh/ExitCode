@@ -13,7 +13,7 @@ import {
   promptStatusText, resolveModeFromBranch, restoreTree, rootReviewText, sealNode, sha256Hex, snapshotTree,
   stableStringify, statusSnapshot, statusText, terminalStale, validateStructure,
 } from "./exitcode-core.mjs";
-import { candidateIdentity } from "./exitcode-evaluator.mjs";
+import { candidateIdentity, scanCapabilities } from "./exitcode-evaluator.mjs";
 import { structuralReview } from "./test/structural-review.mjs";
 
 // ---------------------------------------------------------------------------
@@ -535,6 +535,131 @@ test("baseline: pre-seal changes from any source are saved, restored, reported, 
     assert.equal(enforceBaseline(io).restored, true);
   }
   assert.equal(discardedSets(dir).length, MAX_DISCARDED_CHANGES);
+});
+
+test("staging: user-authorized test windows preserve product, invalidate approval, and freeze the completed tests", async (t) => {
+  for (const boundary of ["guard", "complete"]) await t.test(boundary, async (t) => {
+    const oldTest = "import { test } from 'node:test'; test('old behavior', () => {});";
+    const newTest = "import { test } from 'node:test'; test('new behavior', () => {});";
+    const dir = tempProject(t, { "feature.txt": "todo\n", "keep.txt": "preserved", "proof.test.mjs": oldTest, "other.test.mjs": oldTest,
+      "test/old.test.mjs": oldTest, "scripts/verify": "old verify", "node_modules/pkg/index.js": "dependency" });
+    const { io } = testIo(dir, fileExec(dir, { checks: standardChecks }));
+    draftNode(io, { goal: "g", criteria: ROOT_CRITERIA });
+    assert.equal((await prepareNode(io)).ok, true);
+    assert.equal(approveRoot(io).ok, true);
+    const attempts = loadNodeState(io, "G1").evaluatorMetrics.e0Attempts;
+    assert.equal(core.approveTestStaging(io, "G1").ok, false, "request precedes approval");
+    for (const paths of [["feature.txt"], ["../proof.test.mjs"], ["node_modules/pkg/a.test.mjs"], ["test"], []])
+      assert.equal(core.requestTestStaging(io, "G1", { reason: "Update acceptance", paths }).ok, false);
+    assert.equal(core.requestTestStaging(io, "G1", { reason: "Update acceptance for the new behavior",
+      paths: ["./proof.test.mjs", "test/new.test.mjs", "test/old.test.mjs", "scripts/verify"] }).ok, true);
+    assert.equal(statusSnapshot(io).phase, "TEST_STAGING");
+    assert.equal(statusSnapshot(io).awaitingApproval, false);
+    assert.equal(loadNodeState(io, "G1").prepared, undefined);
+    assert.equal(loadRoot(io, "G1").approval, undefined);
+    assert.equal(core.completeTestStaging(io, "G1").ok, false);
+    assert.equal((await prepareNode(io)).ok, false);
+    assert.equal(approveRoot(io).ok, false);
+    assert.equal((await sealNode(io, "G1")).ok, false);
+    const misuse = await blockNode(io, "G1", { code: "AUTHORIZATION_MISSING", reason: "Need test edits" });
+    assert.equal(misuse.paused, undefined);
+    assert.match(misuse.errors[0], /test staging has its own approval/);
+    assert.equal(loadRoot(io, "G1").status, "ACTIVE");
+    write(dir, "proof.test.mjs", newTest);
+    assert.equal(enforceBaseline(io).restored, true, "request alone grants no writes");
+    assert.equal(readText(dir, "proof.test.mjs"), oldTest);
+    assert.equal(core.approveTestStaging(io, "G1", { userApproval: " " }).ok, false);
+    assert.equal(core.approveTestStaging(io, "G1", { userApproval: "Yes, update these tests" }).ok, true);
+    write(dir, "proof.test.mjs", newTest);
+    write(dir, "test/new.test.mjs", newTest);
+    fs.rmSync(path.join(dir, "test/old.test.mjs"));
+    write(dir, "scripts/verify", "new verify");
+    write(dir, "other.test.mjs", "outside approved paths");
+    write(dir, "feature.txt", "premature implementation");
+    fs.rmSync(path.join(dir, "keep.txt"));
+    fs.mkdirSync(path.join(dir, "generated"));
+    write(dir, "generated/added.js", "premature addition");
+    write(dir, "node_modules/pkg/index.js", "changed dependency");
+    const fresh = makeIo(dir, { exec: io.exec });
+    assert.equal(core.resumePreparation(fresh).ok, true);
+    assert.equal(statusSnapshot(fresh).staging.status, "open", "window survives reload");
+    assert.equal(draftNode(fresh, { goal: "g", criteria: ROOT_CRITERIA, revise: "G1" }).ok, false);
+    assert.equal((await prepareNode(fresh)).ok, false);
+    assert.equal((await sealNode(fresh, "G1")).ok, false);
+    // Supervisor calls above also enforce the guard. Add another product edit
+    // to exercise completion's restoration independently.
+    write(dir, "feature.txt", "another unauthorized edit");
+    if (boundary === "guard") assert.equal(enforceBaseline(fresh).restored, true);
+    const completed = core.completeTestStaging(fresh, "G1");
+    assert.equal(completed.ok, true, JSON.stringify(completed));
+    assert.deepEqual(completed.staged.files, ["proof.test.mjs", "scripts/verify", "test/new.test.mjs", "test/old.test.mjs"]);
+    assert.equal(readText(dir, "feature.txt"), "todo\n");
+    assert.equal(readText(dir, "keep.txt"), "preserved");
+    assert.equal(fs.existsSync(path.join(dir, "generated/added.js")), false);
+    assert.equal(readText(dir, "other.test.mjs"), oldTest);
+    assert.equal(readText(dir, "node_modules/pkg/index.js"), "dependency");
+    assert.equal(readText(dir, "proof.test.mjs"), newTest);
+    assert.deepEqual(scanCapabilities(dir).selectors["proof.test.mjs"], ["new behavior"]);
+    assert.equal(core.statusSnapshot(fresh).phase, "EVALUATOR_PREPARATION");
+    assert.equal(loadNodeState(fresh, "G1").testStagingsCompleted, 1);
+    assert.equal(loadNodeState(fresh, "G1").evaluatorMetrics.e0Attempts, attempts);
+    assert.equal(loadRoot(fresh, "G1").consumedAttempts, 0);
+    assert.equal(loadRoot(fresh, "G1").deadlineAt, null);
+    assert.equal(statusSnapshot(fresh).stagingHistory[0].approval.userReply, "Yes, update these tests");
+    assert.equal(approveRoot(fresh).ok, false, "staging never grants acceptance approval");
+    write(dir, "proof.test.mjs", "after staging");
+    assert.equal(enforceBaseline(fresh).restored, true);
+    assert.equal(readText(dir, "proof.test.mjs"), newTest);
+    assert.equal((await prepareNode(fresh)).ok, true);
+    assert.equal(approveRoot(fresh).ok, true);
+    assert.equal((await sealNode(fresh, "G1")).ok, true);
+    assert.equal(core.requestTestStaging(fresh, "G1", { reason: "Too late" }).ok, false);
+    write(dir, "proof.test.mjs", "weakened sealed acceptance");
+    const drift = await evaluateNode(fresh, "G1");
+    assert.equal(drift.pause.code, "EVALUATOR_DRIFT");
+    assert.equal(core.resumeRoot(fresh).ok, true);
+    assert.equal(readText(dir, "proof.test.mjs"), newTest, "resume restores the staged acceptance bytes");
+    assert.equal(draftNode(fresh, childArgs()).ok, true);
+    assert.match(core.requestTestStaging(fresh, "G1.1", { reason: "Change parent tests" }).errors[0], /sealed ancestor/);
+  });
+
+  for (const limit of ["files", "bytes", "windows", "missing-snapshot", "symlink", "no-changes", "revise-request"]) await t.test(limit, async (t) => {
+    const dir = tempProject(t, { "feature.txt": "todo\n", "proof.test.mjs": "old" });
+    const { io } = testIo(dir, fileExec(dir, { checks: standardChecks }));
+    draftNode(io, { goal: "g", criteria: ROOT_CRITERIA });
+    if (limit === "windows") {
+      const node = loadNodeState(io, "G1"); node.testStagingsCompleted = core.MAX_TEST_STAGINGS_PER_NODE; core.saveNodeState(io, node);
+      assert.equal(core.requestTestStaging(io, "G1", { reason: "Again" }).ok, false); return;
+    }
+    core.requestTestStaging(io, "G1", { reason: "Update acceptance" });
+    if (limit === "revise-request") {
+      assert.equal(draftNode(io, { goal: "g", criteria: ROOT_CRITERIA, revise: "G1" }).ok, true);
+      assert.equal(statusSnapshot(io).staging, null); return;
+    }
+    if (limit === "missing-snapshot") {
+      fs.rmSync(path.join(baselineDir(dir), "manifest.json"));
+      assert.equal(core.approveTestStaging(io, "G1").ok, false);
+      assert.equal(statusSnapshot(io).staging.status, "requested"); return;
+    }
+    assert.equal(core.approveTestStaging(io, "G1").ok, true);
+    if (limit === "symlink") {
+      fs.symlinkSync("feature.txt", path.join(dir, "linked.test.mjs"));
+      assert.equal(enforceBaseline(io).restored, true);
+      assert.equal(fs.existsSync(path.join(dir, "linked.test.mjs")), false);
+      assert.equal(core.completeTestStaging(io, "G1").ok, true); return;
+    }
+    if (limit === "files") for (let i = 0; i <= core.MAX_STAGED_FILES; i++) write(dir, `added-${i}.test.mjs`, "test");
+    if (limit === "bytes") write(dir, "proof.test.mjs", "x".repeat(core.MAX_STAGED_BYTES + 1));
+    const completed = core.completeTestStaging(io, "G1");
+    if (limit === "no-changes") {
+      assert.equal(completed.ok, true);
+      assert.equal(loadNodeState(io, "G1").testStagingsCompleted, 0); return;
+    }
+    assert.equal(completed.ok, false);
+    assert.match(completed.errors[0], /exceed the bounded window/);
+    assert.equal(statusSnapshot(io).staging.status, "open");
+    assert.equal(readText(dir, ".exitcode/baseline/tree/proof.test.mjs"), "old");
+  });
 });
 
 test("baseline: review-time changes are discarded, sealing releases, and children and pauses freeze their own work", async (t) => {

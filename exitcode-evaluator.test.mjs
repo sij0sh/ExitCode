@@ -6,8 +6,8 @@ import * as path from 'node:path';
 import { test } from 'node:test';
 import * as core from './exitcode-core.mjs';
 import { releasePreparation } from './exitcode-preparation.mjs';
-import { REVIEW_MAX_TOKENS, callReview, reviewPrompt, reviewRepository, validateDerivation } from './exitcode-quality.mjs';
-import { applyMutations, captureEvaluatorAssets, compileRecipe, restoreEvaluatorAssets, runRecipe, sandboxCommand, scanCapabilities, verifyEvaluatorAssets } from './exitcode-evaluator.mjs';
+import { REVIEW_MAX_TOKENS, callReview, parseReviewText, reviewPrompt, reviewRepository, validateDerivation } from './exitcode-quality.mjs';
+import { applyMutations, captureEvaluatorAssets, compileRecipe, lintEvaluators, restoreEvaluatorAssets, runRecipe, sandboxCommand, scanCapabilities, verifyEvaluatorAssets } from './exitcode-evaluator.mjs';
 import { structuralReview } from './test/structural-review.mjs';
 
 const read = (cwd, file) => fs.existsSync(path.join(cwd, file)) ? fs.readFileSync(path.join(cwd, file), 'utf8') : null;
@@ -69,6 +69,7 @@ function scenario(t, mode = 'strong') {
   switch (mode) {
     case 'uncovered': derived.uncovered.push('Explicit unauthorized actor rejection'); break;
     case 'overlap': assessed.issues.push({ code: 'INTENT_REDUNDANT', criterionId: 'C1', evidence: 'Criteria restate the same outcome' }); break;
+    case 'bundled': assessed.issues.push({ code: 'CRITERION_BUNDLED', criterionId: 'C1', evidence: 'Persistence and rejection can independently pass or fail' }); break;
     case 'no-observation': assessed.criteria[0].outcomeObserved = false; break;
     case 'no-negative': assessed.criteria[0].negativeCovered = false; break;
     case 'no-regression': assessed.criteria[0].regressionCriteria = []; break;
@@ -129,7 +130,7 @@ test('semantic: adequate behavioral, structural, and thin evaluators reach appro
 });
 
 test('semantic: weak, uncovered, unchallenged, or malformed evaluators never reach approval', async t => {
-  const expected = { 'weak-file': 'SHAM_SURVIVED', 'empty-file': 'SHAM_SURVIVED', uncovered: 'INTENT_UNCOVERED', overlap: 'INTENT_REDUNDANT',
+  const expected = { 'weak-file': 'SHAM_SURVIVED', 'empty-file': 'SHAM_SURVIVED', uncovered: 'INTENT_UNCOVERED', overlap: 'INTENT_REDUNDANT', bundled: 'CRITERION_BUNDLED',
     'no-observation': 'OUTCOME_NOT_OBSERVED', 'no-negative': 'NEGATIVE_COVERAGE_MISSING', 'no-regression': 'REGRESSION_UNRELATED',
     'irrelevant-regression': 'REGRESSION_UNRELATED', 'duplicated-test': 'TEST_REUSE_MISSING', 'no-sham': 'SHAM_MISSING', unchanged: 'SHAM_INVALID',
     'thin-new-feature': 'POSITIVE_WITNESS_REQUIRED', 'runner-error': 'RUNNER_ERROR' };
@@ -139,6 +140,7 @@ test('semantic: weak, uncovered, unchallenged, or malformed evaluators never rea
     assert.equal(r.ok, false, JSON.stringify(r));
     assert.ok(r.diagnostics.length);
     if (expected[mode]) assert.ok(codes(r).includes(expected[mode]), `${mode}: ${codes(r)}`);
+    if (mode === 'bundled') assert.match(r.diagnostics.find(d => d.code === 'CRITERION_BUNDLED').recommendedRepair, /Split independently observable outcomes/);
     assert.equal(core.digestTree(cwd), before);
     assert.equal(r.review, undefined);
     assert.equal(core.statusSnapshot(io).awaitingApproval, false);
@@ -211,8 +213,16 @@ test('review: derivations are compact, clipped, and supervisor-numbered; respons
     { criteria: [{ criterionId: 'C1', observation: 'o', nearMisses: ['a', 'b', 'c'] }] }, { uncovered: 'x', criteria: [{ criterionId: 'C1', observation: 'o', structural: true }] }])
     assert.throws(() => validateDerivation(bad, criteria), e => e.code === 'REVIEW_RESPONSE_INVALID');
   assert.ok(REVIEW_MAX_TOKENS <= 4096);
-  for (const phase of ['derive', 'assess']) assert.ok(reviewPrompt(phase).length < 2600, `${phase} prompt is compact`);
+  for (const phase of ['derive', 'assess']) {
+    assert.ok(reviewPrompt(phase).length < 2600, `${phase} prompt is compact`);
+    assert.match(reviewPrompt(phase), /submit_review/);
+  }
   await assert.rejects(callReview(() => ({ large: 'x'.repeat(70 * 1024) }), {}), /too large/);
+  // Compatibility fallback accepts the same JSON object wrapped in markdown or prose.
+  for (const text of ['{"a":1}', 'Here is the requested review:\n\n```json\n{"a":1}\n```', '{"a":1}\n\nHope this helps.', '```\n{"a":1}\n```'])
+    assert.deepEqual(parseReviewText(text), { a: 1 });
+  for (const text of ['', 'not JSON', '```json\n{broken\n```', 'no object here'])
+    assert.throws(() => parseReviewText(text), e => e.code === 'REVIEW_RESPONSE_INVALID');
 });
 
 test('review: repository context is bounded, excludes secrets and symlinks, and admits only declared hidden plans', t => {
@@ -295,6 +305,20 @@ test('recipes: selectors must be literal and discovered, discovery never execute
   assert.equal(cap.availableScripts.test, 'touch leaked');
   assert.equal(fs.existsSync(path.join(cwd, 'leaked')), false);
   assert.throws(() => compileRecipe({ kind: 'existing_test', path: 'test/a.test.mjs', selector: 'absent' }, cap), /TEST_SELECTOR_NOT_FOUND/);
+  for (const [recipe, code, hints] of [
+    [{ kind: 'existing_test', path: 'test/a.test.mjs', selector: 'future behavior' }, 'TEST_SELECTOR_NOT_FOUND', [/never invent/, /command_exit\/custom_command/, /test_suite/, /exitcode_stage_tests/]],
+    [{ kind: 'existing_test', path: 'future.test.mjs', selector: 'future behavior' }, 'CHECK_TARGET_MISSING', [/never invent/, /exitcode_stage_tests/]],
+    [{ kind: 'command_exit', command: './scripts/verify' }, 'INVALID_SPEC', [/basename plus args/, /"command":"sh"/, /scripts\/verify/, /custom_command/, /test_suite/]],
+  ]) {
+    const diagnostics = lintEvaluators({ criteria: [{ id: 'C1', check: { recipe } }] }, cwd, cap);
+    assert.equal(diagnostics[0].code, code);
+    for (const hint of hints) assert.match(diagnostics[0].recommendedRepair, hint);
+  }
+  assert.deepEqual(compileRecipe({ kind: 'command_exit', command: 'sh', args: ['scripts/verify'] }, cap),
+    { operation: 'command', executable: 'sh', args: ['scripts/verify'] });
+  assert.deepEqual(compileRecipe({ kind: 'custom_command', command: 'sh scripts/verify' }, cap),
+    { operation: 'shell', command: 'sh scripts/verify', custom: true });
+  assert.deepEqual(compileRecipe({ kind: 'test_suite' }, cap), { operation: 'command', executable: 'npm', args: ['run', 'test'], script: 'test' });
   assert.equal((await runRecipe({ kind: 'existing_test', path: 'test/a.test.mjs', selector: 'works' }, { cwd })).exit, 0);
   fs.writeFileSync(path.join(cwd, 'test/a.test.mjs'), "import {test} from 'node:test';test('other',()=>{});");
   assert.equal((await runRecipe({ kind: 'existing_test', path: 'test/a.test.mjs', selector: 'works' }, { cwd, capabilities: cap })).exit, 1);

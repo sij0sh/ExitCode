@@ -143,7 +143,7 @@ export function compileRecipe(r, capabilities = {}) {
   if (r.kind === 'existing_test') {
     if (capabilities.testRunner !== 'node:test') throw new Error('RUNNER_NOT_FOUND: node:test not discovered');
     if (!capabilities.existingTests?.includes(r.path)) throw new Error('CHECK_TARGET_MISSING: test file not discovered');
-    if (typeof r.selector !== 'string' || !capabilities.selectors?.[r.path]?.includes(r.selector)) throw new Error('TEST_SELECTOR_NOT_FOUND: literal test selector not discovered');
+    if (typeof r.selector !== 'string' || !capabilities.selectors?.[r.path]?.includes(r.selector)) throw new Error(`TEST_SELECTOR_NOT_FOUND: ${JSON.stringify(r.selector)} is not a discovered literal test name in ${r.path}; existing_test cannot select a future test`);
     return { operation:'command', executable:'node', args:['--test','--test-reporter=tap',`--test-name-pattern=^${escapeRegex(r.selector)}$`,r.path], selectedTest:true };
   }
   if (['test_suite','build_succeeds','typecheck_succeeds'].includes(r.kind)) {
@@ -318,7 +318,16 @@ export function lintEvaluators(draft, cwd, capabilities) {
     try {
       if(recipe){compileRecipe(recipe,capabilities);if(recipe.path)safePath(cwd,recipe.path);}
       for(const control of [c.controls?.accept,...(c.controls?.reject??[])].filter(Boolean))for(const mutation of control.mutations??[]){validateMutation(mutation);safePath(cwd,mutation.path);if(mutation.kind==='copy_fixture')safePath(cwd,mutation.from);}
-    }catch(e){const code=e.message.split(':')[0];diagnostics.push(diagnostic(['RUNNER_NOT_FOUND','CHECK_TARGET_MISSING','TEST_SELECTOR_NOT_FOUND'].includes(code)?code:e.message.startsWith('command_exit requires')?'INVALID_SPEC':'UNSAFE_COMMAND','lint',c.id,e.message,'Use a discovered runner, literal selector, and confined fixture paths'));}
+    } catch(e) {
+      const code=e.message.split(':')[0];
+      const lintCode=['RUNNER_NOT_FOUND','CHECK_TARGET_MISSING','TEST_SELECTOR_NOT_FOUND'].includes(code)?code:e.message.startsWith('command_exit requires')?'INVALID_SPEC':'UNSAFE_COMMAND';
+      const repair = recipe?.kind === 'existing_test' && ['TEST_SELECTOR_NOT_FOUND','CHECK_TARGET_MISSING'].includes(lintCode)
+        ? 'Copy a literal selector from discovery; never invent a future name. For new behavior, use command_exit/custom_command with a minimal positive witness, or file_contains for literal artifact content; use test_suite for regression. If tests must change, request exitcode_stage_tests before root sealing, complete staging, then discover and prepare again.'
+        : lintCode === 'INVALID_SPEC'
+          ? 'command_exit takes a basename plus args: {"kind":"command_exit","command":"sh","args":["scripts/verify"]}. Use test_suite for npm test, or {"kind":"custom_command","command":"sh scripts/verify"} for a shell check.'
+          : 'Use a discovered runner, literal selector, and confined fixture paths';
+      diagnostics.push(diagnostic(lintCode,'lint',c.id,e.message,repair));
+    }
     const command=recipe?.command??c.check.command??'';
     if(/https?:\/\/|\b(?:curl|wget|ssh|nc|sudo)\b/.test(command))diagnostics.push(diagnostic('EXTERNAL_DEPENDENCY','lint',c.id,'External or privileged command','Use local deterministic evidence'));
     if(recipe?.path&&BUILTIN_RECIPES.includes(recipe.kind)&&c.controls?.accept?.mutations){
@@ -354,7 +363,9 @@ export function fixtureDirectory(cwd, prefix = 'exitcode-fixture-') {
   }
 }
 
-const TEST_PATH = /(?:^|\/)(?:tests?|__tests__|fixtures)(?:\/|$)|(?:\.test|\.spec)\.[^/]+$|(?:^|\/)(?:jest|vitest|pytest|playwright|tsconfig)[^/]*\.(?:[cm]?[jt]s|json)$|(?:^|\/)(?:pytest.ini|tox.ini|scripts\/verify)$/;
+export const TEST_PATH = /(?:^|\/)(?:tests?|__tests__|fixtures)(?:\/|$)|(?:\.test|\.spec)\.[^/]+$|(?:^|\/)(?:jest|vitest|pytest|playwright|tsconfig)[^/]*\.(?:[cm]?[jt]s|json)$|(?:^|\/)(?:pytest.ini|tox.ini|scripts\/verify)$/;
+/** Conventional test paths stageable under user-authorized pre-seal test staging. Installed packages never qualify. */
+export const isTestPath = rel => typeof rel === 'string' && !rel.split('/').includes('node_modules') && TEST_PATH.test(rel);
 // Development dependencies and runner settings remain immutable. Only these
 // product dependency declarations may change under explicit plan approval.
 const PRODUCT_DEPENDENCY_FIELDS = new Set(['dependencies', 'optionalDependencies', 'peerDependencies']);
@@ -412,7 +423,7 @@ function evaluatorPackages(cwd, pkg, declaredPaths) {
 /** Freeze acceptance assets, not implementation files merely executed or imported by checks. */
 export function captureEvaluatorAssets(cwd, draft, directory) {
   const files = inventory(cwd, {dependencies:true});
-  const conventionalPaths=files.filter(f=>!f.rel.split('/').includes('node_modules') && TEST_PATH.test(f.rel)).map(f=>f.rel).sort();
+  const conventionalPaths=files.filter(f=>isTestPath(f.rel)).map(f=>f.rel).sort();
   const paths = new Set(conventionalPaths);
   const readOnly = new Set(), directories=new Set();
   for(const f of files.filter(f=>!f.rel.split('/').includes('node_modules'))) {
@@ -481,7 +492,7 @@ export function verifyEvaluatorAssets(cwd, directory, assets) {
     throw operationError('EVALUATOR_ASSET_INVALID', 'acceptance asset manifest mismatch');
   for(const rel of assets.dependencyBoundary?.absentPaths??[])if(fs.existsSync(safePath(cwd,rel)))throw operationError('EVALUATOR_DRIFT',`evaluator dependency resolution changed: ${rel}`);
   const liveFiles=inventory(cwd,{dependencies:true});
-  const conventionalPaths=liveFiles.filter(f=>!f.rel.split('/').includes('node_modules') && TEST_PATH.test(f.rel)).map(f=>f.rel).sort();
+  const conventionalPaths=liveFiles.filter(f=>isTestPath(f.rel)).map(f=>f.rel).sort();
   if(stable(conventionalPaths)!==stable(assets.conventionalPaths))throw operationError('EVALUATOR_DRIFT','acceptance test or runner inventory changed');
   for(const rel of assets.directories){
     const live=liveFiles.filter(f=>f.rel.startsWith(rel+'/')).map(f=>f.rel).sort();
@@ -532,7 +543,7 @@ export function restoreEvaluatorAssets(cwd,directory,assets) {
   verifyEvaluatorAssets(directory,directory,assets);
   const expected=new Set(assets.files.map(f=>f.path)),removed=[];
   for(const f of inventory(cwd,{dependencies:true}))if(!expected.has(f.rel) &&
-    (assets.directories.some(p=>f.rel===p || f.rel.startsWith(p+'/')) || !f.rel.split('/').includes('node_modules') && TEST_PATH.test(f.rel))) {
+    (assets.directories.some(p=>f.rel===p || f.rel.startsWith(p+'/')) || isTestPath(f.rel))) {
     fs.rmSync(safePath(cwd,f.rel,{allowFinalSymlink:true}),{force:true});removed.push(f.rel);
   }
   for(const rel of assets.dependencyBoundary?.absentPaths??[])if(fs.existsSync(safePath(cwd,rel))){

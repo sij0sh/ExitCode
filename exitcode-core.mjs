@@ -13,8 +13,8 @@
  */
 
 import { createHash, randomUUID } from "node:crypto";
-export { RECIPE_KINDS, MUTATION_KINDS } from "./exitcode-evaluator.mjs";
-import { sandboxCommand, candidateIdentity, evaluatorEnvironment, normalizeEvaluator, runRecipe, diagnostic, fileDigest, inventory, fixtureDirectory, captureEvaluatorAssets, verifyEvaluatorAssets, installEvaluatorAssets, restoreEvaluatorAssets, compatibleEnvironment, digest, safePath } from "./exitcode-evaluator.mjs";
+export { RECIPE_KINDS, MUTATION_KINDS, TEST_PATH, isTestPath } from "./exitcode-evaluator.mjs";
+import { sandboxCommand, candidateIdentity, evaluatorEnvironment, normalizeEvaluator, runRecipe, diagnostic, fileDigest, inventory, fixtureDirectory, captureEvaluatorAssets, verifyEvaluatorAssets, installEvaluatorAssets, restoreEvaluatorAssets, compatibleEnvironment, digest, safePath, isTestPath } from "./exitcode-evaluator.mjs";
 import { prepareGate, emptyMetrics, addMetrics, copyCandidate, releasePreparation } from "./exitcode-preparation.mjs";
 import { ensureRunning, operationSignal, operationError } from "./exitcode-operation.mjs";
 import * as fs from "node:fs";
@@ -84,13 +84,19 @@ export const MAX_DISCARDED_CHANGES = 3;
 export const EXITCODE_TOOL_NAMES = Object.freeze([
   "exitcode_status", "exitcode_draft", "exitcode_seal",
   "exitcode_evaluate", "exitcode_child", "exitcode_block",
+  "exitcode_stage_tests",
 ]);
+
+/** User-authorized pre-seal test staging stays small and single-window. */
+export const MAX_TEST_STAGINGS_PER_NODE = 3;
+export const MAX_STAGED_FILES = 32;
+export const MAX_STAGED_BYTES = 1024 * 1024;
 
 /** The loop only. Tools explain how to act; the supervisor enforces invariants. */
 export const PROTOCOL_PROMPT =
   "EXITCODE MODE. Understand the user's goal and inspect the project before changing it. " +
   "Before implementation, submit the smallest observable acceptance contract to ExitCode; ask the user only when ambiguity materially changes success. " +
-  "Keep the candidate unchanged until ExitCode validates the evaluator and the user approves the plan; follow tool diagnostics and next actions to repair it. " +
+  "Keep product files unchanged until ExitCode validates the evaluator and the user approves the plan; request exitcode_stage_tests when acceptance tests need pre-seal edits, and follow diagnostics to repair the evaluator. " +
   "After sealing, implement toward failing criteria, evaluate after meaningful changes, and use a child only when a smaller goal helps one failing parent criterion. " +
   "Only a fresh root PASS completes the goal; pauses, errors, and child PASS do not.";
 
@@ -684,6 +690,67 @@ function candidateChanges(cwd, manifest,options) {
 
 const unchanged = (changes) => changes.modified.length + changes.added.length + changes.removed.length === 0;
 
+/** Split pre-seal changes into stageable test files and immutable product files. */
+function partitionStagedChanges(changes, staging) {
+  const test = { modified: [], added: [], removed: [] };
+  const product = { modified: [], added: [], removed: [] };
+  const allowed = rel => isTestPath(rel) && (!staging?.paths || staging.paths.includes(rel));
+  for (const entry of changes.modified) (allowed(entry.rel) && entry.link === undefined ? test : product).modified.push(entry);
+  for (const entry of changes.added) (allowed(entry.rel) && entry.link === undefined ? test : product).added.push(entry);
+  for (const rel of changes.removed) (allowed(rel) ? test : product).removed.push(rel);
+  return { test, product };
+}
+
+/** Restore only product files from a trusted snapshot; staged test files stay in place. */
+function restoreProductChanges(cwd, snapDir, manifest, product, options = {}) {
+  const running = () => ensureRunning(options.signal, options.deadlineAt, options.nowMs);
+  const payload = checkpointPayload(snapDir, manifest, options);
+  const wanted = new Map((manifest?.files ?? []).map((f) => [f.path, f]));
+  const restored = [], removed = [];
+  for (const entry of product.added) {
+    running();
+    fs.rmSync(entry.full, { force: true });
+    removed.push(entry.rel);
+  }
+  for (const rel of removed) {
+    for (let dir = path.dirname(path.join(cwd, rel)); dir !== cwd && dir.startsWith(cwd + path.sep); dir = path.dirname(dir)) {
+      try { fs.rmdirSync(dir); } catch { break; }
+    }
+  }
+  const restoreOne = (rel) => {
+    running();
+    const file = wanted.get(rel);
+    if (!file) throw operationError("RESTORATION_FAILED", `baseline entry missing: ${rel}`);
+    const dest = path.join(cwd, rel);
+    let parent = path.dirname(dest);
+    const parents = [];
+    while (parent !== cwd && parent.startsWith(cwd + path.sep)) { parents.unshift(parent); parent = path.dirname(parent); }
+    for (const dir of parents) { try { if (fs.lstatSync(dir).isSymbolicLink()) fs.unlinkSync(dir); } catch (e) { if (e.code !== "ENOENT") throw e; } fs.mkdirSync(dir, { recursive: true }); }
+    try { const stat = fs.lstatSync(dest); if (stat.isSymbolicLink() || stat.isFile()) fs.unlinkSync(dest); else if (stat.isDirectory()) fs.rmSync(dest, { recursive: true }); } catch (e) { if (e.code !== "ENOENT") throw e; }
+    if (file.link !== undefined) { fs.symlinkSync(file.link, dest); restored.push(rel); return; }
+    fs.copyFileSync(path.join(payload, rel), dest, fs.constants.COPYFILE_FICLONE);
+    if (file.mode !== undefined) fs.chmodSync(dest, file.mode);
+    restored.push(rel);
+  };
+  for (const entry of product.modified) restoreOne(entry.rel);
+  for (const rel of product.removed) restoreOne(rel);
+  for (const rel of [...product.modified.map((e) => e.rel), ...product.removed]) {
+    running();
+    const file = wanted.get(rel), full = path.join(cwd, rel);
+    if (file.link !== undefined ? fs.readlinkSync(full) !== file.link : fileDigest(full, options) !== file.sha || file.mode !== undefined && (fs.statSync(full).mode & 0o777) !== file.mode)
+      throw operationError("RESTORATION_FAILED", `restored identity differs: ${rel}`);
+  }
+  running();
+  return { restored, removed };
+}
+
+/** Open test-staging window for the current unsealed scope, if any. */
+function openStagingForScope(io, scope) {
+  if (!isValidNodeId(scope)) return null;
+  const node = loadNodeState(io, scope);
+  return node?.status === NodeState.DRAFT && node.testStaging?.status === "open" ? node : null;
+}
+
 function describeChanges(changes) {
   const list = (label, rels) => rels.length === 0 ? [] :
     [`${label} ${rels.slice(0, 8).join(", ")}${rels.length > 8 ? ` and ${rels.length - 8} more` : ""}`];
@@ -737,14 +804,36 @@ function restoreBaseline(io) {
     return { ok: true };
   }
   const manifest = record.unrestorable ? null : readJson(p.manifest);
+  const staging = openStagingForScope(io, scope);
   if (!manifest) {
     if (record.digest == null || digestTree(io.cwd) === record.digest) return { ok: true };
+    if (staging) return { ok: false, restored: false, message: `Candidate changed during test staging and cannot be restored (${record.unrestorable ?? "baseline snapshot missing"}). Revert the changes, or the user can cancel with /exitcode exit.` };
     // Digest-bound preparation evidence for the previous candidate is already stale.
     captureBaseline(io, scope);
     return { ok: false, restored: false, message: `Candidate changed before sealing and cannot be restored (${record.unrestorable ?? "baseline snapshot missing"}). The change is kept as the new pre-seal baseline; prepare the evaluator again.` };
   }
   const changes = candidateChanges(io.cwd, manifest,options);
   if (unchanged(changes)) return { ok: true };
+  if (staging) {
+    const { test, product } = partitionStagedChanges(changes, staging.testStaging);
+    if (unchanged(product)) return { ok: true, staging: true };
+    const summary = describeChanges(product);
+    let saved;
+    try {
+      saved = saveDiscarded(io.cwd, { modified: product.modified, added: product.added, removed: product.removed });
+    } catch (error) {
+      return { ok: false, restored: false, message: `Only conventional test files may change during test staging (${summary}), but the product files could not be saved for recovery (${error.message}), so they were left in place. Revert them, or the user can cancel with /exitcode exit.` };
+    }
+    try {
+      restoreProductChanges(io.cwd, p.tree, manifest, product, options);
+      const left = partitionStagedChanges(candidateChanges(io.cwd, manifest, options), staging.testStaging).product;
+      if (!unchanged(left)) return { ok: false, restored: false, discarded: saved, message: `Only conventional test files may change during test staging (${summary}) and product restoration failed (still ${describeChanges(left)}). The product files are saved in ${saved}. Revert the remaining changes, or the user can cancel with /exitcode exit.` };
+    } catch (error) {
+      return { ok: false, restored: false, discarded: saved, message: `Only conventional test files may change during test staging (${summary}) and product restoration failed (${error.message}). The product files are saved in ${saved}. Revert the remaining changes, or the user can cancel with /exitcode exit.` };
+    }
+    const kept = describeChanges(test);
+    return { ok: false, restored: true, discarded: saved, staging: true, message: `Only conventional test files may change during test staging (${summary}). Product files were restored to the pre-seal baseline; the discarded files are saved in ${saved} for the user. Staged test changes were kept${kept === "unlisted changes" ? "" : ` (${kept})`}.` };
+  }
   const summary = describeChanges(changes);
   let saved;
   try {
@@ -773,6 +862,183 @@ function onBaseline(io, operation) {
   const report = (result) => guard.ok ? result : { ...result, warnings: [guard.message, ...(result.warnings ?? [])] };
   const result = operation();
   return typeof result?.then === "function" ? result.then(report) : report(result);
+}
+
+// ---------------------------------------------------------------------------
+// User-authorized pre-seal test staging. The product candidate stays frozen;
+// only conventional TEST_PATH files may change inside one approved window.
+// Completion snapshots the staged tests as the new pre-seal baseline and
+// invalidates prior preparation, so seal still freezes validated evidence.
+// ---------------------------------------------------------------------------
+
+function stagingLeaf(io, nodeId) {
+  const index = loadIndex(io.cwd);
+  const root = index.activeRootId ? loadRoot(io, index.activeRootId) : null;
+  const node = nodeId ? loadNodeState(io, nodeId) : null;
+  if (!root || root.status !== NodeState.ACTIVE) return { error: "no active root; resume any pause before staging tests" };
+  if (!node || node.rootId !== root.id) return { error: `unknown node ${nodeId}` };
+  if (node.status !== NodeState.DRAFT) return { error: `${node.id} is ${node.status}; only DRAFT nodes can stage tests` };
+  if (node.parentId) return { error: "test staging must precede root sealing; a child cannot change its sealed ancestor's acceptance assets. Use the frozen tests or a check with a confined witness instead." };
+  if (leafOf(root) !== node.id) return { error: `stage tests on the active leaf ${leafOf(root)} before its ancestors` };
+  if (baselineScope(io) !== node.id) return { error: `${node.id} is not the current unsealed phase` };
+  return { root, node };
+}
+
+function normalizeStagingPaths(cwd, paths) {
+  if (paths === undefined) return { ok: true };
+  if (!Array.isArray(paths) || paths.length === 0 || paths.length > MAX_STAGED_FILES)
+    return { ok: false, error: `staging paths must list 1-${MAX_STAGED_FILES} conventional test files` };
+  const normalized = [];
+  for (const raw of paths) {
+    if (!nonEmptyString(raw)) return { ok: false, error: "staging paths must be nonempty candidate-relative paths" };
+    let rel;
+    try { safePath(cwd, raw.trim()); rel = path.posix.normalize(raw.trim()); } catch (e) { return { ok: false, error: `unsafe staging path ${raw.trim()}: ${e.message}` }; }
+    if (!isTestPath(rel)) return { ok: false, error: `staging path is not a conventional test file: ${rel}` };
+    if (fs.existsSync(path.join(cwd, rel)) && !fs.statSync(path.join(cwd, rel)).isFile()) return { ok: false, error: `staging path must be a file: ${rel}` };
+    normalized.push(rel);
+  }
+  return { ok: true, paths: [...new Set(normalized)] };
+}
+
+function stagingNext(node) {
+  if (node.testStaging?.status === "open")
+    return `edit only conventional test files for ${node.id}, then complete staging with exitcode_stage_tests`;
+  if (node.testStaging?.status === "requested")
+    return `present the ${node.id} test-staging request and wait for the user's reply; quote it to open the window`;
+  return `prepare or repair ${node.id} evaluator before user review`;
+}
+
+function invalidateStagingEvidence(io, root, node) {
+  delete node.prepared;
+  delete node.preparedDigest;
+  node.phase = "EVALUATOR_PREPARATION";
+  delete root.approval;
+  delete root.validatedBundleDigest;
+  saveRoot(io, root);
+}
+
+/** Agent declares why conventional tests must change before validation. */
+export function requestTestStaging(io, nodeId, { reason, paths } = {}) {
+  return workspaceOperation(io, "stage", (locked) => onBaseline(locked, () => {
+    const leaf = stagingLeaf(locked, nodeId);
+    if (leaf.error) return { ok: false, errors: [leaf.error] };
+    const { root, node } = leaf;
+    if (node.testStaging?.status === "open") return { ok: false, errors: [`${node.id} already has an open test-staging window; complete it before requesting again`] };
+    if ((node.testStagingsCompleted ?? 0) >= MAX_TEST_STAGINGS_PER_NODE)
+      return { ok: false, errors: [`${node.id} already used ${MAX_TEST_STAGINGS_PER_NODE} test stagings; revise the contract instead`] };
+    if (!nonEmptyString(reason)) return { ok: false, errors: ["reason must explain which acceptance tests need to change and why"] };
+    if (reason.trim().length > 1000) return { ok: false, errors: ["staging reason must be under 1000 characters"] };
+    const normalized = normalizeStagingPaths(locked.cwd, paths);
+    if (!normalized.ok) return { ok: false, errors: [normalized.error] };
+    invalidateStagingEvidence(locked, root, node);
+    node.testStaging = { status: "requested", reason: reason.trim(), ...(normalized.paths ? { paths: normalized.paths } : {}), requestedAt: locked.nowMs() };
+    saveNodeState(locked, node);
+    return { ok: true, id: node.id, status: "requested", reason: node.testStaging.reason, paths: node.testStaging.paths ?? null, next: stagingNext(node) };
+  }));
+}
+
+/** One user reply opens the window. Direct /exitcode commands omit the quote. */
+export function approveTestStaging(io, nodeId, { userApproval } = {}) {
+  return workspaceOperation(io, "stage", (locked) => onBaseline(locked, () => {
+    const leaf = stagingLeaf(locked, nodeId);
+    if (leaf.error) return { ok: false, errors: [leaf.error] };
+    const { node } = leaf;
+    if (!node.testStaging || node.testStaging.status !== "requested")
+      return { ok: false, errors: node.testStaging?.status === "open" ? [`${node.id} test staging is already open`] : [`${node.id} has no test-staging request; request it with exitcode_stage_tests first`] };
+    if ((node.testStagingsCompleted ?? 0) >= MAX_TEST_STAGINGS_PER_NODE)
+      return { ok: false, errors: [`${node.id} already used ${MAX_TEST_STAGINGS_PER_NODE} test stagings; revise the contract instead`] };
+    if (userApproval !== undefined && !nonEmptyString(userApproval)) return { ok: false, errors: ["staging approval reply must be a nonempty string"] };
+    if (userApproval !== undefined && userApproval.trim().length > 2000) return { ok: false, errors: ["staging approval reply must be under 2000 characters"] };
+    const p = baselinePaths(locked.cwd), record = readJson(p.record), manifest = readJson(p.manifest);
+    if (record?.scope !== node.id || record.unrestorable || !manifest) return { ok: false, errors: ["test staging needs a restorable pre-seal baseline; restore supervisor storage before opening the window"] };
+    checkpointPayload(p.tree, manifest, { signal: locked.signal });
+    node.testStaging.status = "open";
+    node.testStaging.approvedAt = locked.nowMs();
+    node.testStaging.approval = { approvedBy: "user", at: new Date(locked.nowMs()).toISOString(), ...(userApproval !== undefined ? { userReply: userApproval.trim() } : {}) };
+    saveNodeState(locked, node);
+    return { ok: true, id: node.id, status: "open", next: stagingNext(node) };
+  }));
+}
+
+/** Close the window, re-baseline staged tests, and require fresh validation. */
+export function completeTestStaging(io, nodeId) {
+  return workspaceOperation(io, "stage", (locked) => {
+    const leaf = stagingLeaf(locked, nodeId);
+    if (leaf.error) return { ok: false, errors: [leaf.error] };
+    const { root, node } = leaf;
+    if (!node.testStaging || node.testStaging.status !== "open")
+      return { ok: false, errors: node.testStaging?.status === "requested" ? [`${node.id} test staging awaits user approval; quote the reply to open it`] : [`${node.id} has no open test staging`] };
+    const warnings = [];
+    const options = { signal: locked.signal, deadlineAt: root.deadlineAt, nowMs: locked.nowMs };
+    const p = baselinePaths(locked.cwd);
+    const record = readJson(p.record);
+    if (record?.scope !== node.id) return { ok: false, errors: [`pre-seal baseline changed during test staging; request staging again`] };
+    const manifest = record.unrestorable ? null : readJson(p.manifest);
+    if (!manifest) {
+      if (record.digest == null || digestTree(locked.cwd) === record.digest) {
+        // No observable change; close the empty window without consuming the staging budget.
+        delete node.testStaging;
+        saveNodeState(locked, node);
+        return { ok: true, id: node.id, status: "completed", staged: { files: [], bytes: 0 }, warnings, next: stagingNext(node) };
+      }
+      return { ok: false, errors: [`Candidate changed during test staging and cannot be restored (${record.unrestorable ?? "baseline snapshot missing"}). Revert the changes, or the user can cancel with /exitcode exit.`] };
+    }
+    const changes = candidateChanges(locked.cwd, manifest, options);
+    let { test, product } = partitionStagedChanges(changes, node.testStaging);
+    if (!unchanged(product)) {
+      const summary = describeChanges(product);
+      let saved;
+      try {
+        saved = saveDiscarded(locked.cwd, { modified: product.modified, added: product.added, removed: product.removed });
+      } catch (error) {
+        return { ok: false, errors: [`Only conventional test files may change during test staging (${summary}), but the product files could not be saved for recovery (${error.message}), so they were left in place. Revert them, or the user can cancel with /exitcode exit.`] };
+      }
+      try {
+        restoreProductChanges(locked.cwd, p.tree, manifest, product, options);
+        const left = partitionStagedChanges(candidateChanges(locked.cwd, manifest, options), node.testStaging);
+        product = left.product;
+        test = left.test;
+        if (!unchanged(product)) return { ok: false, discarded: saved, errors: [`Only conventional test files may change during test staging (${summary}) and product restoration failed (still ${describeChanges(product)}). The product files are saved in ${saved}. Revert the remaining changes, or the user can cancel with /exitcode exit.`] };
+      } catch (error) {
+        return { ok: false, discarded: saved, errors: [`Only conventional test files may change during test staging (${summary}) and product restoration failed (${error.message}). The product files are saved in ${saved}. Revert the remaining changes, or the user can cancel with /exitcode exit.`] };
+      }
+      warnings.push(`Only conventional test files may change during test staging (${summary}). Product files were restored; the discarded files are saved in ${saved} for the user.`);
+    }
+    const files = [...test.modified.map((f) => f.rel), ...test.added.map((f) => f.rel), ...test.removed].sort();
+    const bytes = [...test.modified, ...test.added].reduce((n, f) => n + (f.link !== undefined ? Buffer.byteLength(f.link) : f.size ?? 0), 0);
+    if (files.length > MAX_STAGED_FILES || bytes > MAX_STAGED_BYTES)
+      return { ok: false, errors: [`staged test changes exceed the bounded window (${files.length} files, ${bytes} bytes; limits ${MAX_STAGED_FILES} files, ${MAX_STAGED_BYTES} bytes). Narrow the test update and complete again.`] };
+    // Validate the replacement snapshot before retiring the original baseline.
+    const next = fs.mkdtempSync(p.dir + "-staging-");
+    try {
+      const snap = snapshotTree(locked.cwd, path.join(next, "tree"), { writeManifest: false, ...options });
+      if (!snap.ok) return { ok: false, errors: [`cannot snapshot staged tests: ${snap.reason}`] };
+      const digest = digestTree(locked.cwd);
+      if (!unchanged(candidateChanges(locked.cwd, snap.manifest, options))) return { ok: false, errors: ["candidate changed while snapshotting staged tests; retry completion"] };
+      writeJsonAtomic(path.join(next, "manifest.json"), snap.manifest);
+      writeJsonAtomic(path.join(next, "baseline.json"), { version: 1, scope: node.id, digest, at: new Date(locked.nowMs()).toISOString() });
+      const previous = next + "-previous";
+      fs.renameSync(p.dir, previous);
+      try { fs.renameSync(next, p.dir); } catch (e) { fs.renameSync(previous, p.dir); throw e; }
+      fs.rmSync(previous, { recursive: true, force: true });
+    } finally { fs.rmSync(next, { recursive: true, force: true }); }
+    invalidateStagingEvidence(locked, root, node);
+    node.diagnostics = [];
+    if (!node.parentId) {
+      const draft = readJson(draftFile(locked.cwd, node.id))?.draft;
+      delete root.approval;
+      delete root.validatedBundleDigest;
+      if (draft) root.reviewDigest = rootReviewDigest(root, draft);
+      saveRoot(locked, root);
+    }
+    node.testStagingsCompleted = (node.testStagingsCompleted ?? 0) + (files.length ? 1 : 0);
+    node.testStagingHistory ??= [];
+    node.testStagingHistory.push({ reason: node.testStaging.reason, paths: node.testStaging.paths ?? null, requestedAt: node.testStaging.requestedAt,
+      approvedAt: node.testStaging.approvedAt, approval: node.testStaging.approval, completedAt: locked.nowMs(), files, bytes });
+    delete node.testStaging;
+    saveNodeState(locked, node);
+    return { ok: true, id: node.id, status: "completed", staged: { files, bytes }, warnings, next: `revise ${node.id} with exitcode_draft and prepare the evaluator against the staged tests` };
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -1431,6 +1697,7 @@ function reviseDraft(io, index, args) {
   if (!root || node.rootId !== root.id || root.status !== NodeState.ACTIVE) {
     return { ok: false, errors: [`${node.id} does not belong to the active root`] };
   }
+  if (node.testStaging?.status === "open") return { ok: false, errors: [`${node.id} has an open test-staging window; complete it with exitcode_stage_tests before revising`] };
   const withIds = normalizeEvaluator({criteria:assignCriterionIds(args.criteria)}).draft.criteria;
   const previous = readJson(draftFile(io.cwd, node.id))?.draft;
   const warnings = [];
@@ -1509,6 +1776,8 @@ function reviseDraft(io, index, args) {
   if (!validation.ok) return { ok: false, errors: validation.errors };
   node.phase = "EVALUATOR_PREPARATION";
   delete node.prepared;
+  // Revision abandons an unopened proposal; open staging must be completed.
+  if (node.testStaging?.status === "requested") delete node.testStaging;
   node.evaluatorMetrics ??= emptyMetrics();
   node.evaluatorMetrics.evaluatorProposals++;
   saveNodeState(io,node);
@@ -1560,6 +1829,7 @@ function approveDraft(io, { userReply } = {}) {
   if (!root || root.status !== NodeState.ACTIVE || node?.status !== NodeState.DRAFT) {
     return { ok: false, errors: ["no DRAFT root to approve"] };
   }
+  if (node.testStaging) return { ok: false, errors: [`${node.id} test staging is ${node.testStaging.status}; complete it with exitcode_stage_tests before approval`] };
   if (isExpired(root,io.nowMs())) return expiredDraftResult(root,node,readJson(draftFile(io.cwd,root.id))?.draft,io.nowMs());
   if (node.phase !== "READY_FOR_APPROVAL" || !preparationMatches(io, node)) return {ok:false, errors:["root evaluator must be prepared and validated before approval; candidate or environment may have changed"]};
   const draft = readJson(draftFile(io.cwd, root.id))?.draft;
@@ -1631,6 +1901,7 @@ async function prepareDraft(io, nodeId) {
   const node=root?loadNodeState(io,nodeId??leafOf(root)):null;
   if(node && leafOf(root)!==node.id)return {ok:false,errors:["prepare the active leaf before its ancestors"]};
   if(!root||root.status!==NodeState.ACTIVE||!node||node.rootId!==root.id||node.status!==NodeState.DRAFT)return {ok:false,errors:["no editable DRAFT evaluator; resume any infrastructure pause first"]};
+  if(node.testStaging)return {ok:false,errors:[`${node.id} test staging is ${node.testStaging.status}; complete it with exitcode_stage_tests before preparation`]};
   const stored=readJson(draftFile(io.cwd,node.id));if(!stored?.draft)return {ok:false,errors:["missing draft"]};
   if(isExpired(root,io.nowMs()))return pauseRoot(io,root,{code:"BUDGET_EXHAUSTED",reason:"shared execution deadline exceeded",operation:"prepare",nodeId:node.id});
   if(node.preparing)return {ok:false,errors:["evaluator preparation already in progress; resume interrupted work first"]};
@@ -1724,6 +1995,7 @@ async function sealPrepared(io, nodeId, { userApproval } = {}) {
   if(node.status===NodeState.ACTIVE && verifyBundle(loadBundle(io,nodeId),node).ok){releasePreparation(io.cwd);releaseBaseline(io.cwd);return {ok:true,sealed:nodeId,alreadySealed:true,baseline:formatVector(node.lastResult?.outcomes??[]),next:nextAction(root,node,null,io.nowMs())};}
   if (node.status !== NodeState.DRAFT) return { ok: false, errors: [`${nodeId} is ${node.status}; only DRAFT nodes can be sealed`] };
   if (root.status !== NodeState.ACTIVE) return { ok: false, errors: [`root ${root.id} is ${root.status}`] };
+  if (node.testStaging) return { ok: false, errors: [`${nodeId} test staging is ${node.testStaging.status}; complete it with exitcode_stage_tests before sealing`] };
 
   const stored = readJson(draftFile(io.cwd, nodeId));
   if (!stored?.draft) return { ok: false, errors: [`draft for ${nodeId} is missing`] };
@@ -2085,6 +2357,7 @@ async function blockActive(io,nodeId,{reason,code="NO_PATH"}) {
   if(!root||!node||node.rootId!==root.id)return {ok:false,errors:[`unknown node ${nodeId}`]};
   if(!nonEmptyString(reason))return {ok:false,errors:["reason must name the specific missing requirement or cause"]};
   if(!BLOCK_CODES.includes(code))return {ok:false,errors:[`code must be one of ${BLOCK_CODES.join(", ")}`]};
+  if(code==="AUTHORIZATION_MISSING" && node.testStaging)return {ok:false,errors:["test staging has its own approval workflow; follow exitcode_stage_tests and the current next action instead of pausing with AUTHORIZATION_MISSING"]};
   if([NodeState.PASS,NodeState.BLOCKED].includes(node.status))return {ok:true,node:node.id,status:node.status};
   if(root.status===NodeState.PAUSED)return {ok:false,errors:["resume the saved pause before replacing its operation"]};
   if(!node.parentId || code!=="NO_PATH")
@@ -2113,6 +2386,8 @@ export function nextAction(root, node, draft = null, nowMs = Date.now()) {
   if(root?.status===NodeState.PAUSED)return `PAUSED (${root.pause?.code}): ${root.pause?.reason}. Restore the prerequisite, then /exitcode resume. Execution budget never resets.`;
   if (!node) return "no active node";
   if (node.status === NodeState.DRAFT) {
+    if (node.testStaging?.status === "open") return stagingNext(node);
+    if (node.testStaging?.status === "requested") return stagingNext(node);
     if (isExpired(root, nowMs)) {
       return policyEditable(root, node)
         ? `shared deadline exceeded; revise ${node.id} with a larger finite policy and present the entire contract again, or the user can cancel with /exitcode exit`
@@ -2154,13 +2429,16 @@ export function statusSnapshot(io) {
   const leaf = leafId ? loadNodeState(io, leafId) : null;
   const rootNode = loadNodeState(io, root.id);
   const rootDraft = rootNode?.status === NodeState.DRAFT ? readJson(draftFile(io.cwd, root.id))?.draft : null;
-  const awaitingApproval = rootNode?.status === NodeState.DRAFT && rootNode.phase === "READY_FOR_APPROVAL" && !approvalMatches(root, rootDraft);
+  const awaitingApproval = rootNode?.status === NodeState.DRAFT && !rootNode.testStaging && rootNode.phase === "READY_FOR_APPROVAL" && !approvalMatches(root, rootDraft);
+  const staging = leaf?.testStaging ? { node: leaf.id, status: leaf.testStaging.status, reason: leaf.testStaging.reason,
+    paths: leaf.testStaging.paths ?? null, completed: leaf.testStagingsCompleted ?? 0 } : null;
   return {
     active: true,
     root: root.id,
     status: root.status,
     stack: root.stack,
     nodes,
+    staging,
     consumedAttempts: root.consumedAttempts,
     maxTotalAttempts: root.attemptLimit??root.policy.maxTotalAttempts,
     ...policyStatus(root, rootNode, io.nowMs()),
@@ -2169,12 +2447,13 @@ export function statusSnapshot(io) {
     executionGrants: root.executionGrants??[],
     acceptanceRestorations:root.acceptanceRestorations??[],
     awaitingApproval,
-    phase: root.status===NodeState.PAUSED?"PAUSED":leaf?.phase ?? (leaf?.status === NodeState.DRAFT ? "EVALUATOR_PREPARATION" : "EXECUTION"),
+    phase: root.status===NodeState.PAUSED?"PAUSED":leaf?.testStaging ? "TEST_STAGING" : leaf?.phase ?? (leaf?.status === NodeState.DRAFT ? "EVALUATOR_PREPARATION" : "EXECUTION"),
     intentDigest: rootDraft ? intentDigestOf(rootDraft) : loadBundle(io,root.id)?.intentDigest,
     evaluatorDigest: rootDraft ? evaluatorDigestOf(rootDraft) : loadBundle(io,root.id)?.evaluatorDigest,
     evaluatorMetrics: rootNode?.evaluatorMetrics ?? emptyMetrics(),
     diagnostics: leaf?.diagnostics ?? [],
     evaluatorEvidence: rootNode?.prepared ?? null,
+    stagingHistory: leaf?.testStagingHistory ?? [],
     originalRequest: rootDraft?.originalRequest ?? loadBundle(io,root.id)?.contract.originalRequest,
     contract: rootDraft ?? loadBundle(io,root.id)?.contract,
     review: awaitingApproval ? rootReviewText(rootDraft, root, io.nowMs(), rootNode.prepared) : null,
@@ -2207,6 +2486,7 @@ export function promptStatusText(io) {
   for (const c of contract?.criteria ?? []) lines.push(`  ${c.id}${c.type === "regression" ? " (regression)" : ""}: ${clip(c.requirement, 120)}`);
   lines.push(`approval: ${snap.awaitingApproval ? "awaiting the user's reply to the validated plan" : snap.approval ? "approved" : "none"}`);
   lines.push(`budget: ${snap.consumedAttempts}/${snap.maxTotalAttempts} attempts; ${snap.clockStarted ? `${(snap.remainingMs / 60000).toFixed(1)} min left` : "clock starts at root seal"}${snap.expired ? " (EXPIRED)" : ""}`);
+  if (snap.staging) lines.push(`staging: ${snap.staging.node} ${snap.staging.status}: ${clip(snap.staging.reason, 160)}`);
   if (snap.pause) lines.push(`pause: ${snap.pause.code}: ${clip(snap.pause.reason, 200)}`);
   const shown = snap.diagnostics.slice(0, 6);
   for (const d of shown) lines.push(`diagnostic: ${diagnosticLine(d, 160)}`);
@@ -2232,10 +2512,12 @@ export function statusText(io, { detail = "normal" } = {}) {
   lines.push(`  remaining: ${(snap.remainingMs / 60000).toFixed(2)} minutes; policy ${snap.policyEditable ? "editable before approval" : "locked"}${snap.clockStarted?"":"; execution clock not started"}`);
   if (snap.executionGrants.length) lines.push(`  execution grants: ${JSON.stringify(snap.executionGrants)}`);
   if (snap.acceptanceRestorations.length) lines.push(`  acceptance restorations: ${JSON.stringify(snap.acceptanceRestorations)}`);
+  if (snap.staging) lines.push(`  test staging: ${snap.staging.node} ${snap.staging.status}: ${snap.staging.reason}${snap.staging.paths ? ` (${snap.staging.paths.join(", ")})` : ""}`);
   lines.push(`  phase: ${snap.phase}`, ...(snap.pause?[`  pause: ${snap.pause.code}: ${snap.pause.reason}`]:[]));
   if (detail === "evidence") {
     lines.push(`  evaluator metrics: ${JSON.stringify(snap.evaluatorMetrics)}`, `  intent digest: ${snap.intentDigest}`, `  evaluator digest: ${snap.evaluatorDigest}`,
-      `  diagnostics: ${JSON.stringify(snap.diagnostics)}`, `  evaluator evidence: ${JSON.stringify(snap.evaluatorEvidence)}`, `  contract: ${JSON.stringify(snap.contract)}`);
+      `  diagnostics: ${JSON.stringify(snap.diagnostics)}`, `  evaluator evidence: ${JSON.stringify(snap.evaluatorEvidence)}`,
+      `  test staging history: ${JSON.stringify(snap.stagingHistory)}`, `  contract: ${JSON.stringify(snap.contract)}`);
   } else {
     for (const d of snap.diagnostics) lines.push(`  - ${diagnosticLine(d, 400)}${d?.recommendedRepair ? ` (${d.recommendedRepair})` : ""}`);
   }
@@ -2269,4 +2551,4 @@ export function resumePreparation(io) {
   });
 }
 
-export { reviewPrompt, REVIEW_TIMEOUT_MS, REVIEW_MAX_TOKENS } from './exitcode-quality.mjs';
+export { reviewPrompt, REVIEW_TIMEOUT_MS, REVIEW_MAX_TOKENS, REVIEW_TOOL_NAME, parseReviewText } from './exitcode-quality.mjs';

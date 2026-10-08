@@ -36,9 +36,9 @@ const CheckSchema = Type.Object({
   recipe: Type.Optional(Type.Object({
     kind: Type.Union(core.RECIPE_KINDS.map((x: string) => Type.Literal(x))),
     path: Type.Optional(Type.String()), value: Type.Optional(Type.Unknown()),
-    pointer: Type.Optional(Type.String()), selector: Type.Optional(Type.String()),
-    runner: Type.Optional(Type.String()), command: Type.Optional(Type.String()),
-    args: Type.Optional(Type.Array(Type.String())),
+    pointer: Type.Optional(Type.String()), selector: Type.Optional(Type.String({ description: "existing_test: exact discovered literal name already present in the file; never invent a future test name" })),
+    runner: Type.Optional(Type.String()), command: Type.Optional(Type.String({ description: "command_exit: executable basename (e.g. sh), with args separately; custom_command: shell string (e.g. sh scripts/verify)" })),
+    args: Type.Optional(Type.Array(Type.String(), { description: "command_exit arguments, e.g. [scripts/verify] with command sh; test_suite runs the discovered npm test script" })),
   })),
   assets: Type.Optional(Type.Array(Type.String({minLength:1}), {description:"Acceptance helpers outside conventional test paths; frozen at seal, not product source"})),
   timeoutSeconds: Type.Optional(Type.Number({ description: "Immutable explicit check watchdog; otherwise use remaining execution time" })),
@@ -62,9 +62,52 @@ const ControlsSchema = Type.Object({
   "Built-in file recipes and checks that already pass need none; supply accept only when the check cannot pass on the current candidate. " +
   "ExitCode derives independent negatives."});
 
+const ReviewDeriveSchema = Type.Object({
+  uncovered: Type.Optional(Type.Array(Type.String(), {maxItems:16})),
+  criteria: Type.Array(Type.Object({
+    criterionId: Type.String(),
+    observation: Type.String(),
+    structural: Type.Optional(Type.Boolean()),
+    nearMisses: Type.Optional(Type.Array(Type.String(), {maxItems:2})),
+    negative: Type.Optional(Type.String()),
+    regression: Type.Optional(Type.String()),
+  })),
+});
+const ReviewAssessSchema = Type.Object({
+  criteria: Type.Array(Type.Object({
+    criterionId: Type.String(),
+    outcomeObserved: Type.Boolean(),
+    negativeCovered: Type.Optional(Type.Boolean()),
+    regressionCriteria: Type.Optional(Type.Array(Type.String())),
+    shams: Type.Array(Type.Object({
+      id: Type.String(),
+      mutations: Type.Array(MutationSchema, {minItems:1,maxItems:32}),
+    })),
+  })),
+  issues: Type.Array(Type.Object({
+    code: Type.String(),
+    criterionId: Type.Union([Type.String(), Type.Null()]),
+    evidence: Type.String(),
+  }), {maxItems:32}),
+});
+
+// Each isolated semantic-review call gets exactly this one response tool.
+// Constrained sampling is preferred where supported; plain-JSON text stays
+// as a compatibility fallback for providers without tool support.
+function reviewTool(phase: string) {
+  return {
+    name: core.REVIEW_TOOL_NAME,
+    description: phase === "derive"
+      ? "Submit independently derived outcomes for each behavior criterion"
+      : "Submit assessment of each check against the derived outcomes",
+    parameters: phase === "derive" ? ReviewDeriveSchema : ReviewAssessSchema,
+    constrainedSampling: { type: "json_schema", strict: "prefer" },
+  };
+}
+
 const CriterionSchema = Type.Object({
   id: Type.Optional(Type.String({ description: "Suggested id (supervisor assigns C1..Cn when omitted)" })),
-  requirement: Type.String({ description: "Observable requirement in plain language" }),
+  requirement: Type.String({ description: "One independently observable outcome in plain language; split unrelated behaviors into separate criteria" }),
   type: Type.Optional(Type.Union([Type.Literal("behavior"), Type.Literal("regression")], { description: "behavior (default) or regression" })),
   check: CheckSchema,
   controls: Type.Optional(ControlsSchema),
@@ -147,9 +190,11 @@ function reviewIo(ctx: ExtensionContext, signal?: AbortSignal, onProgress?: (pro
       if (!ctx.model || !ctx.modelRegistry?.streamSimple) throw new Error("selected review model unavailable");
       const encoded=JSON.stringify(input);
       if(encoded.length>2*1024*1024)throw new Error("review input exceeds bounded context; reduce evaluator scope");
+      const tool=reviewTool(input.phase);
       const result=await ctx.modelRegistry.streamSimple(ctx.model, {
         systemPrompt:core.reviewPrompt(input.phase),
         messages:[{role:"user",content:encoded,timestamp:Date.now()}],
+        tools:[tool],
       }, {reasoning:ctx.thinkingLevel,maxTokens:core.REVIEW_MAX_TOKENS,signal:options.signal}).result();
       // Provider errors can still carry billable usage.
       if(result.usage)usage.available=true;
@@ -157,10 +202,17 @@ function reviewIo(ctx: ExtensionContext, signal?: AbortSignal, onProgress?: (pro
         usage[k]+=result.usage?.[k] ?? 0;
       for(const k of ["input","output","cacheRead","cacheWrite","total"] as const)
         usage.cost[k]+=result.usage?.cost?.[k] ?? 0;
-      if(result.stopReason!=="stop")throw Object.assign(new Error(result.errorMessage ?? `review stopped: ${result.stopReason}`),result.stopReason==="aborted"?{code:"CANCELLED"}:result.stopReason==="length"?{code:"REVIEW_RESPONSE_INVALID"}:{});
+      if(result.stopReason!=="stop"&&result.stopReason!=="toolUse")throw Object.assign(new Error(result.errorMessage ?? `review stopped: ${result.stopReason}`),result.stopReason==="aborted"?{code:"CANCELLED"}:result.stopReason==="length"?{code:"REVIEW_RESPONSE_INVALID"}:{});
+      const call=(result.content??[]).find((b:any)=>b?.type==="toolCall"&&b?.name===tool.name);
+      if(call) {
+        const args=typeof call.arguments==="string"?core.parseReviewText(call.arguments):call.arguments;
+        const sized=JSON.stringify(args??null);
+        if(!sized||sized.length>512*1024)throw Object.assign(new Error("review output exceeds bounded response"),{code:"REVIEW_RESPONSE_INVALID"});
+        return args;
+      }
       const text=result.content.filter(b=>b.type==="text").map(b=>b.text).join("");
       if(text.length>512*1024)throw Object.assign(new Error("review output exceeds bounded response"),{code:"REVIEW_RESPONSE_INVALID"});
-      return JSON.parse(text);
+      return core.parseReviewText(text);
     },
   });
   return io;
@@ -312,7 +364,8 @@ export default function (pi: ExtensionAPI) {
       name: "exitcode_draft",
       label: "Exitcode Draft",
       description:
-        "Submit the smallest observable acceptance contract. Prefer existing tests and behavioral evidence over implementation-detail checks. " +
+        "Submit the smallest observable acceptance contract, one outcome per criterion. Prefer discovered existing tests; never invent an existing_test selector. " +
+        "For new behavior use a focused command with controls, or request exitcode_stage_tests before root sealing when tests must change; use test_suite for regression. " +
         "ExitCode validates it before user review; repair returned diagnostics, then present the returned plan and wait for the user's reply.",
       promptSnippet: "exitcode_draft: submit the root contract (goal + observable criteria + checks)",
       parameters: Type.Object({
@@ -438,7 +491,7 @@ export default function (pi: ExtensionAPI) {
     {
       name: "exitcode_block",
       label: "Exitcode Block",
-      description: "Pause with the concrete missing authority, infrastructure, budget, ambiguity, or viable path. On a child, withdraws that path and reruns its parent.",
+      description: "Pause for a concrete external authority, infrastructure, budget, ambiguity, or viable-path blocker. Test edits use exitcode_stage_tests; lint errors need evaluator repair. Only a child NO_PATH withdraws that path and reruns its parent.",
       promptSnippet: "exitcode_block: pause with the concrete missing requirement",
       parameters: Type.Object({
         node: Type.Optional(Type.String({ description: "Node id (defaults to the active leaf)" })),
@@ -461,6 +514,47 @@ export default function (pi: ExtensionAPI) {
         const lines = [...(result.events ?? [])];
         if (result.terminal) lines.push(`terminal: root ${result.terminal.root} ${result.terminal.status}`, "Enforcement remains on. Only the user can cancel with /exitcode exit.");
         return textResult(lines.join("\n"), result);
+      }),
+    },
+    {
+      name: "exitcode_stage_tests",
+      label: "Exitcode Stage Tests",
+      description: "Before root sealing, request, open, or complete a user-authorized window to edit conventional test files. Present the concrete reason and paths, quote the user's reply to open it, edit only those tests, then complete to re-baseline and revalidate. Pending staging waits without pausing the root. Seal still freezes the staged tests.",
+      promptSnippet: "exitcode_stage_tests: request, open, or complete a test-only pre-seal window",
+      parameters: Type.Object({
+        node: Type.Optional(Type.String({ description: "Draft node id (defaults to the active leaf)" })),
+        reason: Type.Optional(Type.String({ description: "Why acceptance tests must change before validation (requests a window)" })),
+        paths: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { description: "Exact conventional test files authorized for this window; omit to allow conventional test files within the staging limits" })),
+        userApproval: Type.Optional(Type.String({ minLength: 1, description: "Quote the user's reply authorizing test staging (e.g. 'yes, update the tests'). Silence or a change request is not approval." })),
+        complete: Type.Optional(Type.Boolean({ description: "Close the open window, re-baseline staged tests, and require fresh validation" })),
+      }),
+      execute: async (_id, params, _signal, _onUpdate, ctx) => withOperation(ctx,_signal,_onUpdate,async io => {
+        assertMode();
+        const actions = Number(params.complete === true) + Number(params.userApproval !== undefined) + Number(params.reason !== undefined);
+        if (actions !== 1 || params.paths !== undefined && params.reason === undefined)
+          return textResult("stage rejected:\n- supply exactly one action: reason (with optional paths), userApproval, or complete:true", { ok: false }, true);
+        const target = params.node ?? (() => {
+          const snap = core.statusSnapshot(io);
+          const stack = snap.stack ?? [];
+          return stack.length > 0 ? stack[stack.length - 1] : null;
+        })();
+        if (!target) return textResult("stage rejected:\n- no active node", { ok: false }, true);
+        const run = params.complete === true
+          ? core.completeTestStaging(io, target)
+          : params.userApproval !== undefined
+            ? core.approveTestStaging(io, target, { userApproval: params.userApproval })
+            : params.reason !== undefined
+              ? core.requestTestStaging(io, target, { reason: params.reason, paths: params.paths })
+              : { ok: false, errors: ["supply reason to request, userApproval to open, or complete:true to close test staging"] };
+        if (!run.ok) {syncBaseline(ctx);return textResult(`stage rejected:\n${errLines(run)}`, run, true);}
+        syncBaseline(ctx);
+        const lines = [`test staging ${run.status} for ${run.id}.`];
+        if (run.status === "requested") lines.push(`reason: ${run.reason}`, ...(run.paths?.length ? [`paths: ${run.paths.join(", ")}`] : []),
+          "Present this request and wait for the user's reply; quote it as userApproval to open the window.");
+        if (run.status === "open") lines.push("Edit only conventional test files; product changes are restored. Complete with exitcode_stage_tests when done.");
+        if (run.status === "completed") lines.push(`staged: ${run.staged.files.join(", ") || "(no test changes)"} (${run.staged.bytes} bytes).`);
+        if (run.next) lines.push(`next: ${run.next}`);
+        return textResult(withWarnings(lines, run.warnings).join("\n"), run);
       }),
     },
   ];
@@ -550,7 +644,7 @@ export default function (pi: ExtensionAPI) {
       if(root?.status==='PASS')maybeAutoExit({terminal:{root:root.id,status:root.status,outcome:root.outcome}},ctx);
       return undefined;
     }
-    if(snap.status==='PAUSED' || snap.awaitingApproval)return undefined;
+    if(snap.status==='PAUSED' || snap.awaitingApproval || snap.staging?.status==='requested')return undefined;
     const leafId=snap.stack?.at(-1),leaf=leafId?(snap.nodes as any)?.[leafId]:null;
     if(!leaf || !['ACTIVE','DRAFT'].includes(leaf.status))return undefined;
     if(snap.expired) {
@@ -581,6 +675,7 @@ export default function (pi: ExtensionAPI) {
       "/exitcode <goal>  enter exitcode mode rooted at your goal (root only; children come from exitcode_child)",
       "/exitcode approve optional shortcut to approve the root draft and start autonomous work",
       "/exitcode status [evidence]  show the active contract, vectors, and budgets (evidence adds full E0 evidence)",
+      "/exitcode stage-tests [approve]  show the test-staging request, or approve it to open a test-only pre-seal window",
       "/exitcode resume [Gid] [minutes=N] [attempts=N] [evaluators=N]  retry the same paused operation; optional positive grants require this user command",
       "/exitcode exit    user cancellation only; not successful completion (work on disk is preserved)",
     ].join("\n");
@@ -628,6 +723,46 @@ export default function (pi: ExtensionAPI) {
           display: true,
           details: result,
         }, { triggerTurn: rt.modeOn && core.statusSnapshot(io).status==="ACTIVE" });
+        return;
+      }
+      if (sub === "stage-tests") {
+        const rest = text.split(/\s+/).slice(1);
+        if (rest.length > 1 || (rest.length === 1 && rest[0] !== "approve")) {
+          ctx.ui.notify("Usage: /exitcode stage-tests [approve]", "warning");
+          return;
+        }
+        if (!rt.modeOn) {
+          ctx.ui.notify("Enter exitcode mode with /exitcode resume before staging tests.", "warning");
+          return;
+        }
+        const snap = core.statusSnapshot(core.makeIo(ctx.cwd, { expectedRootId: rt.rootId }));
+        const leafId = snap.stack?.at(-1);
+        const staging = (snap as any).staging;
+        if (!leafId || !staging) {
+          ctx.ui.notify("No test-staging request is pending. The agent requests one with exitcode_stage_tests when acceptance tests must change.", "info");
+          return;
+        }
+        if (rest.length === 0) {
+          ctx.ui.notify(`Test staging for ${staging.node} [${staging.status}]: ${staging.reason}${staging.paths?.length ? `\nPaths: ${staging.paths.join(", ")}` : ""}\n${snap.next}`, "info");
+          return;
+        }
+        if (!ctx.isIdle()) {
+          ctx.ui.notify("Wait for the agent to finish before approving test staging.", "warning");
+          return;
+        }
+        const approved = core.approveTestStaging(core.makeIo(ctx.cwd, { expectedRootId: rt.rootId }), leafId, {});
+        if (!approved.ok) {
+          ctx.ui.notify(withWarnings([`staging approval rejected:\n${errLines(approved)}`], (approved as any).warnings).join("\n"), "warning");
+          return;
+        }
+        rt.nudges = 0; rt.progress = undefined;
+        syncBaseline(ctx);
+        pi.sendMessage({
+          customType: "exitcode-staging",
+          content: `User approved test staging for ${leafId}. Edit only conventional test files, then complete staging with exitcode_stage_tests.`,
+          display: true,
+          details: approved,
+        }, { triggerTurn: true });
         return;
       }
       if (sub === "exit") {

@@ -96,7 +96,7 @@ test("adapter: mode exposes ExitCode tools without ever changing the user's load
   const original = ["bash", "read", "write", "codemode"];
   const h = harness(t, "todo\n", original);
   const loadout = () => h.getActiveTools().filter((name) => !core.EXITCODE_TOOL_NAMES.includes(name));
-  assert.equal(h.tools.size, 6);
+  assert.deepEqual([...h.tools.keys()].sort(), [...core.EXITCODE_TOOL_NAMES].sort());
   assert.equal(h.tools.get("exitcode_draft").exposure, "hidden");
   assert.equal(h.events.get("tool_call")({ toolName: "write", input: { path: ".exitcode/index.json" } }, h.ctx), undefined, "inert when off");
   await h.command("Add the feature");
@@ -205,6 +205,70 @@ test("adapter: approval comes from a plain-English reply or /exitcode approve, a
   assert.match(c.messages.at(-1).content, /modified feature\.txt/);
   assert.equal(c.messages.at(-1).triggerTurn, true);
   assert.equal(feature(c), "todo\n");
+});
+
+test("adapter: stage-tests opens a bounded test-only window without leaving mode or pausing for approval", async (t) => {
+  for (const approval of ["reply", "command"]) await t.test(approval, async (t) => {
+    const h = harness(t);
+    fs.writeFileSync(path.join(h.cwd, "proof.test.mjs"), "old acceptance");
+    const literalCriteria = [
+      { id: "C1", requirement: "Artifact says done", check: { recipe: { kind: "file_contains", path: "feature.txt", value: "done" } } },
+      { id: "C2", type: "regression", requirement: "Artifact remains", check: { recipe: { kind: "file_exists", path: "feature.txt" } } },
+    ];
+    await draft(h, { criteria: literalCriteria });
+    const request = await h.tool("exitcode_stage_tests", { reason: "Update the acceptance assertion for the requested behavior", paths: ["proof.test.mjs"] });
+    assert.equal(request.details.status, "requested");
+    assert.match(request.content[0].text, /quote it as userApproval/);
+    assert.match(promptText(h), /phase TEST_STAGING/);
+    assert.equal(core.statusSnapshot(io(h)).awaitingApproval, false);
+    for (let i = 0; i <= core.MAX_SETTLE_NUDGES; i++) assert.equal(await settle(h), undefined, "pending staging waits without a continuation loop");
+    assert.equal(core.loadRoot(io(h), "G1").status, "ACTIVE");
+    assert.equal((await h.tool("exitcode_stage_tests", { complete: true })).isError, true);
+    assert.equal((await h.tool("exitcode_stage_tests", { reason: "Update", userApproval: "yes" })).isError, true);
+    await h.command("stage-tests");
+    assert.match(h.notifications.at(-1).content, /proof\.test\.mjs/);
+    await h.command("approve");
+    assert.equal(core.loadNodeState(io(h), "G1").status, "DRAFT");
+    await h.reload();
+    assert.equal(core.statusSnapshot(io(h)).staging.status, "requested");
+    if (approval === "reply") {
+      await h.reply("Yes, update proof.test.mjs");
+      assert.equal(core.statusSnapshot(io(h)).staging.status, "requested", "a user message alone does not approve a window");
+      const opened = await h.tool("exitcode_stage_tests", { userApproval: "Yes, update proof.test.mjs" });
+      assert.equal(opened.details.status, "open");
+    } else {
+      h.setIdle(false);
+      await h.command("stage-tests approve");
+      assert.match(h.notifications.at(-1).content, /Wait for the agent/);
+      h.setIdle(true);
+      await h.command("stage-tests approve");
+      assert.equal(h.messages.at(-1).customType, "exitcode-staging");
+      assert.equal(h.messages.at(-1).triggerTurn, true);
+    }
+    await h.reload();
+    assert.equal(core.statusSnapshot(io(h)).staging.status, "open");
+    assert.equal((await settle(h)).continue, true, "an authorized staging window continues work");
+    fs.writeFileSync(path.join(h.cwd, "proof.test.mjs"), "new acceptance");
+    fs.writeFileSync(path.join(h.cwd, "feature.txt"), "premature implementation");
+    assert.equal((await settle(h)).continue, true);
+    assert.equal(feature(h), "todo\n");
+    assert.equal(fs.readFileSync(path.join(h.cwd, "proof.test.mjs"), "utf8"), "new acceptance");
+    const completed = await h.tool("exitcode_stage_tests", { complete: true });
+    assert.deepEqual(completed.details.staged.files, ["proof.test.mjs"]);
+    assert.equal(core.statusSnapshot(io(h)).staging, null);
+    const premature = await h.tool("exitcode_seal", { node: "G1", userApproval: "old acceptance" });
+    assert.equal(premature.isError, true);
+    assert.match(premature.content[0].text, /prepared and validated/);
+    const prepared = await h.tool("exitcode_draft", { goal: "Finish the feature", criteria: literalCriteria, revise: "G1" });
+    assert.equal(prepared.details.ok, true);
+    assert.equal(await settle(h), undefined);
+    const sealed = await h.tool("exitcode_seal", { node: "G1", userApproval: "Approve the validated plan" });
+    assert.equal(sealed.details.ok, true);
+    fs.writeFileSync(path.join(h.cwd, "feature.txt"), "done\n");
+    assert.equal((await h.tool("exitcode_evaluate", {})).details.cascade.terminal.status, "PASS");
+    assert.equal(core.resolveModeFromBranch(h.entries).on, false);
+    assert.equal(h.tools.get("exitcode_stage_tests").exposure, "hidden");
+  });
 });
 
 test("adapter: settle restores pre-seal changes, bounds continuations, and cannot be reset by status calls", async (t) => {
@@ -336,8 +400,8 @@ test("adapter: reload, restart, and resume reconnect to the right root with its 
   assert.equal(core.statusSnapshot(io(other)).awaitingApproval, true);
 });
 
-test("adapter: independent review uses the selected model and session thinking in fresh, bounded, tool-free contexts", async (t) => {
-  for (const mode of ["success", "error", "invalid-json", "malformed", "length", "missing-model", "cancel"]) await t.test(mode, async (t) => {
+test("adapter: independent review uses the selected model and session thinking in fresh, bounded, single-tool contexts", async (t) => {
+  for (const mode of ["success", "tool-call", "markdown", "prose", "error", "invalid-json", "malformed", "tool-malformed", "wrong-tool", "length", "missing-model", "cancel"]) await t.test(mode, async (t) => {
     const h = harness(t), registry = reviewRegistry(mode);
     h.ctx.modelRegistry = registry;
     h.ctx.tools = [{ name: "write", description: "Mutate the session candidate" }];
@@ -352,13 +416,17 @@ test("adapter: independent review uses the selected model and session thinking i
       assert.equal(call.options.reasoning, h.ctx.thinkingLevel);
       assert.equal(call.options.maxTokens, core.REVIEW_MAX_TOKENS);
       assert.equal(call.context.systemPrompt, core.reviewPrompt(call.input.phase));
+      assert.match(call.context.systemPrompt, /submit_review/);
       assert.deepEqual(call.context.messages.map((m) => [m.role, m.content]), [["user", JSON.stringify(call.input)]]);
       assert.doesNotMatch(JSON.stringify(call.context), /Session-only history/);
       // Checks are hidden from the deriving reviewer to avoid check-author bias.
       if (call.input.phase === "derive") assert.doesNotMatch(JSON.stringify(call.input), /grep -qx|controls/);
-      assert.ok(!call.context.tools?.length);
+      // Exactly one response tool; no filesystem, shell, session, or ExitCode tools.
+      assert.equal(call.context.tools?.length, 1);
+      assert.equal(call.context.tools[0].name, core.REVIEW_TOOL_NAME);
+      assert.deepEqual(call.context.tools[0].constrainedSampling, { type: "json_schema", strict: "prefer" });
     }
-    if (mode === "success") {
+    if (["success", "tool-call", "markdown", "prose"].includes(mode)) {
       assert.deepEqual(registry.calls.map((c) => c.input.phase), ["derive", "assess"]);
       assert.equal(registry.calls[0].input.originalRequest, "Write literal done into feature.txt and preserve the artifact");
       assert.equal(result.usage.input, 22);
@@ -373,7 +441,7 @@ test("adapter: independent review uses the selected model and session thinking i
       assert.equal(core.statusSnapshot(io(h)).awaitingApproval, false);
       assert.equal(core.approveRoot(io(h)).ok, false);
       assertEnforced(h);
-      if (["error", "invalid-json", "malformed", "length"].includes(mode)) assert.equal(result.usage.input, 11, "billable failures still report usage");
+      if (["error", "invalid-json", "malformed", "tool-malformed", "wrong-tool", "length"].includes(mode)) assert.equal(result.usage.input, 11, "billable failures still report usage");
       if (mode === "cancel") for (const call of registry.calls) assert.equal(call.options.signal.aborted, true);
     }
   });

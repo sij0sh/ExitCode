@@ -8,9 +8,16 @@ export function reviewRegistry(mode='success') {
       if(mode==='cancel'){options.signal.addEventListener('abort',()=>{}, {once:true});return new Promise(()=>{});}
       if(mode==='error')return {stopReason:'error',errorMessage:'provider unavailable',content:[],usage};
       const data=await structuralReview(input);
-      if(mode==='malformed')data.criteria=[];
-      return {stopReason:mode==='length'?'length':'stop',usage,
-        content:[{type:'text',text:mode==='invalid-json'?'not JSON':JSON.stringify(data)}]};
+      if(mode==='malformed'||mode==='tool-malformed')data.criteria=[];
+      if(mode==='tool-call'||mode==='tool-malformed')
+        return {stopReason:'toolUse',usage,content:[{type:'toolCall',id:'call-1',name:'submit_review',arguments:data}]};
+      if(mode==='wrong-tool')
+        return {stopReason:'toolUse',usage,content:[{type:'toolCall',id:'call-1',name:'other_tool',arguments:data}]};
+      const text=mode==='invalid-json'?'not JSON'
+        :mode==='markdown'?'Here is the requested review:\n\n```json\n'+JSON.stringify(data)+'\n```'
+        :mode==='prose'?JSON.stringify(data)+'\n\nHope this helps.'
+        :JSON.stringify(data);
+      return {stopReason:mode==='length'?'length':'stop',usage,content:[{type:'text',text}]};
     }};
   }};
 }

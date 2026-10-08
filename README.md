@@ -29,6 +29,8 @@ A passing baseline does not complete the goal.
 Only fresh supervisor evaluation can close it.
 
 The normal path needs one approval and no clarification turn.
+Tasks that must change acceptance tests can use a bounded test-staging window before root sealing.
+This stays within ExitCode and requires a concrete staging request and one user reply; the updated evaluator still needs validation and plan approval.
 Ask a question in conversation, before drafting, only when ambiguity materially changes success and no repository convention or default resolves it.
 Clarification is not part of the contract schema.
 READY_FOR_APPROVAL pauses automatic continuation; the candidate stays read-only until sealing.
@@ -59,6 +61,7 @@ Unavailable isolation is a runner error, not evidence of a detected defect.
 | --- | --- |
 | `/exitcode approve` | Approve and seal the exact validated plan. |
 | `/exitcode status [evidence]` | Show phase, criteria, budgets, diagnostics, and next action; `evidence` adds the full contract, E0 evidence, digests, and metrics. |
+| `/exitcode stage-tests [approve]` | Show the test-staging request, or approve it to open a test-only pre-seal window. |
 | `/exitcode exit` | Cancel enforcement without claiming success or deleting work. |
 | `/exitcode resume [Gid]` | Resume the same root, pending review, or saved operation, even while mode is on. |
 | `/exitcode resume minutes=N attempts=N evaluators=N` | Record explicit positive execution or evaluator-construction grants and resume. |
@@ -70,14 +73,16 @@ New roots approve an execution duration, not a countdown spent during review.
 Legacy sealed roots keep their original clock.
 It does not authenticate the origin or semantic meaning of that quote.
 
-The adapter exposes six tools only during ExitCode mode.
+The adapter exposes seven tools only during ExitCode mode.
 `exitcode_draft` automatically prepares root proposals and returns either typed repair diagnostics or a validated review.
 `exitcode_seal` seals a reviewed bundle without rerunning preparation.
 Stale candidate, environment, or evaluator evidence requires preparation and approval again.
 `exitcode_evaluate` runs sealed checks fresh.
 `exitcode_child` proposes one reduction of a failed parent criterion.
-`exitcode_block` preserves a concrete blocker as a resumable root pause.
+`exitcode_block` preserves a concrete external authority, infrastructure, budget, ambiguity, or viable-path blocker as a resumable root pause.
+Evaluator lint failures need repair; acceptance-test edits use `exitcode_stage_tests`, not `AUTHORIZATION_MISSING` or a paused root.
 Only a genuinely declined child path uses `NO_PATH` to withdraw child edits and rerun its ancestors.
+`exitcode_stage_tests` requests, opens, or completes a user-authorized pre-seal window to edit only conventional test files.
 `exitcode_status` shows operational state; `detail: "evidence"` adds full mechanics for debugging.
 Each agent turn receives only the five-sentence protocol and a status summary capped at 4 KiB.
 That summary never includes checks, controls, evaluator evidence, or metrics.
@@ -90,7 +95,7 @@ ExitCode never changes your tool loadout or classifies tools by name.
 Any built-in, custom, or extension tool stays available in every phase.
 Instead, ExitCode enforces two state invariants:
 
-- Before sealing, the candidate is immutable.
+- Before sealing, the product candidate is immutable; only a user-authorized test-staging window may change conventional test files.
 - `.exitcode/` is private to the supervisor in every phase.
 
 Entering `/exitcode` or proposing a child snapshots the current candidate as the pre-seal baseline.
@@ -101,8 +106,23 @@ On any difference, it saves the changed and added files under `.exitcode/discard
 Evidence prepared from a changed candidate never reaches approval.
 The latest three discarded change sets are kept.
 This applies to every source, including your own edits during review.
-To change the candidate before approval, use `/exitcode exit`, edit, then `/exitcode resume` and review a fresh preparation.
+To change product files before approval, use `/exitcode exit`, edit, then `/exitcode resume` and review a fresh preparation.
+To change acceptance tests before root sealing, the agent requests test staging with `exitcode_stage_tests`; one user reply (or `/exitcode stage-tests approve`) opens a bounded window for conventional test files only, and completion re-baselines the staged tests and requires fresh validation before approval.
 Sealing releases the baseline, and the agent then implements normally.
+
+For a task where product behavior and its acceptance test must change together:
+
+1. Draft the observable outcomes using discovered checks or focused commands with minimal witnesses. Explain the incompatible test assertion in a staging request with exact file paths.
+2. Quote the user's staging authorization to open the window, or use `/exitcode stage-tests approve`. While waiting, the root stays ACTIVE and automatic continuation stops.
+3. Edit the requested conventional test files and call `exitcode_stage_tests` with `complete: true`. Product files, installed dependencies, and tests outside the requested paths stay frozen. If paths are omitted, all conventional test files are eligible within the limits.
+4. Discover the staged literal test names, revise the draft, and validate it again. Present the fresh validated plan for approval, seal it, then implement the product change.
+
+Staging allows at most 32 changed files, 1 MiB of changed file content, and three nonempty completed windows per root.
+Files must be regular files; symlinks cannot be staged.
+The window survives reloads. A request or open window prevents plan approval and sealing; requesting staging immediately invalidates earlier preparation and approval.
+Revising the draft cancels an unopened staging request. An open window must be completed first; completing an empty window spends no staging allowance.
+After root sealing, acceptance assets remain immutable, including during child preparation.
+Use `/exitcode exit`, edit, then `/exitcode resume` when a product change or a replacement sealed contract requires leaving that boundary.
 
 Built-in file tools cannot read or write `.exitcode/`.
 Shell commands that mention it are blocked.
@@ -139,11 +159,25 @@ Discovery reads package scripts, conventional source/test roots, and literal Nod
 The capability manifest is content-keyed and cached.
 Dynamic test names are not discovered.
 Selectors must resolve to a discovered literal and execute at least one test.
+Never invent a future test name for `existing_test`; controls cannot make an undiscovered selector pass lint.
+Copy the exact name from the current test file or discovery manifest. After staging a new or renamed test, discover it again before drafting.
 The initial script recipes support npm only.
 Missing file/JSON targets fail normally, including negative-content checks.
 Malformed JSON fails normally.
 Unsafe paths and malformed evaluator specs produce diagnostics.
 No HTTP, JSON Schema, or non-Node runner integration is included.
+
+| Intent | Recipe |
+| --- | --- |
+| Run one test already discovered | `existing_test` with its exact `path` and literal `selector` |
+| Prove new behavior before implementation | A focused `command_exit` or `custom_command` with a minimal positive witness and discriminating negatives; stage tests first if their acceptance assertions must change |
+| Require literal artifact content | `file_contains`; source text alone does not prove runtime behavior |
+| Preserve the discovered npm test suite | `test_suite` as a regression criterion; it runs `npm test`, not `scripts/verify` |
+| Run this repository's full verification | `{"kind":"command_exit","command":"sh","args":["scripts/verify"]}` or `{"kind":"custom_command","command":"sh scripts/verify"}` |
+
+`command_exit.command` must be an executable basename: `./scripts/verify` is invalid.
+Use `sh` with `scripts/verify` in `args`, or a `custom_command` shell string when shell syntax is needed.
+Each behavior criterion should cover one outcome that can independently pass or fail. Split separate contracts such as response schema, model selection, and cancellation into focused criteria; independent review reports `CRITERION_BUNDLED` for combined outcomes.
 
 ```json
 {
@@ -211,6 +245,7 @@ Literal artifact requirements such as including LICENSE can use structural evide
 Material negative cases and relevant regression mappings are required when the request or architecture implies them.
 The reviewer checks semantic overlap and unnecessary test duplication.
 It prefers existing relevant tests, then focused tests in the existing framework, then standard recipes, then custom commands.
+Existing means discovered now; tests for future behavior require a focused witness or pre-seal test staging.
 Review findings produce repair diagnostics rather than silently rewriting criteria.
 The internal coverage and risk evidence is available in status, not added as a routine user-facing matrix.
 
@@ -245,8 +280,8 @@ This flag does not grant installation, network, credentials, or external authori
 ### Model calls and bounds
 
 New root and child preparation uses the currently selected Pi model and session thinking level through `ctx.modelRegistry.streamSimple()`.
-It makes two separate, tool-free semantic review phases per successful preparation.
-Each call starts with a fresh context containing only the phase's review prompt and input, not the session history.
+It makes two separate semantic review phases per successful preparation.
+Each call starts with a fresh context containing only the phase's review prompt and input, not the session history, and offers exactly one `submit_review` response tool with preferred JSON-schema constrained sampling.
 Changing the session model or thinking level applies to subsequent review calls without separate reviewer configuration.
 Initial model review has no ExitCode wall-clock ceiling.
 Reviews are compact structured judgments: each response is capped at 4096 output tokens and 64 KiB, prose fields are clipped to 300 characters, and the supervisor numbers near-misses.
@@ -254,8 +289,9 @@ Oversized output is invalid rather than chunked.
 Tool updates report phase and elapsed progress.
 Cancellation still aborts the call.
 Child review after sealing shares the original execution deadline.
-Provider errors, invalid JSON, malformed or missing review evidence, and cancellation prevent approval.
-There is no host-execution or heuristic fallback.
+Provider errors, invalid responses, malformed or missing review evidence, and cancellation prevent approval.
+Structured `submit_review` arguments are preferred; plain-JSON text remains only as a compatibility fallback for providers without tool support.
+There is no host-execution or heuristic fallback for missing evidence.
 Transient 408, 429, 5xx, and connection failures get at most two retries per review phase with bounded backoff.
 Invalid requests, invalid responses, assertions, and semantic rejections are not retried until green.
 Repeated infrastructure failures pause the same root for focused intervention.

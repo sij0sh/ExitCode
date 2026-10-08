@@ -6,7 +6,7 @@ Add variants as table rows inside the canonical test, not as new tests.
 
 | Invariant | Why it exists | Canonical tests |
 | --- | --- | --- |
-| Pre-seal candidate is immutable | Prevent implementation before approval, from any tool | `core: baseline: pre-seal changes …`, `core: baseline: review-time changes …`, `core: baseline: changes that cannot be saved …`, `adapter: settle restores pre-seal changes …` |
+| Pre-seal product is immutable; staged tests are user-authorized | Prevent implementation before approval; test updates need one user reply and re-validation | `core: baseline: pre-seal changes …`, `core: baseline: review-time changes …`, `core: baseline: changes that cannot be saved …`, `core: staging: user-authorized test windows …`, `adapter: settle restores pre-seal changes …`, `adapter: stage-tests opens a bounded test-only window …` |
 | Supervisor state is private | Agents cannot forge contracts, approvals, or evidence | `core: guard: supervisor state is private …` |
 | Evaluator is validated before approval | The user never approves an evaluator E0 has not passed | `core: prepare: failures spend only the evaluator budget …`, `adapter: a draft returns a compact validated plan only after E0 …` |
 | Approval binds the exact validated bundle | Prevent post-review weakening of criteria, checks, policy, or clock | `core: approval: …` (four tests), `core: prepare: candidate, policy, or concurrent changes …` |
