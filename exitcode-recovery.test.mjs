@@ -1,4 +1,4 @@
-/** Crash, reload, cancellation, and compatibility boundaries. See INVARIANTS.md. */
+/** Crash, reload, cancellation, and store-generation boundaries. See INVARIANTS.md. */
 import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
@@ -8,14 +8,15 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { test } from 'node:test';
 import * as core from './exitcode-core.mjs';
 import { releasePreparation } from './exitcode-preparation.mjs';
-import { sandboxCommand, evaluatorEnvironment } from './exitcode-evaluator.mjs';
+import { sandboxCommand } from './exitcode-evaluator.mjs';
 import { structuralReview } from './test/structural-review.mjs';
 
 const read = (cwd, file) => fs.existsSync(path.join(cwd, file)) ? fs.readFileSync(path.join(cwd, file), 'utf8') : null;
 const run = (exit, extra = {}) => ({ exit, stdout: '', stderr: '', timedOut: false, ...extra });
+const custom = command => ({ recipe: { kind: 'custom_command', command } });
 const criterion = (id, file, commands = false) => ({
   id, requirement: `The literal ${file} artifact contains done`,
-  check: commands ? { command: `observe:${file}` } : { recipe: { kind: 'file_contains', path: file, value: 'done' } },
+  check: commands ? custom(`observe:${file}`) : { recipe: { kind: 'file_contains', path: file, value: 'done' } },
   ...(commands ? { controls: { accept: { mutations: [{ kind: 'write_file', path: file, content: 'done' }] },
     reject: [{ mutations: [{ kind: 'write_file', path: file, content: 'pending' }] }] } } : {}),
 });
@@ -34,7 +35,7 @@ function project(t, { done = false, commands = false, files = {}, policy = {}, d
   };
   const io = core.makeIo(cwd, { review: structuralReview, exec, nowMs: () => now });
   const criteria = [criterion('C1', 'feature', commands), { id: 'C2', requirement: 'The existing feature artifact remains present', type: 'regression',
-    check: commands ? { command: 'preserve' } : { recipe: { kind: 'file_exists', path: 'feature' } } }];
+    check: commands ? custom('preserve') : { recipe: { kind: 'file_exists', path: 'feature' } } }];
   const args = { goal: 'Complete the literal feature artifact', criteria, policy, ...draft };
   assert.equal(core.draftNode(io, args).ok, true);
   t.after(() => { releasePreparation(cwd); fs.rmSync(parent, { recursive: true, force: true }); });
@@ -60,7 +61,7 @@ async function waitFor(predicate) {
 }
 const done = f => fs.writeFileSync(path.join(f.cwd, 'feature'), 'done');
 
-test('recovery: infrastructure faults during preparation pause without spending evaluator quality budget', async t => {
+test('recovery: infrastructure faults during root preparation remain editable without spending evaluator quality budget', async t => {
   // Retryable transport errors are retried a bounded number of times.
   const retried = project(t);
   let calls = 0;
@@ -70,7 +71,10 @@ test('recovery: infrastructure faults during preparation pause without spending 
   assert.deepEqual([calls, ok.stages.filter(s => s.stage === 'review-transport').length], [4, 2]);
   assert.equal(core.loadNodeState(retried.io, 'G1').evaluatorMetrics.transportRetries, 2);
   for (const [label, setup, code] of [
-    ['configuration', f => { f.io.review = async () => { throw Object.assign(Error('400 incompatible request'), { status: 400 }); }; }, 'REVIEW_CONFIGURATION'],
+    ['incompatible request', f => { f.io.review = async () => { throw Object.assign(Error('400 incompatible request'), { status: 400 }); }; }, 'REVIEW_INCOMPATIBLE'],
+    ['provider authority', f => { f.io.review = async () => { throw Object.assign(Error('401 invalid credentials'), { status: 401 }); }; }, 'REVIEW_CONFIGURATION'],
+    ['malformed review', f => { f.io.review = async () => ({criteria:[]}); }, 'REVIEW_RESPONSE_INVALID'],
+    ['length exhausted', f => { f.io.review = async () => { throw Object.assign(Error('review exceeds bounded response'), {code:'REVIEW_TOO_LARGE'}); }; }, 'REVIEW_TOO_LARGE'],
     ['runner', f => { f.io.exec = async (command, options) => command === 'observe:feature' && read(options.cwd, 'feature') === 'pending'
       ? run(null, { error: 'temporary runner failure', errorCode: 'RUNNER_ERROR' }) : f.exec(command, options); }, 'RUNNER_ERROR'],
     ['runtime IO', f => { fs.writeFileSync(path.join(f.cwd, 'node_modules'), 'not a directory'); core.releaseBaseline(f.cwd); }, 'ENOTDIR'],
@@ -79,14 +83,76 @@ test('recovery: infrastructure faults during preparation pause without spending 
     const f = project(t, { commands: true });
     setup(f);
     const failed = await core.prepareNode(f.io);
-    assert.equal(failed.status, 'PAUSED', label);
-    assert.equal(failed.pause.code, code, label);
+    assert.equal(failed.ok,false,label);
+    assert.equal(core.loadRoot(f.io,'G1').status, 'ACTIVE', label);
+    assert.ok(failed.diagnostics.some(d=>d.code===code),label);
     const node = core.loadNodeState(f.io, 'G1');
+    assert.deepEqual([node.status,node.phase],['DRAFT','EVALUATOR_PREPARATION'],label);
     assert.equal(node.evaluatorMetrics.e0Attempts, 0, label);
     assert.equal(node.preparing, undefined, label);
     assert.equal(fs.existsSync(core.storePaths(f.cwd).operation), false, label);
     assert.equal(core.approveRoot(f.io).ok, false, label);
   }
+});
+
+test('recovery: legacy unsealed pauses unlock every editing boundary without resetting budgets or evidence', async t => {
+  for(const boundary of ['revise','request','approve','complete','prepare','budget','external'])await t.test(boundary,async t=>{
+    const f=project(t,{policy:{evaluatorAttempts:1}});
+    assert.equal((await core.prepareNode(f.io)).ok,true);
+    const diagnostics=[{code:'REVIEW_TOO_LARGE',stage:'quality',evidence:'length',repairability:'supervisor'}];
+    if(['approve','complete'].includes(boundary))assert.equal(core.requestTestStaging(f.io,'G1',{reason:'Write focused tests',paths:['proof.test.mjs']}).ok,true);
+    if(boundary==='complete') {
+      assert.equal(core.approveTestStaging(f.io,'G1',{userApproval:'Yes, write the tests'}).ok,true);
+      fs.writeFileSync(path.join(f.cwd,'proof.test.mjs'),"export const acceptance=true;");
+    }
+    const node=core.loadNodeState(f.io,'G1');
+    node.phase='EVALUATOR_PREPARATION';node.diagnostics=diagnostics;
+    delete node.prepared;delete node.preparedDigest;
+    core.saveNodeState(f.io,node);
+    const root=core.loadRoot(f.io,'G1');
+    root.status='PAUSED';root.pause={code:boundary==='budget'?'EVALUATOR_UNBUILDABLE':boundary==='external'?'REVIEW_CONFIGURATION':'REVIEW_RESPONSE_INVALID',reason:'legacy preparation failure',nodeId:'G1',operation:'prepare',phase:'EVALUATOR_PREPARATION',at:101};
+    root.pauseHistory=[structuredClone(root.pause)];
+    root.executionGrants=[{approvedBy:'user',evaluatorAttempts:1,at:99}];
+    core.saveRoot(f.io,root);
+    let result;
+    if(['revise','external'].includes(boundary))result=core.draftNode(f.io,{...f.args,revise:'G1'});
+    if(['request','budget'].includes(boundary))result=core.requestTestStaging(f.io,'G1',{reason:'Write focused tests',paths:['proof.test.mjs']});
+    if(boundary==='approve')result=core.approveTestStaging(f.io,'G1',{userApproval:'Yes, write the tests'});
+    if(boundary==='complete')result=core.completeTestStaging(f.io,'G1');
+    if(boundary==='prepare') {
+      // A recorded explicit grant is retained; the saved leaf limit is authoritative.
+      const granted=core.loadNodeState(f.io,'G1');granted.evaluatorAttemptLimit=2;core.saveNodeState(f.io,granted);
+      result=await core.prepareNode(f.io);
+    }
+    assert.equal(result.ok,true,JSON.stringify(result));
+    const recovered=core.loadRoot(f.io,'G1'),state=core.loadNodeState(f.io,'G1');
+    assert.equal(recovered.status,'ACTIVE');assert.equal(recovered.pause,undefined);
+    for(const key of ['policy','consumedAttempts','deadlineAt','executionGrants','pauseHistory','stack'])assert.deepEqual(recovered[key],root[key],key);
+    assert.equal(state.evaluatorMetrics.e0Attempts,boundary==='prepare'?2:1);
+    if(['revise','request','approve','external','budget'].includes(boundary))assert.deepEqual(state.diagnostics,diagnostics,'recovery retains diagnostics');
+    assert.equal(recovered.approval,undefined,'recovery grants no approval');
+    if(boundary!=='prepare')assert.equal(core.approveRoot(f.io).ok,false,'unprepared recovery cannot be approved');
+    if(boundary==='prepare')assert.equal(state.phase,'READY_FOR_APPROVAL');
+    if(boundary==='complete')assert.deepEqual(state.testStagingHistory[0].files,['proof.test.mjs']);
+    if(boundary==='budget') {
+      assert.equal(core.approveTestStaging(f.io,'G1').ok,true);
+      assert.equal(core.completeTestStaging(f.io,'G1').ok,true);
+      const exhausted=await core.prepareNode(f.io);
+      assert.equal(exhausted.pause.code,'EVALUATOR_UNBUILDABLE','unlocking staging never adds evaluator attempts');
+      assert.equal(core.resumeRoot(f.io).ok,false,'grant still required');
+      const resumed=core.resumeRoot(f.io,{evaluatorAttempts:1});
+      assert.deepEqual([resumed.ok,resumed.retry,resumed.operation],[true,false,'continue']);
+      assert.equal(core.loadNodeState(f.io,'G1').evaluatorAttemptLimit,2);
+    }
+  });
+  // Sealed execution cannot use draft repair or staging to clear its pause.
+  const sealed=project(t);await seal(sealed);
+  core.pauseNode(sealed.io,{code:'RUNNER_ERROR',reason:'runner unavailable'});
+  const before=core.loadRoot(sealed.io,'G1');
+  assert.equal(core.draftNode(sealed.io,{...sealed.args,revise:'G1'}).ok,false);
+  assert.equal(core.requestTestStaging(sealed.io,'G1',{reason:'Change proof'}).ok,false);
+  assert.equal((await core.prepareNode(sealed.io)).ok,false);
+  assert.deepEqual(core.loadRoot(sealed.io,'G1'),before);
 });
 
 test('recovery: interrupted preparation never restores approval and its evaluator charge persists', async t => {
@@ -124,7 +190,7 @@ test('recovery: live operations and transcript root ownership cannot be cleared 
 test('recovery: cancellation stops isolated descendants before fixtures or ownership are released', async t => {
   const f = project(t, { commands: true });
   const command = 'printf ready > started; sleep 10; test "$(cat feature)" = done';
-  f.args.criteria[0].check.command = command;
+  f.args.criteria[0].check.recipe.command = command;
   assert.equal(core.draftNode(f.io, { ...f.args, revise: 'G1' }).ok, true);
   f.io.exec = async (cmd, options) => cmd === command ? run(read(options.cwd, 'feature') === 'done' ? 0 : 1) : f.exec(cmd, options);
   await seal(f);
@@ -153,7 +219,7 @@ test('recovery: cancellation stops isolated descendants before fixtures or owner
   // Direct runner cancellation and absolute deadlines also wait for descendants.
   for (const [label, options, code] of [['abort', null, 'CANCELLED'], ['deadline', { deadlineAt: Date.now() + 80 }, 'DEADLINE_EXCEEDED']]) {
     const abort = new AbortController();
-    const check = core.runCheck({ id: 'C1', check: { command: 'printf ready > started-check; (sleep 0.3; printf late > late) & sleep 10' } },
+    const check = core.runCheck({ id: 'C1', check: custom('printf ready > started-check; (sleep 0.3; printf late > late) & sleep 10') },
       sandboxCommand, f.cwd, 5000, options ?? { signal: abort.signal });
     if (!options) { await waitFor(() => read(f.cwd, 'started-check') === 'ready'); abort.abort(); }
     const result = await check;
@@ -161,7 +227,7 @@ test('recovery: cancellation stops isolated descendants before fixtures or owner
     await sleep(400);
     assert.equal(read(f.cwd, 'late'), null, label);
   }
-  const recipe = await core.runCheck({ id: 'C1', check: { recipe: { kind: 'custom_command', command: 'sleep 10' } } }, sandboxCommand, f.cwd, 5000, { deadlineAt: Date.now() + 80 });
+  const recipe = await core.runCheck({ id: 'C1', check: custom('sleep 10') }, sandboxCommand, f.cwd, 5000, { deadlineAt: Date.now() + 80 });
   assert.equal(recipe.errorCode, 'DEADLINE_EXCEEDED', 'shared deadline outranks the clamped watchdog');
 });
 
@@ -179,7 +245,7 @@ test('recovery: inconclusive evaluation preserves work, approval, stack, and a s
   assert.equal(read(f.cwd, 'feature'), 'done', 'a sealed pause never restores an old preparation candidate');
   // Partial node persistence cannot double charge the reserved candidate.
   const node = core.loadNodeState(f.io, 'G1');
-  node.attempts = 0; delete node.reservedCandidateDigest; delete node.reservedAccountingDigest;
+  node.attempts = 0; delete node.reservedCandidateDigest;
   core.saveNodeState(f.io, node);
   f.io.exec = f.exec;
   assert.equal(core.resumeRoot(f.io).operation, 'evaluate');
@@ -326,52 +392,29 @@ test('recovery: reload recovers an interrupted provisional verdict and requires 
   assert.equal((await core.evaluateNode(f.io)).status, 'PASS');
 });
 
-test('recovery: legacy roots and bundles migrate safely or fail closed', async t => {
-  // An unsealed legacy root keeps its history but needs fresh validated approval.
-  const draft = project(t);
-  const root = core.loadRoot(draft.io, 'G1'), node = core.loadNodeState(draft.io, 'G1');
-  delete root.clockVersion; delete root.executionStartedAt;
-  Object.assign(root, { deadlineAt: 99, status: 'BLOCKED', stack: [], outcome: { code: 'BUDGET_EXHAUSTED', reason: 'Old drafting clock elapsed' },
-    approval: { approvedBy: 'user', digest: 'old approval' }, policyLocked: true });
-  node.status = 'BLOCKED'; node.evaluatorMetrics.e0Attempts = 2;
-  core.saveRoot(draft.io, root); core.saveNodeState(draft.io, node);
-  const index = core.loadIndex(draft.cwd); index.activeRootId = null; core.saveIndex(draft.cwd, index);
-  const resumed = core.resumeRoot(draft.io, { rootId: 'G1' });
-  assert.equal(resumed.migrated, true);
-  const current = core.loadRoot(draft.io, 'G1');
-  assert.deepEqual([current.legacyTiming.deadlineAt, current.deadlineAt, current.approval], [99, null, undefined]);
-  assert.equal(core.loadNodeState(draft.io, 'G1').evaluatorMetrics.e0Attempts, 2);
-  assert.equal(core.approveRoot(draft.io).ok, false);
-  assert.equal((await core.prepareNode(draft.io)).ok, true);
-  assert.equal(core.approveRoot(draft.io).ok, true);
-  // Legacy sealed bundles: built-in acceptance can finish under its original limits; command evidence without frozen assets cannot.
-  const legacy = async (options) => {
-    const f = project(t, options);
-    await seal(f);
-    const r = core.loadRoot(f.io, 'G1'), n = core.loadNodeState(f.io, 'G1'), bundle = core.loadBundle(f.io, 'G1');
-    delete r.clockVersion; delete r.executionStartedAt; r.policy.evalTimeoutSeconds = 120;
-    bundle.version = 1; delete bundle.assets; delete bundle.assetsDirectory; delete bundle.integrityDigest; delete n.sealedBundleDigest;
-    core.saveRoot(f.io, r); core.saveNodeState(f.io, n); core.writeJsonAtomic(core.sealedFile(f.cwd, 'G1'), bundle);
-    return { f, root: r, bundle };
-  };
-  const builtin = await legacy({ done: true });
-  assert.equal((await core.evaluateNode(builtin.f.io)).status, 'PASS');
-  assert.equal(core.loadRoot(builtin.f.io, 'G1').consumedAttempts, 0);
-  assert.deepEqual(core.loadRoot(builtin.f.io, 'G1').policy, builtin.root.policy);
-  assert.deepEqual(evaluatorEnvironment(builtin.f.cwd), builtin.bundle.env);
-  const command = await legacy({ commands: true });
-  const bytes = fs.readFileSync(core.sealedFile(command.f.cwd, 'G1'), 'utf8');
-  const failed = await core.evaluateNode(command.f.io);
-  assert.equal(failed.pause.code, 'LEGACY_EVIDENCE_MISSING');
-  assert.match(failed.pause.reason, /superseding approved contract is required/);
-  assert.equal(core.loadRoot(command.f.io, 'G1').deadlineAt, command.root.deadlineAt);
-  assert.equal(core.resumeRoot(command.f.io).migrated, false);
-  assert.equal(fs.readFileSync(core.sealedFile(command.f.cwd, 'G1'), 'utf8'), bytes);
-  // A rehashed or downgraded bundle cannot replace its supervisor identity.
+test('recovery: other store generations are archived untouched, and forged bundles fail closed', async t => {
+  // A store from another generation is never interpreted: it is archived whole and a fresh root starts.
+  const old = project(t, { commands: true });
+  await seal(old);
+  done(old);
+  const candidate = core.digestTree(old.cwd);
+  const store = core.storePaths(old.cwd), index = core.loadIndex(old.cwd);
+  delete index.formatVersion; index.version = 1;
+  core.saveIndex(old.cwd, index);
+  const sealedBytes = fs.readFileSync(core.sealedFile(old.cwd, 'G1'), 'utf8');
+  assert.deepEqual(core.statusSnapshot(old.io), { active: false, roots: [] });
+  const [archive] = fs.readdirSync(store.archiveDir);
+  assert.equal(fs.readFileSync(path.join(store.archiveDir, archive, 'contracts/G1.sealed.json'), 'utf8'), sealedBytes);
+  assert.equal(core.digestTree(old.cwd), candidate, 'the candidate is untouched');
+  assert.equal(core.resumeRoot(old.io, { rootId: 'G1' }).ok, false);
+  assert.equal(core.draftNode(old.io, old.args).id, 'G1');
+  assert.equal(core.loadIndex(old.cwd).formatVersion, core.STORE_FORMAT_VERSION);
+  assert.deepEqual(fs.readdirSync(store.archiveDir), [archive]);
+  // A rehashed bundle cannot replace its supervisor identity.
   const forged = project(t);
   await seal(forged);
   const bundle = core.loadBundle(forged.io, 'G1');
-  bundle.version = 1; bundle.contract.criteria[0].check.recipe.value = 'pending';
+  bundle.contract.criteria[0].check.recipe.value = 'pending';
   bundle.digest = core.sha256Hex(core.stableStringify(bundle.contract)); delete bundle.integrityDigest;
   core.writeJsonAtomic(core.sealedFile(forged.cwd, 'G1'), bundle);
   assert.equal((await core.evaluateNode(forged.io)).pause.code, 'EVALUATOR_DRIFT');

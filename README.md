@@ -63,31 +63,34 @@ Unavailable isolation is a runner error, not evidence of a detected defect.
 | `/exitcode status [evidence]` | Show phase, criteria, budgets, diagnostics, and next action; `evidence` adds the full contract, E0 evidence, digests, and metrics. |
 | `/exitcode stage-tests [approve]` | Show the test-staging request, or approve it to open a test-only pre-seal window. |
 | `/exitcode exit` | Cancel enforcement without claiming success or deleting work. |
-| `/exitcode resume [Gid]` | Resume the same root, pending review, or saved operation, even while mode is on. |
+| `/exitcode resume [Gid]` | Resume the same root; draft repair returns control to the agent, while retry-safe sealed evaluation reruns. |
 | `/exitcode resume minutes=N attempts=N evaluators=N` | Record explicit positive execution or evaluator-construction grants and resume. |
 
 Plain-English approval also works.
 The agent quotes your acceptance when calling `exitcode_seal`.
 The supervisor binds it to the prepared bundle and policy.
-New roots approve an execution duration, not a countdown spent during review.
-Legacy sealed roots keep their original clock.
+Roots approve an execution duration, not a countdown spent during review.
 It does not authenticate the origin or semantic meaning of that quote.
 
 The adapter exposes seven tools only during ExitCode mode.
 `exitcode_draft` automatically prepares root proposals and returns either typed repair diagnostics or a validated review.
+Include `testStaging: { reason, paths }` when acceptance tests need edits first. ExitCode creates or revises the DRAFT, records the staging request, and defers E0 until the tests are staged and the next draft is submitted.
+Preparation infrastructure failures leave an unsealed root ACTIVE with a DRAFT and diagnostics, without spending evaluator-quality budget. The agent can revise, stage tests, inspect evidence, or retry preparation.
 `exitcode_seal` seals a reviewed bundle without rerunning preparation.
 Stale candidate, environment, or evaluator evidence requires preparation and approval again.
 `exitcode_evaluate` runs sealed checks fresh.
 `exitcode_child` proposes one reduction of a failed parent criterion.
-`exitcode_block` preserves a concrete external authority, infrastructure, budget, ambiguity, or viable-path blocker as a resumable root pause.
-Evaluator lint failures need repair; acceptance-test edits use `exitcode_stage_tests`, not `AUTHORIZATION_MISSING` or a paused root.
+`exitcode_block` preserves a concrete external authority, infrastructure, budget, or viable-path blocker as a resumable root pause.
+A draft whose diagnostics are all agent-repairable (lint, review, witness, or discrimination findings) cannot be blocked; the supervisor rejects the call and returns the existing next action.
+Acceptance-test edits use `exitcode_stage_tests`, not `AUTHORIZATION_MISSING` or a paused root.
 Only a genuinely declined child path uses `NO_PATH` to withdraw child edits and rerun its ancestors.
 `exitcode_stage_tests` requests, opens, or completes a user-authorized pre-seal window to edit only conventional test files.
 `exitcode_status` shows operational state; `detail: "evidence"` adds full mechanics for debugging.
 Each agent turn receives only the five-sentence protocol and a status summary capped at 4 KiB.
 That summary never includes checks, controls, evaluator evidence, or metrics.
-Only root PASS automatically exits mode.
-PAUSED and legacy BLOCKED roots keep enforcement on until user cancellation.
+Only root PASS automatically exits mode, and it is the only terminal root state.
+PAUSED roots keep enforcement on until user cancellation.
+BLOCKED applies only to a withdrawn child, which suppresses repeating the same child against unchanged evidence.
 
 ## Before sealing
 
@@ -112,7 +115,7 @@ Sealing releases the baseline, and the agent then implements normally.
 
 For a task where product behavior and its acceptance test must change together:
 
-1. Draft the observable outcomes using discovered checks or focused commands with minimal witnesses. Explain the incompatible test assertion in a staging request with exact file paths.
+1. Draft the observable outcomes using discovered checks or focused commands with minimal witnesses. Include `testStaging: { reason, paths }` to explain the acceptance tests that must change and defer the first E0. An existing draft can also request staging with `exitcode_stage_tests`.
 2. Quote the user's staging authorization to open the window, or use `/exitcode stage-tests approve`. While waiting, the root stays ACTIVE and automatic continuation stops.
 3. Edit the requested conventional test files and call `exitcode_stage_tests` with `complete: true`. Product files, installed dependencies, and tests outside the requested paths stay frozen. If paths are omitted, all conventional test files are eligible within the limits.
 4. Discover the staged literal test names, revise the draft, and validate it again. Present the fresh validated plan for approval, seal it, then implement the product change.
@@ -150,7 +153,8 @@ The bounded initial recipe set is:
 | `command_exit` | `command`, `args` | Run an executable basename and explicit arguments. |
 | `custom_command` | `command` | Run a visibly identified shell escape hatch inside isolation. |
 
-Checks use `check.recipe` or legacy `check.command`, never both.
+Every check has exactly one representation, `check.recipe`; `custom_command` is the isolated shell escape hatch.
+Roots need a regression criterion only when independent review derives a material regression risk.
 `check.expect` can fix exit and stdout expectations.
 `check.timeoutSeconds` is an immutable explicit watchdog and is never silently shortened in the contract.
 Its actual execution allowance cannot exceed the remaining global deadline.
@@ -210,7 +214,7 @@ A control is a minimal witness that the check can discriminate, not a reference 
 Supply `controls.reject` only when no independent near-miss can challenge a check.
 A behavior criterion without any negative evidence reports NEGATIVE_EVIDENCE_MISSING.
 A check that cannot pass on the candidate without a witness reports POSITIVE_WITNESS_REQUIRED.
-EVALUATOR_OVERBUILT rejects a control over 64 KiB, touching more than 16 files, with more than 4 KiB of shell setup, or repeating the same substantial body across criteria.
+EVALUATOR_OVERBUILT rejects a control over 64 KiB, touching more than 16 files, or repeating the same substantial body across criteria.
 Prefer an existing test, narrow the criterion, or shrink the witness.
 
 Fixture operations are `write_file`, `delete_file`, `replace_text`, `copy_fixture`, and `set_json_value`.
@@ -220,8 +224,7 @@ Paths must be relative and cannot cross symlinks or supervisor directories.
 JSON pointer edits reject prototype-related keys.
 `replace_text` must make a change.
 `copy_fixture` copies another regular file within the candidate fixture.
-Legacy `setup` shell commands remain available inside isolation.
-A successful setup does not establish a valid evaluator.
+Fixtures are only these confined mutations; there is no shell setup.
 
 ## Evaluator preparation
 
@@ -238,7 +241,7 @@ The second phase receives bounded repository context, checks, controls, and only
 Each sham starts from an independent valid fixture and uses the existing confined mutation operations.
 Shams cannot edit conventional test files or runner selection.
 A surviving sham rejects the evaluator.
-An unchanged fixture, failed setup, unsafe mutation, timeout, or runner ERROR is not successful challenge evidence.
+An unchanged fixture, unappliable or unsafe mutation, timeout, or runner ERROR is not successful challenge evidence.
 
 A behavior must be observed through its state or effects, not merely file or symbol existence.
 Literal artifact requirements such as including LICENSE can use structural evidence.
@@ -258,7 +261,7 @@ For example, `"assets": ["checks/accept.mjs", "checks/expected.json"]` freezes t
 Product source remains mutable merely because a check imports or executes it.
 Independent review must flag undeclared acceptance helpers.
 Automatic discovery cannot infer arbitrary shell or import graphs.
-Fixture setup cannot replace the authoritative acceptance bytes.
+Fixture mutations cannot replace the authoritative acceptance bytes.
 Each executable check gets frozen assets mounted read-only inside a disposable candidate copy.
 Changed acceptance bytes or test-selection inventory pause execution rather than weaken the evaluator.
 User resume can restore those exact supervisor-owned bytes and remove added acceptance files before reevaluating.
@@ -279,22 +282,25 @@ This flag does not grant installation, network, credentials, or external authori
 
 ### Model calls and bounds
 
-New root and child preparation uses the currently selected Pi model and session thinking level through `ctx.modelRegistry.streamSimple()`.
+New root and child preparation uses the currently selected Pi model through `ctx.modelRegistry.streamSimple()`.
 It makes two separate semantic review phases per successful preparation.
-Each call starts with a fresh context containing only the phase's review prompt and input, not the session history, and offers exactly one `submit_review` response tool with preferred JSON-schema constrained sampling.
-Changing the session model or thinking level applies to subsequent review calls without separate reviewer configuration.
+Each call starts with a fresh context containing only the phase's review prompt and input, not the session history, and offers at most one `submit_review` response tool.
+Changing the session model applies to subsequent review calls. Internal review uses fixed low reasoning independently of the coding session's thinking level.
 Initial model review has no ExitCode wall-clock ceiling.
-Reviews are compact structured judgments: each response is capped at 4096 output tokens and 64 KiB, prose fields are clipped to 300 characters, and the supervisor numbers near-misses.
-Oversized output is invalid rather than chunked.
+Reviews are compact structured judgments: initial responses have a 4096 output-token ceiling, a 64 KiB response bound, clipped prose fields, and supervisor-numbered near-misses.
+A provider `length` stop retries once with the same schema, omitted reasoning, and an 8192-token ceiling. A second length stop returns REVIEW_TOO_LARGE with a scope-reduction diagnostic; the root draft stays editable.
 Tool updates report phase and elapsed progress.
 Cancellation still aborts the call.
 Child review after sealing shares the original execution deadline.
 Provider errors, invalid responses, malformed or missing review evidence, and cancellation prevent approval.
-Structured `submit_review` arguments are preferred; plain-JSON text remains only as a compatibility fallback for providers without tool support.
+Requests start as `submit_review` with JSON-schema constrained sampling and low reasoning.
+A 400 rejects ExitCode's request shape rather than the task, so the adapter degrades: without constrained sampling, then without the reasoning option, then plain JSON with no tool.
+The first shape a provider/model accepts is reused for the session.
+When every shape is rejected, or on 401/403 provider authority failures, preparation returns REVIEW_CONFIGURATION. An unsealed root stays editable while the missing prerequisite is repaired.
 There is no host-execution or heuristic fallback for missing evidence.
 Transient 408, 429, 5xx, and connection failures get at most two retries per review phase with bounded backoff.
-Invalid requests, invalid responses, assertions, and semantic rejections are not retried until green.
-Repeated infrastructure failures pause the same root for focused intervention.
+Invalid responses, assertions, and semantic rejections are not retried until green.
+Repeated infrastructure failures remain diagnostics during root preparation; sealed execution retains strict pauses.
 Review source context is limited to 64 files, 12 KiB per file, and 96 KiB total per repository view.
 Hidden paths are excluded unless they are explicitly selected Markdown specifications.
 Credential-named files, detected credential content, binary files, and symlink targets remain excluded.
@@ -307,7 +313,7 @@ Tests and benchmarks use explicitly injected deterministic reviewers, not a prod
 
 Diagnostics contain `code`, `stage`, `criterionId`, `evidence`, `repairability`, and `recommendedRepair`.
 Examples include INTENT_UNCOVERED, EVALUATOR_OVERBUILT, POSITIVE_WITNESS_REQUIRED, SHAM_SURVIVED, REJECT_NOT_DISCRIMINATED, EMPTY_TARGET_PASS, NONDETERMINISTIC, and EXTERNAL_DEPENDENCY.
-Mechanical repair normalizes numeric timeouts and discovered runner selection.
+Mechanical repair normalizes numeric timeouts.
 Other repairs are agent-authored evaluator revisions inside a bounded construction budget.
 The sealed execution start and implementation counters never reset.
 An explicit user grant adds budget without changing the approved acceptance policy.
@@ -324,7 +330,7 @@ Review and execution strengthen the evidence; they do not turn approval into a f
 ## Isolation and preservation
 
 Every default executable probe uses a fail-closed bubblewrap runner.
-This includes custom shell, legacy setup, preparation, completion, and parent reruns.
+This includes custom shell, preparation, completion, and parent reruns.
 The runner exposes system runtime trees and an independent workspace, not host home, credentials, sockets, or the real candidate path.
 It clears inherited environment variables and mounts private `/proc`, `/dev`, and `/tmp`.
 It unshares network, process, IPC, user, and other namespaces, drops capabilities, and creates a new session.
@@ -332,7 +338,7 @@ Each stream is capped at 64 KiB.
 Timeouts and cancellation kill the runner process group and its private namespace processes.
 The supervisor waits for process close before deleting fixtures or releasing the workspace operation lock.
 Injected executable runners must honor the signal and settle only after their processes stop.
-Fixtures can be writable for setup and builds but never alias real candidate files.
+Fixtures can be writable for builds but never alias real candidate files.
 Public sandbox commands use a read-only workspace by default.
 
 Snapshots use independent reflinks where supported and ordinary copies otherwise.
@@ -389,14 +395,15 @@ Confirmed infrastructure failures are recorded without charging a substantive ev
 ### Pause and resume
 
 A pause preserves root identity, original request, phase, stack, approval, bundle, useful edits, diagnostics, and cumulative counters.
-`/exitcode resume` retries the saved operation after its prerequisite is restored.
+Pauses record a recovery kind: `retry`, `repair`, `grant`, or `external`. `/exitcode resume` replays only explicitly retry-safe sealed operations, including evaluation after an explicit budget grant. An unsealed DRAFT returns control to the agent and never automatically replays preparation.
+Draft revision, test-staging request/approval/completion, and explicit preparation also recover legacy preparation pauses on an unsealed root. Recovery retains pause history, diagnostics, approval records, policy, grants, and cumulative budgets, and grants no product-write authority.
 Only one supervisor operation owns a workspace at a time.
 Reload or another session cannot clear a live operation's lock.
 A transcript must explicitly adopt another active workspace root through the resume command.
 No external worker, scheduler, installation, credential acquisition, or authority grant is automatic.
 
 Execution exhaustion requires `/exitcode resume minutes=N` or `/exitcode resume attempts=N`.
-Construction exhaustion reports EVALUATOR_UNBUILDABLE and requires `/exitcode resume evaluators=N` before further proposals.
+Construction exhaustion reports EVALUATOR_UNBUILDABLE and requires `/exitcode resume evaluators=N` before further E0 attempts. Revision and staging remain available, and never reset consumed construction attempts.
 Values are positive additions, not replacement limits.
 Time additions extend the later of the previous deadline and the grant time.
 Grants are user-command records separate from sealed policy.
@@ -404,14 +411,12 @@ They never reset consumed attempts, execution start, acceptance, or prior eviden
 Contradictory acceptance, missing authority, damaged trusted evidence, or unavailable isolation still require focused intervention.
 Fixing an incorrect sealed evaluator requires a superseding contract and fresh user approval, not resume-time editing.
 
-Legacy sealed roots retain exact contracts, policy, deadlines, and original attempt-accounting rules.
-They do not acquire new seal-time evidence from current mutable files.
-A legacy command evaluator without trustworthy frozen acceptance assets reports LEGACY_EVIDENCE_MISSING.
-It requires a superseding approved contract.
-Legacy self-contained built-in checks can still run fresh within their original limits.
-Unsealed legacy roots with no implementation history can migrate on explicit resume.
-Migration preserves timing history and counters, invalidates old approval, and requires fresh preparation and validated-plan approval.
-Other legacy terminal execution is not automatically revived.
+### Store generations
+
+Supervisor state is pre-1.0 and not backward compatible.
+`.exitcode/index.json` records one `formatVersion` for everything persisted under `.exitcode/`.
+A store from any other generation is never migrated or partially interpreted.
+On first access, ExitCode moves it untouched to `.exitcode/archive/<timestamp>/` and starts fresh; the candidate is not modified.
 
 ## Instrumentation and benchmark
 

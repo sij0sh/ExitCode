@@ -68,14 +68,20 @@ export async function abortable(work, signal) {
   } finally { if (abort) signal?.removeEventListener('abort', abort); }
 }
 
+/**
+ * 400 is a request-capability mismatch (tool schema, constrained sampling,
+ * reasoning option) that a host may degrade past; 401/403 are real provider
+ * authority problems that only the user can fix.
+ */
 export function reviewFailure(error) {
-  if (['CANCELLED', 'DEADLINE_EXCEEDED', 'REVIEW_TIMEOUT', 'REVIEW_RESPONSE_INVALID', 'REVIEW_CONFIGURATION', 'REVIEW_UNAVAILABLE', 'REVIEW_TRANSPORT'].includes(error?.code)) return error;
+  if (['CANCELLED', 'DEADLINE_EXCEEDED', 'REVIEW_TIMEOUT', 'REVIEW_RESPONSE_INVALID', 'REVIEW_TOO_LARGE', 'REVIEW_INCOMPATIBLE', 'REVIEW_CONFIGURATION', 'REVIEW_UNAVAILABLE', 'REVIEW_TRANSPORT'].includes(error?.code)) return error;
   if (error instanceof SyntaxError) return operationError('REVIEW_RESPONSE_INVALID', `invalid reviewer JSON: ${error.message}`);
   const message = error?.message ?? String(error);
   const status = Number(error?.status ?? error?.statusCode ?? message.match(/\b(400|401|403|408|429|5\d\d)\b/)?.[1]);
   if ([408, 429].includes(status) || status >= 500 && status < 600 || /\b(?:ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|ENETUNREACH)\b/.test(message))
     return Object.assign(operationError('REVIEW_TRANSPORT', message), { retryable: true });
-  if ([400, 401, 403].includes(status)) return operationError('REVIEW_CONFIGURATION', message);
+  if (status === 400) return operationError('REVIEW_INCOMPATIBLE', message);
+  if ([401, 403].includes(status)) return operationError('REVIEW_CONFIGURATION', message);
   return operationError('REVIEW_UNAVAILABLE', message);
 }
 

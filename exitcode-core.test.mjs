@@ -6,7 +6,7 @@ import * as path from "node:path";
 import { test } from "node:test";
 import * as core from "./exitcode-core.mjs";
 import {
-  DEFAULT_POLICY, MAX_DISCARDED_CHANGES, MAX_DRAFT_PROPOSALS, MODE_ENTRY_TYPE, NodeState, PROTOCOL_PROMPT,
+  DEFAULT_POLICY, MAX_DISCARDED_CHANGES, MODE_ENTRY_TYPE, NodeState, PROTOCOL_PROMPT,
   PROMPT_STATUS_MAX_BYTES, SNAPSHOT_MAX_BYTES, approveRoot, assignCriterionIds, baselineScope, blockNode, captureBaseline,
   detectRegression, digestTree, draftFile, draftNode, enforceBaseline, ensureBaseline, evaluateNode, formatVector,
   guardToolCall, loadBundle, loadNodeState, loadRoot, makeIo as hostMakeIo, matchesExpect, nextAction, prepareNode,
@@ -22,38 +22,33 @@ import { structuralReview } from "./test/structural-review.mjs";
 
 const makeIo = (cwd, overrides = {}) => hostMakeIo(cwd, { review: structuralReview, ...overrides });
 
+/** Each behavior's confined witnesses write its fixture file. */
+const FIXTURES = {
+  C1: { file: "feature.txt", valid: "done\n", invalid: "todo\n" },
+  D1: { file: "child1.txt", valid: "ok", invalid: "bad" },
+  E1: { file: "gc.txt", valid: "ok", invalid: "bad" },
+};
+const witness = (id, content) => ({ mutations: [{ kind: "write_file", path: FIXTURES[id].file, content }] });
+const custom = (command) => ({ recipe: { kind: "custom_command", command } });
 const behavior = (id, cmd) => ({
-  id, requirement: `requirement ${id}`, check: { command: cmd },
-  controls: { accept: { setup: `accept:${id}` }, reject: [{ setup: `reject:${id}`, reason: `broken ${id}` }] },
+  id, requirement: `requirement ${id}`, check: custom(cmd),
+  controls: { accept: witness(id, FIXTURES[id].valid), reject: [{ ...witness(id, FIXTURES[id].invalid), reason: `broken ${id}` }] },
 });
-const regression = (id, cmd) => ({ id, requirement: `requirement ${id}`, type: "regression", check: { command: cmd } });
+const regression = (id, cmd) => ({ id, requirement: `requirement ${id}`, type: "regression", check: custom(cmd) });
 
 function rootDraft(overrides = {}) {
-  return { version: 1, id: "G1", goal: "Add the thing", originalRequest: "user: add the thing", parent: null,
+  return { id: "G1", goal: "Add the thing", originalRequest: "user: add the thing", parent: null,
     criteria: [behavior("C1", "check:c1"), regression("C2", "check:reg")], ...overrides };
 }
 
-/** Fake exec: setups mutate fixtures; checks always read the supplied cwd. */
-function fileExec(dir, { checks = {}, accepts = {}, rejects = {} } = {}) {
-  const fixtures = {
-    C1: { file: "feature.txt", valid: "done\n", invalid: "todo\n" },
-    D1: { file: "child1.txt", valid: "ok", invalid: "bad" },
-    E1: { file: "gc.txt", valid: "ok", invalid: "bad" },
-  };
+/** Fake exec: checks always read the supplied cwd. */
+function fileExec(dir, { checks = {} } = {}) {
   const fn = async (command, { cwd, timeoutMs }) => {
     fn.calls.push({ command, cwd, timeoutMs });
     const read = (rel) => {
       try { return fs.readFileSync(path.join(cwd, rel), "utf8"); }
       catch (error) { if (error.code === "ENOENT") return null; throw error; }
     };
-    if (command.startsWith("accept:") || command.startsWith("reject:")) {
-      assert.notEqual(cwd, dir, "control setup must not run on the real candidate");
-      const accept = command.startsWith("accept:");
-      const fixture = fixtures[command.split(":")[1]];
-      const { content = accept ? fixture.valid : fixture.invalid, ...result } = (accept ? accepts : rejects)[command] ?? {};
-      fs.writeFileSync(path.join(cwd, fixture.file), content);
-      return { exit: 0, stdout: "setup", stderr: "", timedOut: false, ...result };
-    }
     if (command in checks) {
       const pass = checks[command](read);
       return { exit: pass ? 0 : 1, stdout: pass ? "pass" : "fail", stderr: "", timedOut: false };
@@ -111,18 +106,18 @@ const write = (dir, rel, content) => fs.writeFileSync(path.join(dir, rel), conte
 
 test("structure: drafts are validated before any probe, and controls are optional witnesses", () => {
   assert.deepEqual(validateStructure(rootDraft(), { policy: DEFAULT_POLICY }), { ok: true, errors: [] });
-  // Thin contracts: a behavior criterion may omit controls entirely.
-  assert.equal(validateStructure(rootDraft({ criteria: [{ id: "C1", requirement: "r", check: { command: "c" } }, regression("C2", "r")] })).ok, true);
+  // Thin contracts: a behavior criterion may omit controls, and a root needs no regression criterion.
+  assert.equal(validateStructure(rootDraft({ criteria: [{ id: "C1", requirement: "r", check: custom("c") }] })).ok, true);
   const parent = { contract: rootDraft() };
-  const child = (targets, extra = {}) => ({ version: 1, id: "G1.1", goal: "g", originalRequest: "r", parent: { id: "G1", targets }, criteria: [behavior("C1", "c")], ...extra });
+  const child = (targets, extra = {}) => ({ id: "G1.1", goal: "g", originalRequest: "r", parent: { id: "G1", targets }, criteria: [behavior("C1", "c")], ...extra });
   for (const [label, draft, opts, fragment] of [
     ["duplicate ids", rootDraft({ criteria: [behavior("C1", "a"), behavior("C1", "b"), regression("C2", "r")] }), {}, "duplicate criterion id C1"],
-    ["no regression", rootDraft({ criteria: [behavior("C1", "c")] }), {}, "regression"],
     ["empty goal", rootDraft({ goal: "  " }), {}, "goal"],
     ["no request", rootDraft({ originalRequest: "" }), {}, "originalRequest"],
-    ["blank accept", rootDraft({ criteria: [{ ...behavior("C1", "c"), controls: { accept: { setup: " " } } }, regression("C2", "r")] }), {}, "controls.accept"],
+    ["blank accept", rootDraft({ criteria: [{ ...behavior("C1", "c"), controls: { accept: { mutations: [] } } }, regression("C2", "r")] }), {}, "controls.accept"],
     ["empty reject", rootDraft({ criteria: [{ ...behavior("C1", "c"), controls: { reject: [] } }, regression("C2", "r")] }), {}, "controls.reject"],
-    ["legacy verdict command", rootDraft({ criteria: [{ ...behavior("C1", "c"), controls: { accept: { command: "true" }, reject: [{ command: "false" }] } }, regression("C2", "r")] }), {}, "controls.reject[0].setup"],
+    ["shell setup", rootDraft({ criteria: [{ ...behavior("C1", "c"), controls: { accept: { setup: "true" }, reject: [{ setup: "false" }] } }, regression("C2", "r")] }), {}, "controls.reject[0] needs nonempty mutations"],
+    ["bare command", rootDraft({ criteria: [{ id: "C1", requirement: "r", check: { command: "true" } }] }), {}, "check must be an object with a recipe"],
     ["assumptions", rootDraft({ assumptions: "bad" }), {}, "assumptions"],
     ["exclusions", rootDraft({ exclusions: [""] }), {}, "exclusions"],
     ["unknown target", child(["C9"]), { parent, parentDepth: 0 }, "C9"],
@@ -150,7 +145,7 @@ test("verdict: runner errors, timeouts, and truncated output never PASS; only PA
   assert.deepEqual(detectRegression(prev, next), ["C1"]);
   assert.deepEqual(detectRegression(prev, [{ criterionId: "C1", status: "ERROR" }]), []);
   assert.equal(formatVector(next), "C1=FAIL C2=PASS");
-  const truncated = await core.runCheck({ id: "C1", check: { command: "observe", expect: { stdoutNotContains: ["unsafe"] } } },
+  const truncated = await core.runCheck({ id: "C1", check: { ...custom("observe"), expect: { stdoutNotContains: ["unsafe"] } } },
     async () => ({ exit: 0, stdout: "only the retained tail", stderr: "", timedOut: false, truncated: true }), os.tmpdir(), 1000);
   assert.equal(truncated.status, "ERROR");
   assert.equal(truncated.errorCode, "OUTPUT_INCOMPLETE");
@@ -166,7 +161,7 @@ test("lifecycle: an approved, validated draft seals exactly and only a fresh eva
   const { io } = testIo(dir, fileExec(dir, { checks: standardChecks }), nowRef);
   const draft = draftNode(io, { goal: "Add the thing", criteria: ROOT_CRITERIA });
   assert.equal(draft.id, "G1");
-  assert.match(draft.next, /prepare or repair/);
+  assert.match(draft.next, /revise G1 evaluator with exitcode_draft/);
   const prepared = await prepareNode(io);
   assert.equal(prepared.ok, true);
   assert.match(prepared.review, /Validated plan/);
@@ -212,7 +207,7 @@ test("approval: unapproved roots and invalid replies never seal or spend proposa
   const exec = fileExec(dir, { checks: standardChecks });
   const { io } = testIo(dir, exec);
   draftNode(io, { goal: "g", criteria: ROOT_CRITERIA });
-  for (let n = 0; n < MAX_DRAFT_PROPOSALS + 1; n++) assert.match((await sealNode(io, "G1")).errors[0], /requires explicit user approval/);
+  for (let n = 0; n < 3; n++) assert.match((await sealNode(io, "G1")).errors[0], /requires explicit user approval/);
   for (const userApproval of ["", "  ", null, true, 123]) assert.match((await sealNode(io, "G1", { userApproval })).errors[0], /nonempty string/);
   assert.equal(exec.calls.length, 0);
   assert.equal(loadRoot(io, "G1").approval, undefined);
@@ -253,8 +248,8 @@ test("approval: every revision or on-disk edit invalidates approval", async (t) 
   for (const mutate of [
     (draft) => { draft.criteria.pop(); },
     (draft) => { draft.criteria[0].requirement = "Weakened requirement"; },
-    (draft) => { draft.criteria[0].check.command = "true"; },
-    (draft) => { draft.criteria[0].controls.reject[0].setup = "true"; },
+    (draft) => { draft.criteria[0].check.recipe.command = "true"; },
+    (draft) => { draft.criteria[0].controls.reject[0].mutations[0].content = "done\n"; },
     (draft) => { draft.assumptions = ["Changed policy"]; },
   ]) {
     assert.equal((await prepareNode(io)).ok, true);
@@ -272,7 +267,7 @@ test("approval: every revision or on-disk edit invalidates approval", async (t) 
     fs.writeFileSync(draftFile(dir, "G1"), JSON.stringify(original));
     draftNode(io, { goal: "g", criteria: ROOT_CRITERIA, revise: "G1" });
   }
-  // A legacy root without a review digest fails closed until revised.
+  // A root whose review digest is missing fails closed until revised.
   const root = loadRoot(io, "G1");
   delete root.reviewDigest;
   core.saveRoot(io, root);
@@ -332,7 +327,7 @@ test("policy: limits are editable before first approval, atomic when invalid, an
     assert.equal(draftNode(io, { revise: "G1", goal: "Should not persist", criteria: ROOT_CRITERIA, policy }).ok, false);
     assert.deepEqual(files.map((file) => fs.readFileSync(file, "utf8")), before);
   }
-  assert.equal(draftNode(io, { revise: "G1", goal: "Invalid", criteria: [behavior("C1", "check:c1")], policy: { deadlineMinutes: 900 } }).ok, false);
+  assert.equal(draftNode(io, { revise: "G1", goal: "Invalid", criteria: [behavior("C1", "check:c1"), behavior("C1", "check:c1")], policy: { deadlineMinutes: 900 } }).ok, false);
   assert.deepEqual(files.map((file) => fs.readFileSync(file, "utf8")), before);
   // Partial corrections retain effective values; the retained request outranks a later one.
   nowRef.now += 14 * 86400000;
@@ -428,8 +423,9 @@ test("prepare: failures spend only the evaluator budget, repair precedes first a
   const dir = tempProject(t);
   const exec = fileExec(dir, { checks: standardChecks });
   let bad = true;
+  // While bad, C1 passes on any fixture that has the artifact, so the reject witness survives.
   const wrapped = async (command, opts) => {
-    if (bad && command === "reject:C1") { write(opts.cwd, "feature.txt", "done\n"); return { exit: 0, stdout: "", stderr: "", timedOut: false }; }
+    if (bad && command === "check:c1" && fs.existsSync(path.join(opts.cwd, "feature.txt"))) return { exit: 0, stdout: "", stderr: "", timedOut: false };
     return exec(command, opts);
   };
   const { io } = testIo(dir, wrapped);
@@ -439,6 +435,11 @@ test("prepare: failures spend only the evaluator budget, repair precedes first a
   assert.equal(failed.review, undefined);
   assert.equal((await sealNode(io, "G1", { userApproval: "Proceed" })).ok, false);
   assert.equal(loadNodeState(io, "G1").evaluatorMetrics.e0Attempts, 1);
+  // Agent-repairable evaluator findings are never a reason to pause.
+  const misuse = await blockNode(io, "G1", { code: "AUTHORIZATION_MISSING", reason: "Evaluator needs changes" });
+  assert.match(misuse.errors[0], /only agent-repairable evaluator diagnostics \(REJECT_NOT_DISCRIMINATED\)/);
+  assert.match(misuse.next, /revise G1 evaluator with exitcode_draft/);
+  assert.equal(loadRoot(io, "G1").status, NodeState.ACTIVE);
   // Operational corrections remain possible after a failed E0.
   assert.equal(draftNode(makeIo(dir, { exec: wrapped }), { revise: "G1", goal: "g", criteria: ROOT_CRITERIA, policy: { deadlineMinutes: 480, evaluatorAttempts: 3 } }).ok, true);
   assert.equal((await prepareNode(io)).ok, false);
@@ -463,7 +464,7 @@ test("prepare: candidate, policy, or concurrent changes during E0 invalidate the
     let changed = false;
     const wrapped = async (command, opts) => {
       const result = await exec(command, opts);
-      if (!changed && (phase === "controls" && command === "reject:C1" || phase === "wiring" && fs.readdirSync(opts.cwd).length === 0 ||
+      if (!changed && (phase === "controls" && command === "check:c1" || phase === "wiring" && fs.readdirSync(opts.cwd).length === 0 ||
         phase === "baseline" && command === "check:reg" && fs.existsSync(path.join(opts.cwd, "feature.txt")))) { changed = true; write(dir, "feature.txt", "changed"); }
       return result;
     };
@@ -623,10 +624,30 @@ test("staging: user-authorized test windows preserve product, invalidate approva
     assert.match(core.requestTestStaging(fresh, "G1.1", { reason: "Change parent tests" }).errors[0], /sealed ancestor/);
   });
 
-  for (const limit of ["files", "bytes", "windows", "missing-snapshot", "symlink", "no-changes", "revise-request"]) await t.test(limit, async (t) => {
+  for (const limit of ["draft-request", "files", "bytes", "windows", "missing-snapshot", "symlink", "no-changes", "revise-request"]) await t.test(limit, async (t) => {
     const dir = tempProject(t, { "feature.txt": "todo\n", "proof.test.mjs": "old" });
     const { io } = testIo(dir, fileExec(dir, { checks: standardChecks }));
     draftNode(io, { goal: "g", criteria: ROOT_CRITERIA });
+    if(limit==="draft-request") {
+      const before=[fs.readFileSync(draftFile(dir,"G1"),"utf8"),loadRoot(io,"G1"),loadNodeState(io,"G1")];
+      for(const testStaging of [null,{}, {reason:""},{reason:"x".repeat(1001)}, {reason:"Tests",paths:["feature.txt"]},{reason:"Tests",paths:[]}]) {
+        assert.equal(draftNode(io,{goal:"changed",criteria:ROOT_CRITERIA,revise:"G1",testStaging}).ok,false);
+        assert.deepEqual([fs.readFileSync(draftFile(dir,"G1"),"utf8"),loadRoot(io,"G1"),loadNodeState(io,"G1")],before,"invalid staging does not partially revise the draft");
+      }
+      const submitted=draftNode(io,{goal:"g",criteria:ROOT_CRITERIA,revise:"G1",testStaging:{reason:"Write new acceptance tests",paths:["new.test.mjs"]}});
+      assert.equal(submitted.testStaging.status,"requested");
+      assert.equal(loadNodeState(io,"G1").evaluatorMetrics.e0Attempts,0);
+      assert.equal(fs.existsSync(path.join(dir,"new.test.mjs")),false,"the draft exists before the test");
+      assert.equal((await prepareNode(io)).ok,false,"pending staging prevents premature E0");
+      assert.equal(core.approveTestStaging(io,"G1").ok,true);
+      write(dir,"new.test.mjs","import {test} from 'node:test'; test('new behavior',()=>{});");
+      assert.equal(core.completeTestStaging(io,"G1").ok,true);
+      assert.equal((await prepareNode(io)).ok,true);
+      assert.equal(loadNodeState(io,"G1").phase,"READY_FOR_APPROVAL");
+      assert.equal(loadNodeState(io,"G1").evaluatorMetrics.e0Attempts,1);
+      assert.equal(loadRoot(io,"G1").consumedAttempts,0);
+      return;
+    }
     if (limit === "windows") {
       const node = loadNodeState(io, "G1"); node.testStagingsCompleted = core.MAX_TEST_STAGINGS_PER_NODE; core.saveNodeState(io, node);
       assert.equal(core.requestTestStaging(io, "G1", { reason: "Again" }).ok, false); return;
@@ -895,7 +916,7 @@ test("snapshots: fixtures and checkpoints copy large trees independently and out
   const exec = fileExec(dir, { checks: standardChecks });
   const fixtures = [];
   const { io } = testIo(dir, async (command, opts) => {
-    if (command.startsWith("accept:") || command.startsWith("reject:")) {
+    if (command === "check:c1" && fs.existsSync(path.join(opts.cwd, "target/build.bin"))) {
       fixtures.push(opts.cwd);
       assert.ok(path.relative(outer, opts.cwd).startsWith(`..${path.sep}`), "fixtures cannot discover the candidate repository");
       assert.equal(fs.statSync(path.join(opts.cwd, "target/build.bin")).size, bytes);
@@ -993,12 +1014,12 @@ test("status: injected state is bounded and evidence-free; explicit evidence is 
   const prompt = promptStatusText(io);
   assert.ok(Buffer.byteLength(prompt) <= PROMPT_STATUS_MAX_BYTES, `${Buffer.byteLength(prompt)} bytes`);
   assert.match(prompt, /next: /);
-  assert.doesNotMatch(prompt, /check:c1|accept:C1|evaluator evidence|"contract"/);
-  assert.doesNotMatch(statusText(io), /evaluator evidence|accept:C1/);
-  assert.match(statusText(io, { detail: "evidence" }), /accept:C1/);
+  assert.doesNotMatch(prompt, /check:c1|write_file|evaluator evidence|"contract"/);
+  assert.doesNotMatch(statusText(io), /evaluator evidence|check:c1/);
+  assert.match(statusText(io, { detail: "evidence" }), /check:c1/);
   // The loop position drives the next action.
   draftNode(io, { goal: "g", criteria: ROOT_CRITERIA, revise: "G1" });
-  assert.match(statusSnapshot(io).next, /prepare or repair/);
+  assert.match(statusSnapshot(io).next, /revise G1 evaluator with exitcode_draft/);
   assert.equal((await prepareNode(io)).ok, true);
   assert.match(promptStatusText(io), /awaiting the user's reply/);
   assert.match(statusSnapshot(io).review, /Verification\n- C1: an isolated custom command; rejected 1 independent near-miss\./);

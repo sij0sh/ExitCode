@@ -58,7 +58,9 @@ export async function prepareGate(draft, {cwd,exec,runCheck,defaultTimeoutMs,env
   const report = (stage) => {ensureRunning(signal);onProgress?.({phase:'EVALUATOR_PREPARATION',stage,elapsedMs:Date.now()-start});};
   const boundaryDiagnostic = (e,stage) => {
     const code=e.code ?? (stage === 'quality' ? reviewFailure(e).code : 'IO_ERROR');
-    return diagnostic(code,stage,null,e.message,'Restore the authorized reviewer or runner, then resume the same evaluator',code==='CONTROL_SETUP_FAILED'?'agent':'supervisor');
+    return diagnostic(code,stage,null,e.message,code==='REVIEW_TOO_LARGE'
+      ? 'Reduce or consolidate evaluator scope and retry preparation'
+      : 'Repair the draft or authorized environment, stage tests, or retry preparation',code==='CONTROL_SETUP_FAILED'?'agent':'supervisor');
   };
   const execute = async (command,runOptions) => {
     ensureRunning(signal,deadlineAt,nowMs);
@@ -95,7 +97,7 @@ export async function prepareGate(draft, {cwd,exec,runCheck,defaultTimeoutMs,env
     report('preflight');
     session=sessionFor(cwd,identity,maxBytes,metrics,signal,options);
     if(candidateIdentity(session.base,options)!==candidateDigest)throw operationError('CANDIDATE_MUTATED','Candidate changed while copying preparation base');
-    if(exec===sandboxCommand && draft.criteria.some(c=>!BUILTIN_RECIPES.includes(c.check.recipe?.kind) || [c.controls?.accept,...(c.controls?.reject??[])].some(x=>x?.setup))) {
+    if(exec===sandboxCommand && draft.criteria.some(c=>!BUILTIN_RECIPES.includes(c.check.recipe.kind))) {
       const runtime=await execute('true',{cwd:session.base,timeoutMs:defaultTimeoutMs,signal});
       if(runtime.error || runtime.timedOut || runtime.exit!==0)throw operationError(runtime.errorCode ?? 'ISOLATION_UNAVAILABLE',runtime.error ?? runtime.stderr ?? 'isolated runtime unavailable');
     }
@@ -123,8 +125,7 @@ export async function prepareGate(draft, {cwd,exec,runCheck,defaultTimeoutMs,env
       const fixture=fixtureDirectory(cwd,'exitcode-valid-');
       try {
         metrics.fixtureBytes+=copyCandidate(session.base,fixture,maxBytes,signal,options);metrics.fixtureCopies++;
-        if(control.mutations){try{await applyMutations(fixture,control.mutations);}catch(e){throw operationError('CONTROL_SETUP_FAILED',e.message);}}
-        if(control.setup){const r=await execute(control.setup,{cwd:fixture,timeoutMs:defaultTimeoutMs,writable:true,signal});if(r.error||r.timedOut)throw operationError(r.errorCode ?? 'RUNNER_ERROR',r.error ?? `accept setup timed out for ${c.id}`);if(r.exit!==0)throw operationError('CONTROL_SETUP_FAILED',`accept setup failed for ${c.id}`);}
+        try{await applyMutations(fixture,control.mutations);}catch(e){throw operationError('CONTROL_SETUP_FAILED',e.message);}
         if(assets){installEvaluatorAssets(fixture,assetsDirectory,assets);verifyEvaluatorAssets(fixture,assetsDirectory,assets);}
         ensureRunning(signal);
         validFixtures.push({criterionId:c.id,witness:source,...witnessChanges(session.base,fixture,draft.specificationPaths)});
@@ -137,7 +138,7 @@ export async function prepareGate(draft, {cwd,exec,runCheck,defaultTimeoutMs,env
   }catch(e){diagnostics.push(boundaryDiagnostic(e,e.code==='CONTROL_SETUP_FAILED'?'discrimination':'quality'));}
   // Every behavior needs some negative evidence: authored, independently derived, or built in.
   if(assessed && !diagnostics.length)for(const c of behaviors)
-    if(!(c.controls?.reject?.length||assessed?.criteria.find(a=>a.criterionId===c.id)?.shams.length||BUILTIN_RECIPES.includes(c.check.recipe?.kind)))
+    if(!(c.controls?.reject?.length||assessed?.criteria.find(a=>a.criterionId===c.id)?.shams.length||BUILTIN_RECIPES.includes(c.check.recipe.kind)))
       diagnostics.push(diagnostic('NEGATIVE_EVIDENCE_MISSING','quality',c.id,'No independent near-miss or reject witness challenges this check','Supply one minimal controls.reject witness or a behavioral check whose near-misses can be challenged'));
   stages.push({stage:'quality-assess',ok:!diagnostics.length,assessed});
   if(diagnostics.length)return finish();
@@ -147,7 +148,7 @@ export async function prepareGate(draft, {cwd,exec,runCheck,defaultTimeoutMs,env
     jobs.push(async()=>{
       ensureRunning(signal);
       const key=digest({criterion,stage,control,expected,label});
-      const cacheable=Boolean(BUILTIN_RECIPES.includes(criterion.check.recipe?.kind) && !control?.setup);
+      const cacheable=BUILTIN_RECIPES.includes(criterion.check.recipe.kind);
       if(useCache&&cacheable&&session.probes.has(key)){metrics.cacheHits++;return session.probes.get(key);}
       active++;metrics.peakConcurrency=Math.max(metrics.peakConcurrency,active);
       let fixture;
@@ -156,7 +157,6 @@ export async function prepareGate(draft, {cwd,exec,runCheck,defaultTimeoutMs,env
         fixture=fixtureDirectory(cwd,'exitcode-probe-');
         if(stage!=='wiring'){metrics.fixtureBytes+=copyCandidate(session.base,fixture,maxBytes,signal,options);metrics.fixtureCopies++;}
         if(control?.mutations)await applyMutations(fixture,control.mutations);
-        if(control?.setup){const setup=await execute(control.setup,{cwd:fixture,timeoutMs:defaultTimeoutMs,writable:true,signal});if(setup.error||setup.timedOut)throw operationError(setup.errorCode ?? 'RUNNER_ERROR',setup.error ?? 'setup timed out');if(setup.exit!==0)throw operationError('CONTROL_SETUP_FAILED',`setup failed: ${setup.stderr??setup.exit}`);}
         if(stage!=='wiring' && assets)installEvaluatorAssets(fixture,assetsDirectory,assets);
         if(stage==='sham'){
           metrics.probeExecutions++;
@@ -190,7 +190,7 @@ export async function prepareGate(draft, {cwd,exec,runCheck,defaultTimeoutMs,env
       queue(c,'determinism',accept,'PASS','accept-repeat');
       // Supervisor-generated negatives for built-in recipes.
       const r=c.check.recipe;
-      if(r?.path&&BUILTIN_RECIPES.includes(r.kind)){
+      if(r.path&&BUILTIN_RECIPES.includes(r.kind)){
         queue(c,'adversarial',{mutations:[{kind:'delete_file',path:r.path}]},'FAIL','delete-target');
         if(r.kind==='file_contains')queue(c,'adversarial',{mutations:[{kind:'write_file',path:r.path,content:`unrelated-${digest(r.value).slice(0,8)}`}]},'FAIL','unrelated-content');
         if(r.kind==='file_not_contains')queue(c,'adversarial',{mutations:[{kind:'write_file',path:r.path,content:r.value}]},'FAIL','forbidden-content');

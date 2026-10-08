@@ -32,14 +32,13 @@ const ExpectSchema = Type.Object({
 });
 
 const CheckSchema = Type.Object({
-  command: Type.Optional(Type.String({ description: "Isolated custom shell escape hatch" })),
-  recipe: Type.Optional(Type.Object({
+  recipe: Type.Object({
     kind: Type.Union(core.RECIPE_KINDS.map((x: string) => Type.Literal(x))),
     path: Type.Optional(Type.String()), value: Type.Optional(Type.Unknown()),
     pointer: Type.Optional(Type.String()), selector: Type.Optional(Type.String({ description: "existing_test: exact discovered literal name already present in the file; never invent a future test name" })),
-    runner: Type.Optional(Type.String()), command: Type.Optional(Type.String({ description: "command_exit: executable basename (e.g. sh), with args separately; custom_command: shell string (e.g. sh scripts/verify)" })),
+    command: Type.Optional(Type.String({ description: "command_exit: executable basename (e.g. sh), with args separately; custom_command: isolated shell string (e.g. sh scripts/verify)" })),
     args: Type.Optional(Type.Array(Type.String(), { description: "command_exit arguments, e.g. [scripts/verify] with command sh; test_suite runs the discovered npm test script" })),
-  })),
+  }),
   assets: Type.Optional(Type.Array(Type.String({minLength:1}), {description:"Acceptance helpers outside conventional test paths; frozen at seal, not product source"})),
   timeoutSeconds: Type.Optional(Type.Number({ description: "Immutable explicit check watchdog; otherwise use remaining execution time" })),
   expect: Type.Optional(ExpectSchema),
@@ -51,8 +50,7 @@ const MutationSchema = Type.Object({
   to: Type.Optional(Type.String()), pointer: Type.Optional(Type.String()), value: Type.Optional(Type.Unknown()),
 });
 const FixtureSchema = Type.Object({
-  setup: Type.Optional(Type.String({ minLength:1, description:"Isolated legacy/custom shell setup" })),
-  mutations: Type.Optional(Type.Array(MutationSchema, {minItems:1,maxItems:32})),
+  mutations: Type.Array(MutationSchema, {minItems:1,maxItems:32}),
   reason: Type.Optional(Type.String()),
 });
 const ControlsSchema = Type.Object({
@@ -91,19 +89,28 @@ const ReviewAssessSchema = Type.Object({
   }), {maxItems:32}),
 });
 
-// Each isolated semantic-review call gets exactly this one response tool.
-// Constrained sampling is preferred where supported; plain-JSON text stays
-// as a compatibility fallback for providers without tool support.
-function reviewTool(phase: string) {
+// Each isolated semantic-review call gets at most this one response tool.
+function reviewTool(phase: string, constrained: boolean) {
   return {
     name: core.REVIEW_TOOL_NAME,
     description: phase === "derive"
       ? "Submit independently derived outcomes for each behavior criterion"
       : "Submit assessment of each check against the derived outcomes",
     parameters: phase === "derive" ? ReviewDeriveSchema : ReviewAssessSchema,
-    constrainedSampling: { type: "json_schema", strict: "prefer" },
+    ...(constrained ? { constrainedSampling: { type: "json_schema", strict: "prefer" } } : {}),
   };
 }
+
+// Review request shapes, most constrained first. A 400 rejects ExitCode's
+// request shape, not the task, so preparation tries a compatible shape.
+// The first shape a provider/model accepts is reused for the session.
+const REVIEW_TRANSPORTS = [
+  { tool: true, constrained: true, reasoning: true },
+  { tool: true, constrained: false, reasoning: true },
+  { tool: true, constrained: false, reasoning: false },
+  { tool: false, constrained: false, reasoning: false },
+] as const;
+type ReviewTransports = Map<string, number>;
 
 const CriterionSchema = Type.Object({
   id: Type.Optional(Type.String({ description: "Suggested id (supervisor assigns C1..Cn when omitted)" })),
@@ -136,6 +143,7 @@ type Runtime = {
   nudges: number;
   progress: string | undefined;
   operations: Map<AbortController, Promise<void>>;
+  reviewTransports: ReviewTransports;
 };
 
 type ToolDef = {
@@ -181,45 +189,67 @@ function cascadeLines(cascade: { events?: string[]; terminal?: { root: string; s
   return lines;
 }
 
-// Review retries are bounded in the core. Usage includes each completed provider attempt.
-function reviewIo(ctx: ExtensionContext, signal?: AbortSignal, onProgress?: (progress: any) => void, expectedRootId?: string | null) {
+// Transport retries are bounded in the core. Usage includes each completed provider attempt.
+function reviewIo(ctx: ExtensionContext, transports: ReviewTransports, signal?: AbortSignal, onProgress?: (progress: any) => void, expectedRootId?: string | null) {
   const usage = { available:false,input:0,output:0,cacheRead:0,cacheWrite:0,totalTokens:0,
     cost:{input:0,output:0,cacheRead:0,cacheWrite:0,total:0} };
-  const io = core.makeIo(ctx.cwd, { signal: signal ?? ctx.signal, reviewUsage:usage,onProgress,expectedRootId,
+  const request = async (input: any, encoded: string, transport: typeof REVIEW_TRANSPORTS[number], abort: AbortSignal, expanded: boolean) => {
+    const tool=reviewTool(input.phase,transport.constrained);
+    const result=await ctx.modelRegistry.streamSimple(ctx.model, {
+      systemPrompt:core.reviewPrompt(input.phase),
+      messages:[{role:"user",content:encoded,timestamp:Date.now()}],
+      ...(transport.tool ? {tools:[tool]} : {}),
+    }, {...(transport.reasoning && !expanded ? {reasoning:"low"} : {}),maxTokens:expanded?core.REVIEW_RETRY_MAX_TOKENS:core.REVIEW_MAX_TOKENS,signal:abort}).result();
+    // Provider errors can still carry billable usage.
+    if(result.usage)usage.available=true;
+    for(const k of ["input","output","cacheRead","cacheWrite","totalTokens"] as const)
+      usage[k]+=result.usage?.[k] ?? 0;
+    for(const k of ["input","output","cacheRead","cacheWrite","total"] as const)
+      usage.cost[k]+=result.usage?.cost?.[k] ?? 0;
+    if(result.stopReason!=="stop"&&result.stopReason!=="toolUse")throw Object.assign(new Error(result.errorMessage ?? `review stopped: ${result.stopReason}`),result.stopReason==="aborted"?{code:"CANCELLED"}:result.stopReason==="length"?{code:"REVIEW_TOO_LARGE"}:{});
+    const call=(result.content??[]).find((b:any)=>b?.type==="toolCall"&&b?.name===tool.name);
+    if(call) {
+      const args=typeof call.arguments==="string"?core.parseReviewText(call.arguments):call.arguments;
+      const sized=JSON.stringify(args??null);
+      if(!sized||sized.length>512*1024)throw Object.assign(new Error("review output exceeds bounded response"),{code:"REVIEW_RESPONSE_INVALID"});
+      return args;
+    }
+    const text=result.content.filter(b=>b.type==="text").map(b=>b.text).join("");
+    if(text.length>512*1024)throw Object.assign(new Error("review output exceeds bounded response"),{code:"REVIEW_RESPONSE_INVALID"});
+    return core.parseReviewText(text);
+  };
+  return core.makeIo(ctx.cwd, { signal: signal ?? ctx.signal, reviewUsage:usage,onProgress,expectedRootId,
     review: async (input: any, options: {signal:AbortSignal}) => {
       if (!ctx.model || !ctx.modelRegistry?.streamSimple) throw new Error("selected review model unavailable");
       const encoded=JSON.stringify(input);
       if(encoded.length>2*1024*1024)throw new Error("review input exceeds bounded context; reduce evaluator scope");
-      const tool=reviewTool(input.phase);
-      const result=await ctx.modelRegistry.streamSimple(ctx.model, {
-        systemPrompt:core.reviewPrompt(input.phase),
-        messages:[{role:"user",content:encoded,timestamp:Date.now()}],
-        tools:[tool],
-      }, {reasoning:ctx.thinkingLevel,maxTokens:core.REVIEW_MAX_TOKENS,signal:options.signal}).result();
-      // Provider errors can still carry billable usage.
-      if(result.usage)usage.available=true;
-      for(const k of ["input","output","cacheRead","cacheWrite","totalTokens"] as const)
-        usage[k]+=result.usage?.[k] ?? 0;
-      for(const k of ["input","output","cacheRead","cacheWrite","total"] as const)
-        usage.cost[k]+=result.usage?.cost?.[k] ?? 0;
-      if(result.stopReason!=="stop"&&result.stopReason!=="toolUse")throw Object.assign(new Error(result.errorMessage ?? `review stopped: ${result.stopReason}`),result.stopReason==="aborted"?{code:"CANCELLED"}:result.stopReason==="length"?{code:"REVIEW_RESPONSE_INVALID"}:{});
-      const call=(result.content??[]).find((b:any)=>b?.type==="toolCall"&&b?.name===tool.name);
-      if(call) {
-        const args=typeof call.arguments==="string"?core.parseReviewText(call.arguments):call.arguments;
-        const sized=JSON.stringify(args??null);
-        if(!sized||sized.length>512*1024)throw Object.assign(new Error("review output exceeds bounded response"),{code:"REVIEW_RESPONSE_INVALID"});
-        return args;
+      const key=`${ctx.model.provider}/${ctx.model.id}`;
+      let expanded=false;
+      for(let level=transports.get(key)??0;;) {
+        try {
+          const value=await request(input,encoded,REVIEW_TRANSPORTS[level],options.signal,expanded);
+          transports.set(key,level);
+          return value;
+        } catch(error) {
+          const failure=core.reviewFailure(error);
+          if(failure.code==="REVIEW_TOO_LARGE") {
+            if(expanded)throw Object.assign(new Error("Reviewer response exceeded the bounded retry limit. Reduce or consolidate evaluator scope and retry preparation."),{code:"REVIEW_TOO_LARGE"});
+            expanded=true;
+            onProgress?.({phase:"EVALUATOR_PREPARATION",stage:"review-length-retry",reviewPhase:input.phase});
+            continue;
+          }
+          if(failure.code!=="REVIEW_INCOMPATIBLE")throw error;
+          if(level===REVIEW_TRANSPORTS.length-1)
+            throw Object.assign(new Error(`provider rejected every review request shape: ${failure.message}`),{code:"REVIEW_CONFIGURATION"});
+          level++;
+        }
       }
-      const text=result.content.filter(b=>b.type==="text").map(b=>b.text).join("");
-      if(text.length>512*1024)throw Object.assign(new Error("review output exceeds bounded response"),{code:"REVIEW_RESPONSE_INVALID"});
-      return core.parseReviewText(text);
     },
   });
-  return io;
 }
 
 export default function (pi: ExtensionAPI) {
-  const rt: Runtime = { pi, modeOn: false, rootId: undefined, pendingGoal: undefined, nudges: 0, progress:undefined, operations:new Map() };
+  const rt: Runtime = { pi, modeOn: false, rootId: undefined, pendingGoal: undefined, nudges: 0, progress:undefined, operations:new Map(), reviewTransports:new Map() };
   const TOOL_NAMES = core.EXITCODE_TOOL_NAMES;
 
   const assertMode = () => {
@@ -255,7 +285,6 @@ export default function (pi: ExtensionAPI) {
       const root = core.loadRoot(io, rt.rootId);
       return [
         `exitcode root ${rt.rootId} [${root?.status ?? "MISSING"}]`,
-        ...(root?.outcome?.reason ? [`${root.outcome.code}: ${root.outcome.reason}`] : []),
         "Enforcement remains on. Only a fresh root PASS exits automatically.",
         "Use /exitcode exit to cancel without completing the goal.",
       ].join("\n");
@@ -289,22 +318,15 @@ export default function (pi: ExtensionAPI) {
     applyExposure();
   };
 
+  // A fresh root PASS is the only terminal state, and the only automatic exit.
   const maybeAutoExit = (result: any, ctx: ExtensionContext) => {
     const terminal = result?.terminal;
-    if (!terminal || (terminal.status !== "PASS" && terminal.status !== "BLOCKED")) return;
+    if (terminal?.status !== "PASS") return;
     const io = core.makeIo(ctx.cwd);
-    if (terminal.status === "PASS") {
-      const root = core.loadRoot(io, terminal.root);
-      if (root?.status !== "PASS" || core.terminalStale(io, terminal.root).stale) return;
-      exitMode(ctx);
-    }
-    if (ctx.hasUI) {
-      const summary =
-        terminal.status === "PASS"
-          ? `exitcode: root ${terminal.root} PASS (candidate ${String(terminal.outcome?.candidateDigest ?? "?").slice(0, 12)}). Mode off.`
-          : `exitcode: root ${terminal.root} BLOCKED (${terminal.outcome?.code ?? "?"}): ${terminal.outcome?.reason ?? "no reason"}. Enforcement remains on; /exitcode exit cancels.`;
-      ctx.ui.notify(summary, terminal.status === "PASS" ? "success" : "warning");
-    }
+    const root = core.loadRoot(io, terminal.root);
+    if (root?.status !== "PASS" || core.terminalStale(io, terminal.root).stale) return;
+    exitMode(ctx);
+    if (ctx.hasUI) ctx.ui.notify(`exitcode: root ${terminal.root} PASS (candidate ${String(terminal.outcome?.candidateDigest ?? "?").slice(0, 12)}). Mode off.`, "success");
   };
 
   const withOperation = async <T>(ctx: ExtensionContext, signal: AbortSignal | undefined, onUpdate: unknown,
@@ -315,7 +337,7 @@ export default function (pi: ExtensionAPI) {
     let complete!: () => void;
     const done=new Promise<void>(resolve=>{complete=resolve;});
     rt.operations.set(controller,done);
-    const io=reviewIo(ctx,controller.signal,progress=>{
+    const io=reviewIo(ctx,rt.reviewTransports,controller.signal,progress=>{
       const content=`exitcode: ${progress.phase} / ${progress.stage}${progress.elapsedMs===undefined?'':` (${(progress.elapsedMs/1000).toFixed(1)}s)`}`;
       if(typeof onUpdate==='function')onUpdate(textResult(content,{progress}));
       if(ctx.hasUI)ctx.ui.setStatus?.('exitcode',content);
@@ -325,21 +347,16 @@ export default function (pi: ExtensionAPI) {
   };
 
   const sealContract = async (nodeId: string, ctx: ExtensionContext, userApproval?: string, signal?: AbortSignal, onUpdate?: unknown) => withOperation(ctx,signal,onUpdate,async io => {
+    // Sealing never completes a goal; it either unlocks execution or pauses.
     const result = await core.sealNode(io, nodeId, { userApproval });
-    maybeAutoExit(result.cascade ?? result, ctx);
     syncBaseline(ctx);
     if (!result.ok && !result.events) {
-      const lines = withWarnings([`seal rejected:`, errLines(result)], result.warnings);
-      if (typeof result.sealAttemptsLeft === "number") lines.push(`seal proposals left: ${result.sealAttemptsLeft}`);
-      return {...textResult(lines.join("\n"), result, true),usage:io.reviewUsage};
+      return {...textResult(withWarnings([`seal rejected:`, errLines(result)], result.warnings).join("\n"), result, true),usage:io.reviewUsage};
     }
     const lines = result.sealed
       ? [`sealed ${result.sealed}. baseline: ${result.baseline}`]
       : [...(result.events ?? [])];
-    if (result.alreadySatisfied) lines.push("baseline already satisfies every criterion: goal already met under this contract.");
-    lines.push(...cascadeLines(result.cascade));
     if (result.next) lines.push(`next: ${result.next}`);
-    if (result.terminal) lines.push(`terminal: root ${result.terminal.root} ${result.terminal.status}`);
     return {...textResult(withWarnings(lines, result.warnings).join("\n"), result,!result.ok),usage:io.reviewUsage};
   });
 
@@ -365,7 +382,7 @@ export default function (pi: ExtensionAPI) {
       label: "Exitcode Draft",
       description:
         "Submit the smallest observable acceptance contract, one outcome per criterion. Prefer discovered existing tests; never invent an existing_test selector. " +
-        "For new behavior use a focused command with controls, or request exitcode_stage_tests before root sealing when tests must change; use test_suite for regression. " +
+        "For new behavior use a focused command with controls, or include testStaging to create the draft and request test edits before the first preparation; use test_suite for regression. " +
         "ExitCode validates it before user review; repair returned diagnostics, then present the returned plan and wait for the user's reply.",
       promptSnippet: "exitcode_draft: submit the root contract (goal + observable criteria + checks)",
       parameters: Type.Object({
@@ -376,6 +393,10 @@ export default function (pi: ExtensionAPI) {
         exclusions: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { description: "Out-of-scope work to show in user review" })),
         revise: Type.Optional(Type.String({ description: "Existing DRAFT root id to revise (e.g. G1)" })),
         policy: Type.Optional(PolicySchema),
+        testStaging: Type.Optional(Type.Object({
+          reason: Type.String({minLength:1,maxLength:1000,description:"Which acceptance tests must be written or updated before E0 and why"}),
+          paths: Type.Optional(Type.Array(Type.String({minLength:1}), {minItems:1,maxItems:core.MAX_STAGED_FILES,description:"Exact conventional test files to stage"})),
+        }, {description:"Create or revise the DRAFT, request authorized test staging, and defer automatic E0 until a later draft submission"})),
         specificationPaths: Type.Optional(Type.Array(Type.String({minLength:1}), {description:"Advanced: referenced Markdown plans to include in independent review, including explicit hidden paths"})),
         mutableDependencies: Type.Optional(Type.Boolean({description:"Advanced: the task must change product dependencies; devDependencies and evaluator runtimes stay frozen"})),
       }),
@@ -394,6 +415,7 @@ export default function (pi: ExtensionAPI) {
           assumptions: params.assumptions,
           exclusions: params.exclusions,
           revise: params.revise,
+          testStaging: params.testStaging,
         });
         if (!result.ok) return textResult(`draft rejected:\n${errLines(result)}`, result, true);
         rt.rootId = result.rootId;
@@ -401,6 +423,12 @@ export default function (pi: ExtensionAPI) {
         persistMode();
         syncBaseline(ctx);
         io.expectedRootId=result.rootId;
+        if(result.testStaging) {
+          const staging=result.testStaging;
+          return textResult(withWarnings([`test staging requested for ${result.id}.`, `reason: ${staging.reason}`,
+            ...(staging.paths?.length?[`paths: ${staging.paths.join(", ")}`]:[]),
+            "Present this request and wait for the user's reply; quote it as userApproval to open the window.", `next: ${staging.next}`],result.warnings).join("\n"),result);
+        }
         const prepared = await core.prepareNode(io,result.id);
         prepared.warnings=[...(result.warnings??[]),...(prepared.warnings??[])];
         syncBaseline(ctx);
@@ -491,7 +519,7 @@ export default function (pi: ExtensionAPI) {
     {
       name: "exitcode_block",
       label: "Exitcode Block",
-      description: "Pause for a concrete external authority, infrastructure, budget, ambiguity, or viable-path blocker. Test edits use exitcode_stage_tests; lint errors need evaluator repair. Only a child NO_PATH withdraws that path and reruns its parent.",
+      description: "Pause for a concrete external authority, infrastructure, budget, or viable-path blocker. Ask the user directly about ambiguity. Test edits use exitcode_stage_tests; agent-repairable evaluator diagnostics are rejected here and need evaluator repair. Only a child NO_PATH withdraws that path and reruns its parent.",
       promptSnippet: "exitcode_block: pause with the concrete missing requirement",
       parameters: Type.Object({
         node: Type.Optional(Type.String({ description: "Node id (defaults to the active leaf)" })),
@@ -509,11 +537,8 @@ export default function (pi: ExtensionAPI) {
         if (!target) return textResult("block rejected:\n- no active node", { ok: false }, true);
         const result = await core.blockNode(io, target, { reason: params.reason, code: params.code ?? "NO_PATH" });
         if (!result.ok) {syncBaseline(ctx);return textResult(`${result.paused?"paused":"block rejected"}:\n${errLines(result)}`, result, true);}
-        maybeAutoExit(result, ctx);
         syncBaseline(ctx);
-        const lines = [...(result.events ?? [])];
-        if (result.terminal) lines.push(`terminal: root ${result.terminal.root} ${result.terminal.status}`, "Enforcement remains on. Only the user can cancel with /exitcode exit.");
-        return textResult(lines.join("\n"), result);
+        return textResult((result.events ?? []).join("\n"), result);
       }),
     },
     {
@@ -568,21 +593,11 @@ export default function (pi: ExtensionAPI) {
   // --- session lifecycle ---------------------------------------------------
 
   pi.on("session_start", (_event, ctx) => {
-    const branch = ctx.sessionManager.getBranch();
-    const mode = core.resolveModeFromBranch(branch);
+    const mode = core.resolveModeFromBranch(ctx.sessionManager.getBranch());
     rt.modeOn = mode.on;
     rt.rootId = mode.rootId;
     rt.nudges = 0;rt.progress=undefined;
     rt.pendingGoal = mode.pendingGoal;
-    // Older versions narrowed the loadout before sealing. Return it once, claiming only borrowed discovery tools.
-    const entry = branch.findLast((entry) => entry.type === "custom" && entry.customType === core.MODE_ENTRY_TYPE);
-    const legacy = (entry as { data?: { discoveryToolsAdded?: unknown; toolsSuspended?: unknown } } | undefined)?.data ?? {};
-    const borrowed = Array.isArray(legacy.discoveryToolsAdded) ? legacy.discoveryToolsAdded.filter((name) => ["read", "grep", "ls", "find"].includes(name)) : [];
-    const suspended = Array.isArray(legacy.toolsSuspended) ? legacy.toolsSuspended.filter((name) => typeof name === "string") : [];
-    if (borrowed.length > 0 || suspended.length > 0) {
-      pi.setActiveTools([...new Set([...pi.getActiveTools().filter((name) => !borrowed.includes(name)), ...suspended])]);
-      persistMode();
-    }
     if(rt.modeOn)core.resumePreparation(core.makeIo(ctx.cwd,{expectedRootId:rt.rootId}));
     applyExposure();
     syncBaseline(ctx);
@@ -796,19 +811,18 @@ export default function (pi: ExtensionAPI) {
         if(!rt.modeOn)enterMode(ctx);else {rt.nudges=0;rt.progress=undefined;persistMode();syncBaseline(ctx);}
         const snap=core.statusSnapshot(io);
         ctx.ui.notify(`${resumed.warnings?.length?resumed.warnings.join("\n")+"\n":""}Resumed root ${resumed.id}. ${snap.next}${snap.review?`\n\n${snap.review}`:''}`,'info');
-        if(resumed.operation==='prepare' || resumed.operation==='seal' || resumed.operation==='evaluate' || resumed.operation==='block' || resumed.operation==='draft') {
+        if(resumed.retry) {
           await withOperation(ctx,undefined,undefined,async operation=>{
             let result;
-            if(resumed.operation==='prepare')result=await core.prepareNode(operation,resumed.nodeId);
-            else if(resumed.operation==='seal')result=await core.sealNode(operation,resumed.nodeId);
-            else if(resumed.operation==='evaluate')result=await core.evaluateNode(operation,resumed.nodeId);
+            if(resumed.operation==='evaluate')result=await core.evaluateNode(operation,resumed.nodeId);
             else if(resumed.operation==='block')result=await core.blockNode(operation,resumed.nodeId,resumed.args);
-            else if(resumed.args)result=core.draftNode(operation,resumed.args);
             else return;
             maybeAutoExit(result.cascade??result,ctx);syncBaseline(ctx);
             pi.sendMessage({customType:'exitcode-resume',content:result.review??withWarnings(result.events??[result.ok?result.next??result.vector??'operation completed':errLines(result)],result.warnings).join('\n'),display:true,details:result},
               {triggerTurn:rt.modeOn && core.statusSnapshot(operation).status==='ACTIVE' && !core.statusSnapshot(operation).awaitingApproval});
           });
+        } else if(!snap.awaitingApproval && snap.staging?.status!=="requested") {
+          pi.sendMessage({customType:'exitcode-resume',content:`Resumed root ${resumed.id}. ${snap.next}`,display:true,details:resumed},{triggerTurn:true});
         }
         return;
       }

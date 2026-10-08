@@ -18,12 +18,14 @@ const source = stripTypeScriptTypes(fs.readFileSync(new URL("./exitcode.ts", imp
 const Type = new Proxy({}, { get: () => () => ({}) });
 const install = new Function("Type", "core", source)(Type, core);
 
+const custom = (command) => ({ recipe: { kind: "custom_command", command } });
+const writes = (path, content) => ({ mutations: [{ kind: "write_file", path, content }] });
 const criteria = [
-  { id: "C1", requirement: "The feature is done", check: { command: "grep -qx done feature.txt" },
-    controls: { accept: { setup: "printf 'done\n' > feature.txt" }, reject: [{ setup: "printf 'todo\n' > feature.txt" }] } },
-  { id: "C2", requirement: "Existing behavior is preserved", type: "regression", check: { command: "test -f feature.txt" } },
+  { id: "C1", requirement: "The feature is done", check: custom("grep -qx done feature.txt"),
+    controls: { accept: writes("feature.txt", "done\n"), reject: [writes("feature.txt", "todo\n")] } },
+  { id: "C2", requirement: "Existing behavior is preserved", type: "regression", check: custom("test -f feature.txt") },
 ];
-const broken = () => { const c = structuredClone(criteria); c[0].controls.reject[0].setup = "printf 'done\n' > feature.txt"; return c; };
+const broken = () => { const c = structuredClone(criteria); c[0].controls.reject[0] = writes("feature.txt", "done\n"); return c; };
 
 function harness(t, content = "todo\n", initialTools = ["read", "write", "bash"]) {
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "exitcode-adapter-test-"));
@@ -109,19 +111,6 @@ test("adapter: mode exposes ExitCode tools without ever changing the user's load
   await h.command("exit");
   assert.deepEqual(h.getActiveTools(), ["bash", "write", "codemode", "custom_tool"]);
   assert.equal(h.tools.get("exitcode_draft").exposure, "hidden");
-  // Older versions narrowed the loadout before sealing; it is returned exactly once.
-  for (const owned of [false, true]) {
-    const legacyTools = ["read", "write", "bash", ...(owned ? ["find"] : [])];
-    const legacy = harness(t, "todo\n", legacyTools);
-    legacy.setActiveTools(["read", "grep", "ls", "find"]);
-    legacy.entries.push({ type: "custom", customType: core.MODE_ENTRY_TYPE, data: { on: true, pendingGoal: "Old goal",
-      discoveryToolsAdded: ["grep", "ls", ...(!owned ? ["find"] : [])], toolsSuspended: ["write", "bash"] } });
-    await legacy.restart();
-    assert.deepEqual(legacy.getActiveTools().filter((name) => !core.EXITCODE_TOOL_NAMES.includes(name)).sort(), [...legacyTools].sort());
-    const count = legacy.entries.length;
-    await legacy.restart();
-    assert.equal(legacy.entries.length, count);
-  }
 });
 
 test("adapter: each turn receives the short protocol and bounded status, never evaluator evidence", async (t) => {
@@ -137,7 +126,7 @@ test("adapter: each turn receives the short protocol and bounded status, never e
   assert.ok(Buffer.byteLength(prompt) < core.PROMPT_STATUS_MAX_BYTES + 1200, `${Buffer.byteLength(prompt)} bytes`);
   assert.match(prompt, /C1: The feature is done/);
   assert.match(prompt, /approval: awaiting the user's reply/);
-  assert.doesNotMatch(prompt, /grep -qx|printf|evaluator evidence:|evaluator metrics:/);
+  assert.doesNotMatch(prompt, /grep -qx|write_file|evaluator evidence:|evaluator metrics:/);
   const status = await h.tool("exitcode_status", {});
   assert.match(status.content[0].text, /Complete all five phases|C1: The feature is done/);
   assert.doesNotMatch(status.content[0].text, /evaluator evidence:/);
@@ -162,7 +151,7 @@ test("adapter: a draft returns a compact validated plan only after E0, and repai
   const text = result.content[0].text;
   for (const fragment of [/Validated plan/, /C1: The feature is done/, /C2: Existing behavior is preserved/, /Use the existing interface/, /Verification\n- C1: an isolated custom command; rejected 1 independent near-miss\./, /Approve this plan/])
     assert.match(text, fragment);
-  assert.doesNotMatch(text, /grep -qx|printf/);
+  assert.doesNotMatch(text, /grep -qx|write_file/);
   assert.ok(Buffer.byteLength(text) < 2048);
   assert.equal(await settle(h), undefined, "review pauses autonomous continuation");
   const sealed = await h.tool("exitcode_seal", { node: "G1" });
@@ -210,14 +199,16 @@ test("adapter: approval comes from a plain-English reply or /exitcode approve, a
 test("adapter: stage-tests opens a bounded test-only window without leaving mode or pausing for approval", async (t) => {
   for (const approval of ["reply", "command"]) await t.test(approval, async (t) => {
     const h = harness(t);
+    const registry=reviewRegistry();h.ctx.modelRegistry=registry;
     fs.writeFileSync(path.join(h.cwd, "proof.test.mjs"), "old acceptance");
     const literalCriteria = [
       { id: "C1", requirement: "Artifact says done", check: { recipe: { kind: "file_contains", path: "feature.txt", value: "done" } } },
       { id: "C2", type: "regression", requirement: "Artifact remains", check: { recipe: { kind: "file_exists", path: "feature.txt" } } },
     ];
-    await draft(h, { criteria: literalCriteria });
-    const request = await h.tool("exitcode_stage_tests", { reason: "Update the acceptance assertion for the requested behavior", paths: ["proof.test.mjs"] });
-    assert.equal(request.details.status, "requested");
+    const request = await draft(h, { criteria: literalCriteria,testStaging:{reason:"Update the acceptance assertion for the requested behavior",paths:["proof.test.mjs"]} });
+    assert.equal(request.details.testStaging.status, "requested");
+    assert.equal(registry.calls.length,0,"staging request defers the first E0");
+    assert.equal(core.loadNodeState(io(h),"G1").evaluatorMetrics.e0Attempts,0);
     assert.match(request.content[0].text, /quote it as userApproval/);
     assert.match(promptText(h), /phase TEST_STAGING/);
     assert.equal(core.statusSnapshot(io(h)).awaitingApproval, false);
@@ -312,8 +303,8 @@ test("adapter: only a fresh root PASS exits mode; child PASS, stale PASS, and pa
   const h = harness(t);
   await draft(h);
   await h.command("approve");
-  const childCriteria = [{ id: "D1", requirement: "Helper ready", check: { command: "grep -qx ready helper.txt" },
-    controls: { accept: { setup: "printf 'ready\n' > helper.txt" }, reject: [{ setup: "printf 'todo\n' > helper.txt" }] } }];
+  const childCriteria = [{ id: "D1", requirement: "Helper ready", check: custom("grep -qx ready helper.txt"),
+    controls: { accept: writes("helper.txt", "ready\n"), reject: [writes("helper.txt", "todo\n")] } }];
   await h.tool("exitcode_child", { parent: "G1", target: "C1", goal: "Prepare helper", criteria: childCriteria, reason: "Helper is a prerequisite", prerequisite: true, prerequisiteArtifact: "helper.txt" });
   fs.writeFileSync(path.join(h.cwd, "progress.txt"), "parent work\n");
   assert.match((await h.tool("exitcode_seal", { node: "G1.1" })).content[0].text, /added progress\.txt/, "child drafts freeze the parent's work");
@@ -400,8 +391,8 @@ test("adapter: reload, restart, and resume reconnect to the right root with its 
   assert.equal(core.statusSnapshot(io(other)).awaitingApproval, true);
 });
 
-test("adapter: independent review uses the selected model and session thinking in fresh, bounded, single-tool contexts", async (t) => {
-  for (const mode of ["success", "tool-call", "markdown", "prose", "error", "invalid-json", "malformed", "tool-malformed", "wrong-tool", "length", "missing-model", "cancel"]) await t.test(mode, async (t) => {
+test("adapter: independent review uses the selected model with bounded reasoning and length recovery in fresh single-tool contexts", async (t) => {
+  for (const mode of ["success", "tool-call", "markdown", "prose", "length-once", "error", "invalid-json", "malformed", "tool-malformed", "wrong-tool", "length", "missing-model", "cancel"]) await t.test(mode, async (t) => {
     const h = harness(t), registry = reviewRegistry(mode);
     h.ctx.modelRegistry = registry;
     h.ctx.tools = [{ name: "write", description: "Mutate the session candidate" }];
@@ -413,8 +404,9 @@ test("adapter: independent review uses the selected model and session thinking i
     const result = await h.tools.get("exitcode_draft").execute("review-call", { goal: "Literal artifact", criteria }, controller.signal, () => {}, h.ctx);
     for (const call of registry.calls) {
       assert.equal(call.model, h.ctx.model);
-      assert.equal(call.options.reasoning, h.ctx.thinkingLevel);
-      assert.equal(call.options.maxTokens, core.REVIEW_MAX_TOKENS);
+      const retry=call.options.maxTokens===core.REVIEW_RETRY_MAX_TOKENS;
+      assert.equal(call.options.reasoning, retry?undefined:"low");
+      assert.equal(call.options.maxTokens, retry?8192:4096);
       assert.equal(call.context.systemPrompt, core.reviewPrompt(call.input.phase));
       assert.match(call.context.systemPrompt, /submit_review/);
       assert.deepEqual(call.context.messages.map((m) => [m.role, m.content]), [["user", JSON.stringify(call.input)]]);
@@ -426,28 +418,63 @@ test("adapter: independent review uses the selected model and session thinking i
       assert.equal(call.context.tools[0].name, core.REVIEW_TOOL_NAME);
       assert.deepEqual(call.context.tools[0].constrainedSampling, { type: "json_schema", strict: "prefer" });
     }
-    if (["success", "tool-call", "markdown", "prose"].includes(mode)) {
-      assert.deepEqual(registry.calls.map((c) => c.input.phase), ["derive", "assess"]);
+    if (["success", "tool-call", "markdown", "prose", "length-once"].includes(mode)) {
+      const length=mode==="length-once";
+      assert.deepEqual(registry.calls.map((c) => c.input.phase), length?["derive","derive","assess","assess"]:["derive", "assess"]);
+      if(length)for(const [a,b] of [[0,1],[2,3]])assert.deepEqual(registry.calls[a].input,registry.calls[b].input,"retry keeps the same review schema and input");
       assert.equal(registry.calls[0].input.originalRequest, "Write literal done into feature.txt and preserve the artifact");
-      assert.equal(result.usage.input, 22);
-      assert.equal(core.loadNodeState(io(h), "G1").evaluatorMetrics.tokenUsage.input, 22);
+      assert.equal(result.usage.input, length?44:22);
+      assert.equal(core.loadNodeState(io(h), "G1").evaluatorMetrics.tokenUsage.input, length?44:22);
+      assert.equal(core.loadNodeState(io(h), "G1").evaluatorMetrics.e0Attempts,1,"length retry is internal to one E0");
       // Repeated preparation follows session selection changes.
       h.ctx.model = { id: "changed-model", provider: "changed-provider" }; h.ctx.thinkingLevel = "max";
       await h.tool("exitcode_draft", { goal: "Literal artifact", criteria, revise: "G1" });
-      assert.equal(registry.calls.length, 4);
-      for (const c of registry.calls.slice(2)) { assert.equal(c.model, h.ctx.model); assert.equal(c.options.reasoning, "max"); }
+      assert.equal(registry.calls.length, length?6:4);
+      for (const c of registry.calls.slice(length?4:2)) { assert.equal(c.model, h.ctx.model); assert.equal(c.options.reasoning, "low"); }
     } else {
       assert.equal(result.isError, true);
       assert.equal(core.statusSnapshot(io(h)).awaitingApproval, false);
       assert.equal(core.approveRoot(io(h)).ok, false);
       assertEnforced(h);
-      if (["error", "invalid-json", "malformed", "tool-malformed", "wrong-tool", "length"].includes(mode)) assert.equal(result.usage.input, 11, "billable failures still report usage");
+      assert.equal(core.loadRoot(io(h),"G1").status,"ACTIVE","unsealed failures leave an editable draft");
+      if (["error", "invalid-json", "malformed", "tool-malformed", "wrong-tool", "length"].includes(mode)) assert.equal(result.usage.input, mode==="length"?22:11, "billable failures still report usage");
+      if(mode==="length") {
+        assert.equal(registry.calls.length,2,"one bounded length retry");
+        assert.equal(result.details.diagnostics[0].code,"REVIEW_TOO_LARGE");
+        assert.match(result.details.diagnostics[0].recommendedRepair,/Reduce or consolidate/);
+        assert.equal(core.loadNodeState(io(h),"G1").evaluatorMetrics.e0Attempts,0);
+        const staging=await h.tool("exitcode_stage_tests",{reason:"Write focused acceptance tests",paths:["proof.test.mjs"]});
+        assert.equal(staging.details.status,"requested","length failure can immediately enter staging");
+      }
       if (mode === "cancel") for (const call of registry.calls) assert.equal(call.options.signal.aborted, true);
     }
   });
 });
 
-test("adapter: /exitcode resume retries the saved operation and accepts only explicit positive grants", async (t) => {
+test("adapter: incompatible review requests degrade to a supported shape; authority failures leave the draft editable", async (t) => {
+  // A 400 rejects ExitCode's request shape, not the task. The accepted shape is reused.
+  const h = harness(t), registry = reviewRegistry("reject-constrained");
+  h.ctx.modelRegistry = registry;
+  await h.command("Add the feature");
+  const result = await h.tool("exitcode_draft", { goal: "Finish the feature", criteria });
+  assert.match(result.content[0].text, /Validated plan/);
+  assert.deepEqual(registry.calls.map((c) => [c.input.phase, Boolean(c.context.tools[0].constrainedSampling), c.options.reasoning]),
+    [["derive", true, "low"], ["derive", false, "low"], ["assess", false, "low"]]);
+  // Exhausted shapes and provider authority failures prevent approval but allow repair.
+  for (const [mode, calls] of [["reject-all", 4], ["unauthorized", 1]]) {
+    const p = harness(t), rejecting = reviewRegistry(mode);
+    p.ctx.modelRegistry = rejecting;
+    await p.command("Add the feature");
+    const failed = await p.tool("exitcode_draft", { goal: "Finish the feature", criteria });
+    assert.equal(failed.details.diagnostics[0].code, "REVIEW_CONFIGURATION", mode);
+    assert.equal(core.loadRoot(io(p),"G1").status,"ACTIVE",mode);
+    assert.equal(rejecting.calls.length, calls, mode);
+    const last = rejecting.calls.at(-1);
+    if (mode === "reject-all") assert.deepEqual([last.context.tools, last.options.reasoning], [undefined, undefined], "plain JSON is the last shape");
+  }
+});
+
+test("adapter: /exitcode resume retries sealed evaluation, returns draft repair to the agent, and accepts only explicit positive grants", async (t) => {
   // Infrastructure pause during evaluation: resume retries without new acceptance.
   const h = harness(t);
   await draft(h);
@@ -484,17 +511,26 @@ test("adapter: /exitcode resume retries the saved operation and accepts only exp
   assert.equal(granted.attemptLimit, sealed.policy.maxTotalAttempts + 3);
   assert.deepEqual(granted.policy, sealed.policy);
   t.mock.restoreAll();
-  // Provider failure during preparation: resume completes review without another root or quality charge.
+  // Legacy preparation pause: resume hands control back without another reviewer call.
   const p = harness(t);
   p.ctx.modelRegistry = reviewRegistry("error");
-  assert.equal((await draft(p)).details.status, "PAUSED");
-  assert.equal(await settle(p), undefined);
-  p.ctx.modelRegistry = reviewRegistry();
+  assert.equal((await draft(p)).details.status, "ACTIVE");
+  const legacy=core.loadRoot(io(p),"G1");
+  legacy.status="PAUSED";
+  legacy.pause={code:"REVIEW_RESPONSE_INVALID",reason:"review stopped: length",nodeId:"G1",operation:"prepare",phase:"EVALUATOR_PREPARATION",at:Date.now()};
+  legacy.pauseHistory=[legacy.pause];
+  core.saveRoot(io(p),legacy);
+  const registry=reviewRegistry();p.ctx.modelRegistry = registry;
   await p.command("resume");
-  assert.equal(core.statusSnapshot(io(p)).awaitingApproval, true);
-  assert.equal(core.loadNodeState(io(p), "G1").evaluatorMetrics.e0Attempts, 1);
-  assert.match(p.messages.at(-1).content, /Validated plan/);
-  assert.equal(p.messages.at(-1).triggerTurn, false);
+  assert.equal(registry.calls.length,0,"resume never automatically repeats draft preparation");
+  assert.equal(core.statusSnapshot(io(p)).awaitingApproval, false);
+  assert.equal(core.loadNodeState(io(p), "G1").evaluatorMetrics.e0Attempts, 0);
+  assert.match(p.messages.at(-1).content, /revise G1 evaluator/);
+  assert.equal(p.messages.at(-1).details.recovery,"repair");
+  assert.equal(p.messages.at(-1).triggerTurn, true);
+  assert.deepEqual(core.loadRoot(io(p),"G1").pauseHistory,legacy.pauseHistory);
+  await p.tool("exitcode_draft",{goal:"Feature",criteria,revise:"G1"});
+  assert.equal(core.statusSnapshot(io(p)).awaitingApproval,true);
   // Evaluator budget exhaustion: grants add construction attempts without bypassing a failed negative.
   const e = harness(t);
   await e.command("Complete feature");
@@ -526,7 +562,7 @@ test("adapter: cancellation and reload abort owned reviewer calls before clearin
     const node = core.loadNodeState(io(h), "G1");
     assert.deepEqual([node.preparing, node.evaluatorMetrics.e0Attempts], [undefined, 0]);
     assert.equal(fs.existsSync(core.storePaths(h.cwd).operation), false);
-    assert.equal(core.loadRoot(io(h), "G1").status, "PAUSED");
+    assert.equal(core.loadRoot(io(h), "G1").status, "ACTIVE");
     assert.equal(core.resolveModeFromBranch(h.entries).on, operation !== "exit");
   }
 });

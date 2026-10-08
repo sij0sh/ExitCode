@@ -10,6 +10,7 @@ export const RECIPE_KINDS = Object.freeze(['file_exists', 'file_contains', 'file
 export const MUTATION_KINDS = Object.freeze(['write_file', 'delete_file', 'replace_text', 'copy_fixture', 'set_json_value']);
 /** Recipes the supervisor can evaluate, witness, and challenge without executing candidate code. */
 export const BUILTIN_RECIPES = Object.freeze(['file_exists', 'file_contains', 'file_not_contains', 'json_value']);
+const DISCOVERED_RECIPES = Object.freeze(['existing_test', 'test_suite', 'build_succeeds', 'typecheck_succeeds']);
 const RESERVED = new Set(['.exitcode', '.git', '.pi']);
 const OMIT = new Set(['.exitcode', '.git', 'node_modules']);
 const CANDIDATE_OMIT = new Set(['.exitcode', '.git']);
@@ -82,7 +83,7 @@ export function scanCapabilities(cwd) {
     selectors[file] = [...text.matchAll(/\b(?:test|it|describe)(?:\.(?:only|skip|todo))?\s*\(\s*(['"])([^\n]*?)\1/g)].map(x => x[2]);
   }
   const manifest = {
-    version: 1, language: files.some(f => /\.tsx?$/.test(f.rel)) ? 'TypeScript' : 'JavaScript',
+    language: files.some(f => /\.tsx?$/.test(f.rel)) ? 'TypeScript' : 'JavaScript',
     packageManager: files.some(f => f.rel === 'pnpm-lock.yaml') ? 'pnpm' : files.some(f => f.rel === 'yarn.lock') ? 'yarn' : 'npm',
     testRunner: nodeTest ? 'node:test' : null, testCommand: availableScripts.test ? 'npm test' : null,
     buildCommand: availableScripts.build ? 'npm run build' : null,
@@ -165,7 +166,8 @@ const quote = s => "'" + String(s).replaceAll("'", "'\\''") + "'";
 export async function runRecipe(recipe, {cwd, timeoutMs = 900000, capabilities, exec = sandboxCommand, signal, deadlineAt, nowMs=Date.now, readOnlyPaths = [], onExecution} = {}) {
   try {
     ensureRunning(signal);
-    const cap = capabilities ?? scanCapabilities(cwd), compiled = compileRecipe(recipe,cap);
+    // Only discovered runners need the capability scan.
+    const cap = capabilities ?? (DISCOVERED_RECIPES.includes(recipe?.kind) ? scanCapabilities(cwd) : {}), compiled = compileRecipe(recipe,cap);
     if (compiled.operation === 'builtin') {
       const full = safePath(cwd,recipe.path);
       if (!fs.existsSync(full) || !fs.statSync(full).isFile()) return {exit:1,stdout:'target missing',stderr:'',timedOut:false};
@@ -206,7 +208,7 @@ export async function runRecipe(recipe, {cwd, timeoutMs = 900000, capabilities, 
 // A supervisor verification can itself run inside this sandbox. Reuse its read-only npm mount.
 const npmRuntime = () => fs.existsSync('/runtime/npm/bin/npm-cli.js') ? '/runtime/npm' : path.join(path.dirname(fs.realpathSync(process.execPath)), '../lib/node_modules/npm');
 
-export function sandboxArgs(cwd, {writable = false, readOnlyPaths = []} = {}) {
+function sandboxArgs(cwd, {writable = false, readOnlyPaths = []} = {}) {
   const args = ['--unshare-all','--die-with-parent','--new-session','--cap-drop','ALL','--ro-bind','/usr','/usr'];
   for (const name of ['lib','lib64','bin','sbin']) {
     const full = '/'+name;
@@ -266,8 +268,7 @@ export function evaluatorEnvironment(cwd,options) {
   const npm = npmRuntime();
   return {platform:os.platform(),release:os.release(),arch:os.arch(),node:process.version,runtime,
     npm:fs.existsSync(npm)?candidateIdentity(npm,options):null,
-    dependencies:fs.existsSync(path.join(cwd,'node_modules'))?digest(inventory(path.join(cwd,'node_modules'),{...options,dependencies:true}).map(({rel,sha,mode,link})=>({rel,sha,mode,link}))):null,
-    runnerVersion:1};
+    dependencies:fs.existsSync(path.join(cwd,'node_modules'))?digest(inventory(path.join(cwd,'node_modules'),{...options,dependencies:true}).map(({rel,sha,mode,link})=>({rel,sha,mode,link}))):null};
 }
 
 /** Deterministic preflight only. Intent coverage is derived independently by semantic review. */
@@ -294,15 +295,15 @@ export function positiveWitness(criterion) {
 }
 
 // Pre-seal controls describe evidence; they must not encode a second implementation.
-const OVERBUILT = Object.freeze({controlBytes:64*1024, files:16, setupBytes:4*1024, repeatedBytes:8*1024});
+const OVERBUILT = Object.freeze({controlBytes:64*1024, files:16, repeatedBytes:8*1024});
 const OVERBUILT_REPAIR = 'A control is a minimal witness that the check can discriminate, not a reference implementation. Prefer an existing test, omit controls, narrow the criterion, or shrink the witness';
 function overbuilt(draft) {
   const diagnostics=[],seen=new Map();
   for(const c of draft.criteria){
     for(const control of [c.controls?.accept,...(c.controls?.reject??[])].filter(Boolean)){
-      const bytes=Buffer.byteLength(stable(control)),files=new Set((control.mutations??[]).map(m=>m.path)).size,setup=Buffer.byteLength(control.setup??'');
-      if(bytes>OVERBUILT.controlBytes||files>OVERBUILT.files||setup>OVERBUILT.setupBytes)
-        diagnostics.push(diagnostic('EVALUATOR_OVERBUILT','lint',c.id,`control is ${bytes} bytes across ${files} files with ${setup} bytes of setup`,OVERBUILT_REPAIR));
+      const bytes=Buffer.byteLength(stable(control)),files=new Set((control.mutations??[]).map(m=>m.path)).size;
+      if(bytes>OVERBUILT.controlBytes||files>OVERBUILT.files)
+        diagnostics.push(diagnostic('EVALUATOR_OVERBUILT','lint',c.id,`control is ${bytes} bytes across ${files} files`,OVERBUILT_REPAIR));
       if(bytes>OVERBUILT.repeatedBytes){const key=digest(control);seen.set(key,[...(seen.get(key)??[]),c.id]);}
     }
   }
@@ -316,7 +317,7 @@ export function lintEvaluators(draft, cwd, capabilities) {
   for(const c of draft.criteria){
     const recipe=c.check.recipe;
     try {
-      if(recipe){compileRecipe(recipe,capabilities);if(recipe.path)safePath(cwd,recipe.path);}
+      compileRecipe(recipe,capabilities);if(recipe.path)safePath(cwd,recipe.path);
       for(const control of [c.controls?.accept,...(c.controls?.reject??[])].filter(Boolean))for(const mutation of control.mutations??[]){validateMutation(mutation);safePath(cwd,mutation.path);if(mutation.kind==='copy_fixture')safePath(cwd,mutation.from);}
     } catch(e) {
       const code=e.message.split(':')[0];
@@ -328,7 +329,7 @@ export function lintEvaluators(draft, cwd, capabilities) {
           : 'Use a discovered runner, literal selector, and confined fixture paths';
       diagnostics.push(diagnostic(lintCode,'lint',c.id,e.message,repair));
     }
-    const command=recipe?.command??c.check.command??'';
+    const command=recipe?.command??'';
     if(/https?:\/\/|\b(?:curl|wget|ssh|nc|sudo)\b/.test(command))diagnostics.push(diagnostic('EXTERNAL_DEPENDENCY','lint',c.id,'External or privileged command','Use local deterministic evidence'));
     if(recipe?.path&&BUILTIN_RECIPES.includes(recipe.kind)&&c.controls?.accept?.mutations){
       const present=fs.existsSync(safePath(cwd,recipe.path));
@@ -342,7 +343,6 @@ export function lintEvaluators(draft, cwd, capabilities) {
 export function normalizeEvaluator(draft) {
   const normalized=structuredClone(draft),repairs=[];
   for(const c of normalized.criteria){
-    if(c.check.recipe?.kind==='existing_test'&&c.check.recipe.runner==='discovered'){delete c.check.recipe.runner;repairs.push({criterionId:c.id,repair:'Use discovered node:test runner'});}
     if(typeof c.check.timeoutSeconds==='string'&&/^\d+(\.\d+)?$/.test(c.check.timeoutSeconds)){c.check.timeoutSeconds=Number(c.check.timeoutSeconds);repairs.push({criterionId:c.id,repair:'Normalize numeric timeout'});}
   }
   return {draft:normalized,repairs};
@@ -449,7 +449,7 @@ export function captureEvaluatorAssets(cwd, draft, directory) {
       for (const rel of frozen.packages) declare(rel);
       for (const rel of frozen.bins) paths.add(rel);
       if (fs.existsSync(path.join(cwd,'node_modules/.bin'))){readOnly.add('node_modules/.bin');directories.add('node_modules/.bin');}
-      dependencyBoundary = {version:1, evaluatorPackages:frozen.packages, absentPaths:frozen.absentPaths};
+      dependencyBoundary = {evaluatorPackages:frozen.packages, absentPaths:frozen.absentPaths};
     }
   } else if (draft.mutableDependencies === true) {
     throw operationError('INVALID_SPEC', 'mutableDependencies requires a package.json product dependency boundary');
@@ -481,14 +481,14 @@ export function captureEvaluatorAssets(cwd, draft, directory) {
         sha:kind === 'package_configuration' ? digest(acceptancePackage(fs.readFileSync(full, 'utf8'))) : fileDigest(full)});
       if (![...readOnly].some(p => rel === p || rel.startsWith(p + '/'))) readOnly.add(rel);
     }
-    const manifest = {version:1, files:entries, conventionalPaths, directories:[...directories].sort(), readOnlyPaths:[...readOnly].sort(), dependencyBoundary};
+    const manifest = {files:entries, conventionalPaths, directories:[...directories].sort(), readOnlyPaths:[...readOnly].sort(), dependencyBoundary};
     return {...manifest, digest:digest(manifest)};
   } catch (e) { fs.rmSync(directory, {recursive:true, force:true}); throw e; }
 }
 
 export function verifyEvaluatorAssets(cwd, directory, assets) {
   const {digest:expected, ...manifest} = assets ?? {};
-  if (manifest.version !== 1 || !Array.isArray(manifest.files) || !Array.isArray(manifest.readOnlyPaths) || !Array.isArray(manifest.directories) || !Array.isArray(manifest.conventionalPaths) || expected !== digest(manifest))
+  if (!Array.isArray(manifest.files) || !Array.isArray(manifest.readOnlyPaths) || !Array.isArray(manifest.directories) || !Array.isArray(manifest.conventionalPaths) || expected !== digest(manifest))
     throw operationError('EVALUATOR_ASSET_INVALID', 'acceptance asset manifest mismatch');
   for(const rel of assets.dependencyBoundary?.absentPaths??[])if(fs.existsSync(safePath(cwd,rel)))throw operationError('EVALUATOR_DRIFT',`evaluator dependency resolution changed: ${rel}`);
   const liveFiles=inventory(cwd,{dependencies:true});
@@ -556,7 +556,7 @@ export function restoreEvaluatorAssets(cwd,directory,assets) {
 
 /** Mutable product bytes are candidate inputs; pinned evaluator dependencies still must match. */
 export function compatibleEnvironment(prepared, current, mutableDependencies = false, assets) {
-  if (mutableDependencies && assets?.dependencyBoundary?.version !== 1) return false;
+  if (mutableDependencies && !assets?.dependencyBoundary) return false;
   const comparable = env => mutableDependencies ? Object.fromEntries(Object.entries(env).filter(([key]) => key !== 'dependencies')) : env;
   return stable(comparable(prepared)) === stable(comparable(current));
 }

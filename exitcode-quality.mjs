@@ -5,8 +5,9 @@ import { abortable, operationSignal, operationError, ensureRunning } from './exi
 
 // No local wall-clock limit. An executing root still supplies its shared deadline.
 export const REVIEW_TIMEOUT_MS = null;
-// Reviews are compact structured judgments, not essays. Oversized output is invalid by design.
+// Compact reviews get one larger response allowance after a provider length stop.
 export const REVIEW_MAX_TOKENS = 4096;
+export const REVIEW_RETRY_MAX_TOKENS = 8192;
 /** Sole response tool offered to each isolated semantic-review call. */
 export const REVIEW_TOOL_NAME = 'submit_review';
 const RESPONSE_BYTES = 64 * 1024;
@@ -153,7 +154,7 @@ export function validateAssessment(assessed, derived, criteria, cwd, assets) {
     if((d.regression&&!regressions.length)||regressions.some(id=>!criteria.some(c=>c.id===id&&c.type==='regression')))fail('REGRESSION_UNRELATED',d.regression??'Mapped regression criterion is not a regression check');
     if(a.shams.length!==d.nearMisses.length||!unique(a.shams.map(s=>s?.id))||d.nearMisses.some(s=>!a.shams.some(x=>x?.id===s.id)))fail('SHAM_MISSING','Each independently derived near-miss needs exactly one confined challenge');
     for(const s of a.shams){
-      if(!record(s)||!text(s.id)||!Array.isArray(s.mutations)||!s.mutations.length||s.mutations.length>32||s.setup!==undefined)throw invalid('malformed sham mutations');
+      if(!record(s)||!text(s.id)||!Array.isArray(s.mutations)||!s.mutations.length||s.mutations.length>32)throw invalid('malformed sham mutations');
       for(const m of s.mutations){
         try{validateMutation(m);safePath(cwd,m.path);if(m.kind==='copy_fixture')safePath(cwd,m.from);}catch(e){throw invalid(e.message);}
         // A sham changes implementation, never the evidence or how it is selected.
