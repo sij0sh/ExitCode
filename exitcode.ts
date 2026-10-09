@@ -35,18 +35,22 @@ const CheckSchema = Type.Object({
   recipe: Type.Object({
     kind: Type.Union(core.RECIPE_KINDS.map((x: string) => Type.Literal(x))),
     path: Type.Optional(Type.String()), value: Type.Optional(Type.Unknown()),
+    asset: Type.Optional(Type.String({minLength:1,description:"test_asset: file name supplied in the draft assets map; mounted under .exitcode-evaluator/ only in disposable copies"})),
     pointer: Type.Optional(Type.String()), selector: Type.Optional(Type.String({ description: "existing_test: exact discovered literal name already present in the file; never invent a future test name" })),
     command: Type.Optional(Type.String({ description: "command_exit: executable basename (e.g. sh), with args separately; custom_command: isolated shell string (e.g. sh scripts/verify)" })),
-    args: Type.Optional(Type.Array(Type.String(), { description: "command_exit arguments, e.g. [scripts/verify] with command sh; test_suite runs the discovered npm test script" })),
+    args: Type.Optional(Type.Array(Type.String(), { description: "command_exit arguments; test_asset runner arguments before its appended asset path, e.g. [--test] with command node" })),
   }),
   assets: Type.Optional(Type.Array(Type.String({minLength:1}), {description:"Acceptance helpers outside conventional test paths; frozen at seal, not product source"})),
   timeoutSeconds: Type.Optional(Type.Number({ description: "Immutable explicit check watchdog; otherwise use remaining execution time" })),
   expect: Type.Optional(ExpectSchema),
 });
 
+const AssetsSchema = Type.Record(Type.String(), Type.String(), {description:"Contract-owned test/fixture files as bundle-relative name -> UTF-8 content (up to 64 files, 1 MiB total). ExitCode stores and seals them privately; never write .exitcode directly. Use ../src imports from .exitcode-evaluator/; keep durable regression tests in the repository."});
+
 const MutationSchema = Type.Object({
   kind: Type.Union(core.MUTATION_KINDS.map((x: string) => Type.Literal(x))),
   path: Type.String(), content: Type.Optional(Type.String()), from: Type.Optional(Type.String()),
+  asset: Type.Optional(Type.String({description:"copy_fixture: authored fixture asset to copy into path; use instead of a candidate-relative from"})),
   to: Type.Optional(Type.String()), pointer: Type.Optional(Type.String()), value: Type.Optional(Type.Unknown()),
 });
 const FixtureSchema = Type.Object({
@@ -58,64 +62,45 @@ const ControlsSchema = Type.Object({
   reject: Type.Optional(Type.Array(FixtureSchema, {minItems:1})),
 }, {description:"Usually omit. A control is a minimal witness that the check can discriminate, not a reference implementation. " +
   "Built-in file recipes and checks that already pass need none; supply accept only when the check cannot pass on the current candidate. " +
-  "ExitCode derives independent negatives."});
+  "Supply reject for behavior the baseline already satisfies; a baseline failure already counts as negative evidence."});
 
-const ReviewDeriveSchema = Type.Object({
-  uncovered: Type.Optional(Type.Array(Type.String(), {maxItems:16})),
-  criteria: Type.Array(Type.Object({
-    criterionId: Type.String(),
-    observation: Type.String(),
-    structural: Type.Optional(Type.Boolean()),
-    nearMisses: Type.Optional(Type.Array(Type.String(), {maxItems:2})),
-    negative: Type.Optional(Type.String()),
-    regression: Type.Optional(Type.String()),
-  })),
-});
-const ReviewAssessSchema = Type.Object({
-  criteria: Type.Array(Type.Object({
-    criterionId: Type.String(),
-    outcomeObserved: Type.Boolean(),
-    negativeCovered: Type.Optional(Type.Boolean()),
-    regressionCriteria: Type.Optional(Type.Array(Type.String())),
-    shams: Type.Array(Type.Object({
-      id: Type.String(),
-      mutations: Type.Array(MutationSchema, {minItems:1,maxItems:32}),
-    })),
-  })),
-  issues: Type.Array(Type.Object({
-    code: Type.String(),
-    criterionId: Type.Union([Type.String(), Type.Null()]),
+const ReviewCriticSchema = Type.Object({
+  concerns: Type.Array(Type.Object({
+    code: Type.Union([
+      Type.Literal("MISSING_OUTCOME"),
+      Type.Literal("OVERREACH"),
+      Type.Literal("CONTRADICTION"),
+      Type.Literal("BUNDLED_OUTCOME"),
+    ]),
     evidence: Type.String(),
-  }), {maxItems:32}),
+  }), {maxItems:3}),
 });
 
-// Each isolated semantic-review call gets at most this one response tool.
-function reviewTool(phase: string, constrained: boolean) {
+// The isolated semantic-critic call gets at most this one response tool.
+function reviewTool() {
   return {
     name: core.REVIEW_TOOL_NAME,
-    description: phase === "derive"
-      ? "Submit independently derived outcomes for each behavior criterion"
-      : "Submit assessment of each check against the derived outcomes",
-    parameters: phase === "derive" ? ReviewDeriveSchema : ReviewAssessSchema,
-    ...(constrained ? { constrainedSampling: { type: "json_schema", strict: "prefer" } } : {}),
+    description: "Submit semantic concerns about the intent contract",
+    parameters: ReviewCriticSchema,
   };
 }
 
-// Review request shapes, most constrained first. A 400 rejects ExitCode's
-// request shape, not the task, so preparation tries a compatible shape.
-// The first shape a provider/model accepts is reused for the session.
-const REVIEW_TRANSPORTS = [
-  { tool: true, constrained: true, reasoning: true },
-  { tool: true, constrained: false, reasoning: true },
-  { tool: true, constrained: false, reasoning: false },
-  { tool: false, constrained: false, reasoning: false },
-] as const;
-type ReviewTransports = Map<string, number>;
+const OutcomeSchema = Type.Object({
+  id: Type.Optional(Type.String({ description: "Suggested id (supervisor assigns O1..On when omitted)" })),
+  requirement: Type.String({ description: "One requested behavior outcome in plain language" }),
+});
+
+const SequenceSchema = Type.Array(Type.Object({
+  objective: Type.String({ description: "Short plain-language slice objective (max 200 characters)" }),
+  verify: Type.Array(Type.String({minLength:1}), {minItems:1, description:"Behavior criterion ids proven by this slice; every behavior appears in exactly one slice"}),
+  after: Type.Optional(Type.Array(Type.String({minLength:1}), {description:"Optional prerequisite behavior criterion ids that must appear in earlier slices"})),
+}), {minItems:1, maxItems:12, description:"Optional ordered proof slices; array order is the dependency"});
 
 const CriterionSchema = Type.Object({
   id: Type.Optional(Type.String({ description: "Suggested id (supervisor assigns C1..Cn when omitted)" })),
   requirement: Type.String({ description: "One independently observable outcome in plain language; split unrelated behaviors into separate criteria" }),
   type: Type.Optional(Type.Union([Type.Literal("behavior"), Type.Literal("regression")], { description: "behavior (default) or regression" })),
+  outcome: Type.Optional(Type.String({ description: "Behavior only: the declared outcome id this criterion proves (exactly one criterion per outcome)" })),
   check: CheckSchema,
   controls: Type.Optional(ControlsSchema),
 });
@@ -143,7 +128,6 @@ type Runtime = {
   nudges: number;
   progress: string | undefined;
   operations: Map<AbortController, Promise<void>>;
-  reviewTransports: ReviewTransports;
 };
 
 type ToolDef = {
@@ -189,67 +173,44 @@ function cascadeLines(cascade: { events?: string[]; terminal?: { root: string; s
   return lines;
 }
 
-// Transport retries are bounded in the core. Usage includes each completed provider attempt.
-function reviewIo(ctx: ExtensionContext, transports: ReviewTransports, signal?: AbortSignal, onProgress?: (progress: any) => void, expectedRootId?: string | null) {
+// Best-effort semantic critic. Any failure marks the critic unavailable;
+// deterministic E0 continues and the user can still approve.
+function reviewIo(ctx: ExtensionContext, signal?: AbortSignal, onProgress?: (progress: any) => void, expectedRootId?: string | null) {
   const usage = { available:false,input:0,output:0,cacheRead:0,cacheWrite:0,totalTokens:0,
     cost:{input:0,output:0,cacheRead:0,cacheWrite:0,total:0} };
-  const request = async (input: any, encoded: string, transport: typeof REVIEW_TRANSPORTS[number], abort: AbortSignal, expanded: boolean) => {
-    const tool=reviewTool(input.phase,transport.constrained);
-    const result=await ctx.modelRegistry.streamSimple(ctx.model, {
-      systemPrompt:core.reviewPrompt(input.phase),
-      messages:[{role:"user",content:encoded,timestamp:Date.now()}],
-      ...(transport.tool ? {tools:[tool]} : {}),
-    }, {...(transport.reasoning && !expanded ? {reasoning:"low"} : {}),maxTokens:expanded?core.REVIEW_RETRY_MAX_TOKENS:core.REVIEW_MAX_TOKENS,signal:abort}).result();
-    // Provider errors can still carry billable usage.
-    if(result.usage)usage.available=true;
-    for(const k of ["input","output","cacheRead","cacheWrite","totalTokens"] as const)
-      usage[k]+=result.usage?.[k] ?? 0;
-    for(const k of ["input","output","cacheRead","cacheWrite","total"] as const)
-      usage.cost[k]+=result.usage?.cost?.[k] ?? 0;
-    if(result.stopReason!=="stop"&&result.stopReason!=="toolUse")throw Object.assign(new Error(result.errorMessage ?? `review stopped: ${result.stopReason}`),result.stopReason==="aborted"?{code:"CANCELLED"}:result.stopReason==="length"?{code:"REVIEW_TOO_LARGE"}:{});
-    const call=(result.content??[]).find((b:any)=>b?.type==="toolCall"&&b?.name===tool.name);
-    if(call) {
-      const args=typeof call.arguments==="string"?core.parseReviewText(call.arguments):call.arguments;
-      const sized=JSON.stringify(args??null);
-      if(!sized||sized.length>512*1024)throw Object.assign(new Error("review output exceeds bounded response"),{code:"REVIEW_RESPONSE_INVALID"});
-      return args;
-    }
-    const text=result.content.filter(b=>b.type==="text").map(b=>b.text).join("");
-    if(text.length>512*1024)throw Object.assign(new Error("review output exceeds bounded response"),{code:"REVIEW_RESPONSE_INVALID"});
-    return core.parseReviewText(text);
-  };
   return core.makeIo(ctx.cwd, { signal: signal ?? ctx.signal, reviewUsage:usage,onProgress,expectedRootId,
     review: async (input: any, options: {signal:AbortSignal}) => {
       if (!ctx.model || !ctx.modelRegistry?.streamSimple) throw new Error("selected review model unavailable");
       const encoded=JSON.stringify(input);
-      if(encoded.length>2*1024*1024)throw new Error("review input exceeds bounded context; reduce evaluator scope");
-      const key=`${ctx.model.provider}/${ctx.model.id}`;
-      let expanded=false;
-      for(let level=transports.get(key)??0;;) {
-        try {
-          const value=await request(input,encoded,REVIEW_TRANSPORTS[level],options.signal,expanded);
-          transports.set(key,level);
-          return value;
-        } catch(error) {
-          const failure=core.reviewFailure(error);
-          if(failure.code==="REVIEW_TOO_LARGE") {
-            if(expanded)throw Object.assign(new Error("Reviewer response exceeded the bounded retry limit. Reduce or consolidate evaluator scope and retry preparation."),{code:"REVIEW_TOO_LARGE"});
-            expanded=true;
-            onProgress?.({phase:"EVALUATOR_PREPARATION",stage:"review-length-retry",reviewPhase:input.phase});
-            continue;
-          }
-          if(failure.code!=="REVIEW_INCOMPATIBLE")throw error;
-          if(level===REVIEW_TRANSPORTS.length-1)
-            throw Object.assign(new Error(`provider rejected every review request shape: ${failure.message}`),{code:"REVIEW_CONFIGURATION"});
-          level++;
-        }
+      if(encoded.length>64*1024)throw new Error("review input exceeds bounded critic context");
+      const tool=reviewTool();
+      const result=await ctx.modelRegistry.streamSimple(ctx.model, {
+        systemPrompt:core.reviewPrompt(input.phase),
+        messages:[{role:"user",content:encoded,timestamp:Date.now()}],
+        tools:[tool],
+      }, {maxTokens:core.REVIEW_MAX_TOKENS,signal:options.signal}).result();
+      if(result.usage)usage.available=true;
+      for(const k of ["input","output","cacheRead","cacheWrite","totalTokens"] as const)
+        usage[k]+=result.usage?.[k] ?? 0;
+      for(const k of ["input","output","cacheRead","cacheWrite","total"] as const)
+        usage.cost[k]+=result.usage?.cost?.[k] ?? 0;
+      if(result.stopReason!=="stop"&&result.stopReason!=="toolUse")throw Object.assign(new Error(result.errorMessage ?? `review stopped: ${result.stopReason}`),result.stopReason==="aborted"?{code:"CANCELLED"}:result.stopReason==="length"?{code:"REVIEW_TOO_LARGE"}:{});
+      const call=(result.content??[]).find((b:any)=>b?.type==="toolCall"&&b?.name===tool.name);
+      if(call) {
+        const args=typeof call.arguments==="string"?core.parseReviewText(call.arguments):call.arguments;
+        const sized=JSON.stringify(args??null);
+        if(!sized||sized.length>8*1024)throw Object.assign(new Error("review output exceeds bounded response"),{code:"REVIEW_RESPONSE_INVALID"});
+        return args;
       }
+      const text=(result.content??[]).filter((b:any)=>b.type==="text").map((b:any)=>b.text).join("");
+      if(text.length>8*1024)throw Object.assign(new Error("review output exceeds bounded response"),{code:"REVIEW_RESPONSE_INVALID"});
+      return core.parseReviewText(text);
     },
   });
 }
 
 export default function (pi: ExtensionAPI) {
-  const rt: Runtime = { pi, modeOn: false, rootId: undefined, pendingGoal: undefined, nudges: 0, progress:undefined, operations:new Map(), reviewTransports:new Map() };
+  const rt: Runtime = { pi, modeOn: false, rootId: undefined, pendingGoal: undefined, nudges: 0, progress:undefined, operations:new Map() };
   const TOOL_NAMES = core.EXITCODE_TOOL_NAMES;
 
   const assertMode = () => {
@@ -337,7 +298,7 @@ export default function (pi: ExtensionAPI) {
     let complete!: () => void;
     const done=new Promise<void>(resolve=>{complete=resolve;});
     rt.operations.set(controller,done);
-    const io=reviewIo(ctx,rt.reviewTransports,controller.signal,progress=>{
+    const io=reviewIo(ctx,controller.signal,progress=>{
       const content=`exitcode: ${progress.phase} / ${progress.stage}${progress.elapsedMs===undefined?'':` (${(progress.elapsedMs/1000).toFixed(1)}s)`}`;
       if(typeof onUpdate==='function')onUpdate(textResult(content,{progress}));
       if(ctx.hasUI)ctx.ui.setStatus?.('exitcode',content);
@@ -381,23 +342,26 @@ export default function (pi: ExtensionAPI) {
       name: "exitcode_draft",
       label: "Exitcode Draft",
       description:
-        "Submit the smallest observable acceptance contract, one outcome per criterion. Prefer discovered existing tests; never invent an existing_test selector. " +
-        "For new behavior use a focused command with controls, or include testStaging to create the draft and request test edits before the first preparation; use test_suite for regression. " +
+        "Submit the smallest observable acceptance contract: explicit outcomes plus one criterion per outcome. Prefer discovered existing tests; never invent an existing_test selector. " +
+        "For new behavior supply contract-owned assets with a test_asset recipe and a minimal positive witness; use the project's runtime and test_suite for regression. testStaging is only for explicitly requested durable product test edits. " +
         "ExitCode validates it before user review; repair returned diagnostics, then present the returned plan and wait for the user's reply.",
-      promptSnippet: "exitcode_draft: submit the root contract (goal + observable criteria + checks)",
+      promptSnippet: "exitcode_draft: submit the root contract (goal + outcomes + observable criteria + checks)",
       parameters: Type.Object({
         goal: Type.String({ description: "Goal statement" }),
         originalRequest: Type.Optional(Type.String({ description: "Fallback request only; the /exitcode goal and existing root request take priority" })),
+        outcomes: Type.Optional(Type.Array(OutcomeSchema, {description:"Explicit behavior outcomes the user requested; every behavior criterion maps to exactly one"})),
         criteria: Type.Array(CriterionSchema),
+        assets: Type.Optional(AssetsSchema),
+        sequence: Type.Optional(SequenceSchema),
         assumptions: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { description: "Resolved product assumptions to show in user review" })),
         exclusions: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { description: "Out-of-scope work to show in user review" })),
         revise: Type.Optional(Type.String({ description: "Existing DRAFT root id to revise (e.g. G1)" })),
         policy: Type.Optional(PolicySchema),
         testStaging: Type.Optional(Type.Object({
-          reason: Type.String({minLength:1,maxLength:1000,description:"Which acceptance tests must be written or updated before E0 and why"}),
+          reason: Type.String({minLength:1,maxLength:1000,description:"Which durable product tests explicitly need pre-seal edits and why; contract-specific tests use assets"}),
           paths: Type.Optional(Type.Array(Type.String({minLength:1}), {minItems:1,maxItems:core.MAX_STAGED_FILES,description:"Exact conventional test files to stage"})),
         }, {description:"Create or revise the DRAFT, request authorized test staging, and defer automatic E0 until a later draft submission"})),
-        specificationPaths: Type.Optional(Type.Array(Type.String({minLength:1}), {description:"Advanced: referenced Markdown plans to include in independent review, including explicit hidden paths"})),
+        specificationPaths: Type.Optional(Type.Array(Type.String({minLength:1}), {description:"Advanced: referenced Markdown plans to include as small critic context"})),
         mutableDependencies: Type.Optional(Type.Boolean({description:"Advanced: the task must change product dependencies; devDependencies and evaluator runtimes stay frozen"})),
       }),
       execute: async (_id, params, _signal, _onUpdate, ctx) => withOperation(ctx,_signal,_onUpdate,async io => {
@@ -408,7 +372,10 @@ export default function (pi: ExtensionAPI) {
         const result = core.draftNode(io, {
           goal: params.goal,
           originalRequest: rt.pendingGoal ?? params.originalRequest,
+          outcomes: params.outcomes,
           criteria: params.criteria,
+          assets: params.assets,
+          sequence: params.sequence,
           specificationPaths: params.specificationPaths,
           mutableDependencies: params.mutableDependencies,
           policy: params.policy,
@@ -487,7 +454,9 @@ export default function (pi: ExtensionAPI) {
         target: Type.String({ description: "Failing parent criterion id (e.g. C2)" }),
         goal: Type.String({ description: "Narrower child goal" }),
         originalRequest: Type.Optional(Type.String({ description: "Retained request (defaults to the parent's)" })),
+        outcomes: Type.Optional(Type.Array(OutcomeSchema)),
         criteria: Type.Array(CriterionSchema),
+        assets: Type.Optional(AssetsSchema),
         specificationPaths: Type.Optional(Type.Array(Type.String({minLength:1}))),
         reason: Type.String({ description: "How this child advances the parent target" }),
         prerequisite: Type.Optional(Type.Boolean({ description: "Decompose before the local repair threshold; requires prerequisiteArtifact" })),
@@ -501,7 +470,9 @@ export default function (pi: ExtensionAPI) {
           target: params.target,
           goal: params.goal,
           originalRequest: params.originalRequest,
+          outcomes: params.outcomes,
           criteria: params.criteria,
+          assets: params.assets,
           specificationPaths: params.specificationPaths,
           reason: params.reason,
           prerequisite: params.prerequisite,
@@ -519,7 +490,7 @@ export default function (pi: ExtensionAPI) {
     {
       name: "exitcode_block",
       label: "Exitcode Block",
-      description: "Pause for a concrete external authority, infrastructure, budget, or viable-path blocker. Ask the user directly about ambiguity. Test edits use exitcode_stage_tests; agent-repairable evaluator diagnostics are rejected here and need evaluator repair. Only a child NO_PATH withdraws that path and reruns its parent.",
+      description: "Pause for a concrete external authority, infrastructure, budget, or viable-path blocker. Ask the user directly about ambiguity. Contract-specific tests use draft assets; explicit durable test edits use exitcode_stage_tests. Agent-repairable evaluator diagnostics need evaluator repair. Only a child NO_PATH withdraws that path and reruns its parent.",
       promptSnippet: "exitcode_block: pause with the concrete missing requirement",
       parameters: Type.Object({
         node: Type.Optional(Type.String({ description: "Node id (defaults to the active leaf)" })),
@@ -544,11 +515,11 @@ export default function (pi: ExtensionAPI) {
     {
       name: "exitcode_stage_tests",
       label: "Exitcode Stage Tests",
-      description: "Before root sealing, request, open, or complete a user-authorized window to edit conventional test files. Present the concrete reason and paths, quote the user's reply to open it, edit only those tests, then complete to re-baseline and revalidate. Pending staging waits without pausing the root. Seal still freezes the staged tests.",
+      description: "For explicitly requested durable product test edits before root sealing, request, open, or complete a user-authorized window. Contract-specific tests use exitcode_draft assets instead. Present the reason and paths, quote the user's reply, edit only those tests, then complete to re-baseline and revalidate. Pending staging waits without pausing the root.",
       promptSnippet: "exitcode_stage_tests: request, open, or complete a test-only pre-seal window",
       parameters: Type.Object({
         node: Type.Optional(Type.String({ description: "Draft node id (defaults to the active leaf)" })),
-        reason: Type.Optional(Type.String({ description: "Why acceptance tests must change before validation (requests a window)" })),
+        reason: Type.Optional(Type.String({ description: "Why durable product tests explicitly need edits before validation (requests a window)" })),
         paths: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { description: "Exact conventional test files authorized for this window; omit to allow conventional test files within the staging limits" })),
         userApproval: Type.Optional(Type.String({ minLength: 1, description: "Quote the user's reply authorizing test staging (e.g. 'yes, update the tests'). Silence or a change request is not approval." })),
         complete: Type.Optional(Type.Boolean({ description: "Close the open window, re-baseline staged tests, and require fresh validation" })),
@@ -754,7 +725,7 @@ export default function (pi: ExtensionAPI) {
         const leafId = snap.stack?.at(-1);
         const staging = (snap as any).staging;
         if (!leafId || !staging) {
-          ctx.ui.notify("No test-staging request is pending. The agent requests one with exitcode_stage_tests when acceptance tests must change.", "info");
+          ctx.ui.notify("No test-staging request is pending. Contract-specific tests use draft assets; exitcode_stage_tests handles explicit durable product test edits.", "info");
           return;
         }
         if (rest.length === 0) {

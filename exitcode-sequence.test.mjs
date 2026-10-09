@@ -15,7 +15,8 @@ const sequence = [
 ];
 const read = (cwd, file) => fs.existsSync(path.join(cwd, file)) ? fs.readFileSync(path.join(cwd, file), 'utf8') : null;
 const write = (f, file, content) => fs.writeFileSync(path.join(f.cwd, file), content);
-const criterion = (id, file) => ({ id, requirement: `The literal ${file} artifact contains done`,
+const OUTCOMES = [{ id: 'O1', requirement: 'First artifact done' }, { id: 'O2', requirement: 'Second artifact done' }, { id: 'O3', requirement: 'Last artifact done' }];
+const criterion = (id, file) => ({ id, requirement: `The literal ${file} artifact contains done`, outcome: `O${id.slice(1)}`,
   check: { recipe: { kind: 'custom_command', command: `observe:${file}` } },
   controls: { accept: { mutations: [{ kind: 'write_file', path: file, content: 'done' }] },
     reject: [{ mutations: [{ kind: 'write_file', path: file, content: 'pending' }] }] } });
@@ -35,7 +36,7 @@ function project(t, { allDone = false, review = structuralReview, order = sequen
   const io = core.makeIo(cwd, { exec, review, nowMs: () => now });
   const criteria = [criterion('C1', 'first'), criterion('C2', 'second'), criterion('C3', 'last'),
     { id: 'R1', requirement: 'The existing stable artifact is unchanged', type: 'regression', check: { recipe: { kind: 'custom_command', command: 'preserve' } } }];
-  const drafted = core.draftNode(io, { goal: 'Complete the three literal artifacts in order', criteria, sequence: order });
+  const drafted = core.draftNode(io, { goal: 'Complete the three literal artifacts in order', outcomes: OUTCOMES, criteria, sequence: order });
   assert.equal(drafted.ok, true, JSON.stringify(drafted.errors));
   return { cwd, io, exec, calls, setNow: value => { now = value; } };
 }
@@ -58,40 +59,30 @@ const firstProof = ['observe:first', 'preserve'];
 const secondProof = ['observe:first', 'observe:second', 'preserve'];
 const completeProof = ['observe:first', 'observe:second', 'observe:last', 'preserve'];
 
-// This reviewer is scripted to exercise the existing assessment issue boundary,
-// not to implement a deterministic ordering heuristic in the supervisor.
-test('sequence: E0 reviews ordering only during assessment', async t => {
+test('sequence: declared prerequisites are validated deterministically; order alone needs no model judgment', async t => {
   for (const backwards of [false, true]) await t.test(backwards ? 'backwards' : 'valid', async t => {
-    const order = backwards ? [sequence[1], sequence[0], sequence[2]] : sequence;
-    const calls = [];
-    const f = project(t, { order, review: async input => {
-      calls.push(input);
-      const response = await structuralReview(input);
-      if (input.phase === 'derive') {
-        assert.equal(Object.hasOwn(input, 'sequence'), false, 'independent outcome derivation is blind to order');
-        assert.ok(input.criteria.every(c => !c.check && !c.controls));
-      } else {
-        assert.deepEqual(input.sequence, order, 'only the existing assessment sees order');
-        if (backwards) response.issues.push({ code: 'SEQUENCE_INVALID', criterionId: 'C2', evidence: 'The second artifact proof requires the first artifact boundary assigned later' });
-      }
-      return response;
-    } });
-    const before = core.digestTree(f.cwd), result = await core.prepareNode(f.io);
-    assert.deepEqual(calls.map(c => c.phase), ['derive', 'assess'], 'no extra planning model call');
-    assert.equal(core.digestTree(f.cwd), before);
-    assert.equal(result.ok, !backwards);
-    if (backwards) {
-      const issue = result.diagnostics.find(d => d.code === 'SEQUENCE_INVALID');
-      assert.ok(issue, JSON.stringify(result.diagnostics));
-      assert.equal(issue.repairability, 'agent');
-      assert.equal(result.review, undefined);
-      assert.equal(core.approveRoot(f.io).ok, false);
-      assert.equal(f.calls.length, 0, 'semantic rejection precedes executable probes');
-    } else {
-      assert.deepEqual(result.baseline.outcomes.map(o => o.criterionId).sort(), ['C1', 'C2', 'C3', 'R1']);
-      assert.equal(core.statusSnapshot(f.io).awaitingApproval, true);
-    }
+    const order = backwards
+      ? [{ objective: 'Establish the second artifact', verify: ['C2'], after: ['C1'] }, { objective: 'Establish the first artifact', verify: ['C1'] }, sequence[2]]
+      : [{ objective: 'Establish the first artifact', verify: ['C1'] }, { objective: 'Establish the second artifact', verify: ['C2'], after: ['C1'] }, sequence[2]];
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'exitcode-sequence-'));
+    for (const [file, content] of Object.entries({ first: 'pending', second: 'pending', last: 'done', stable: 'steady' }))
+      fs.writeFileSync(path.join(cwd, file), content);
+    t.after(() => { releasePreparation(cwd); fs.rmSync(cwd, { recursive: true, force: true }); });
+    const io = core.makeIo(cwd, { exec: async () => ({ exit: 0, stdout: '', stderr: '', timedOut: false }), review: structuralReview });
+    const criteria = [criterion('C1', 'first'), criterion('C2', 'second'), criterion('C3', 'last'),
+      { id: 'R1', requirement: 'stable', type: 'regression', check: { recipe: { kind: 'custom_command', command: 'preserve' } } }];
+    const drafted = core.draftNode(io, { goal: 'g', outcomes: OUTCOMES, criteria, sequence: order });
+    // after must name a prerequisite in an earlier slice; same- or later-slice prerequisites are rejected structurally.
+    assert.equal(drafted.ok, !backwards, JSON.stringify(drafted.errors));
+    if (backwards) assert.ok(drafted.errors.some(e => /earlier slice/.test(e)));
   });
+  {
+    // Without declared prerequisites, array order is accepted without model judgment.
+    const f = project(t, { order: [sequence[1], sequence[0], sequence[2]] });
+    const result = await core.prepareNode(f.io);
+    assert.equal(result.ok, true, JSON.stringify(result.diagnostics));
+    assert.equal(result.stages.find(s => s.stage === 'critic').status, 'pass');
+  }
 });
 
 test('sequence: root proof advances cumulatively and completes only at the final slice', async t => {
@@ -140,7 +131,8 @@ test('sequence: recovery preserves the cursor and requires conclusive current pr
   for (const mode of ['reload-pause', 'earlier-regression', 'regression-check', 'runner-error', 'ancestor-error', 'commit-deadline']) await t.test(mode, async t => {
     const f = project(t), approved = await seal(f);
     if (mode === 'ancestor-error') {
-      const proposal = core.draftNode(f.io, { parentId: 'G1', target: 'C1', goal: 'Establish the helper artifact', criteria: [criterion('D1', 'helper')],
+      const proposal = core.draftNode(f.io, { parentId: 'G1', target: 'C1', goal: 'Establish the helper artifact',
+        outcomes: [{ id: 'O1', requirement: 'Helper done' }], criteria: [criterion('D1', 'helper')],
         reason: 'The helper reduces the first artifact proof', prerequisite: true, prerequisiteArtifact: 'helper' });
       assert.equal(proposal.ok, true);
       assert.equal((await core.sealNode(f.io, proposal.id)).ok, true);

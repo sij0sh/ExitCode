@@ -14,7 +14,7 @@
 
 import { createHash, randomUUID } from "node:crypto";
 export { RECIPE_KINDS, MUTATION_KINDS } from "./exitcode-evaluator.mjs";
-import { sandboxCommand, candidateIdentity, evaluatorEnvironment, normalizeEvaluator, runRecipe, diagnostic, fileDigest, inventory, fixtureDirectory, captureEvaluatorAssets, verifyEvaluatorAssets, installEvaluatorAssets, restoreEvaluatorAssets, compatibleEnvironment, digest, safePath, isTestPath } from "./exitcode-evaluator.mjs";
+import { sandboxCommand, candidateIdentity, evaluatorEnvironment, normalizeEvaluator, runRecipe, diagnostic, fileDigest, inventory, fixtureDirectory, captureEvaluatorAssets, verifyEvaluatorAssets, installEvaluatorAssets, restoreEvaluatorAssets, compatibleEnvironment, digest, safePath, isTestPath, validateEvaluatorAssetDefinitions } from "./exitcode-evaluator.mjs";
 import { prepareGate, emptyMetrics, addMetrics, copyCandidate, releasePreparation } from "./exitcode-preparation.mjs";
 import { ensureRunning, operationSignal, operationError } from "./exitcode-operation.mjs";
 import * as fs from "node:fs";
@@ -92,7 +92,7 @@ export const MAX_STAGED_BYTES = 1024 * 1024;
 export const PROTOCOL_PROMPT =
   "EXITCODE MODE. Understand the user's goal and inspect the project before changing it. " +
   "Before implementation, submit the smallest observable acceptance contract to ExitCode; ask the user only when ambiguity materially changes success. " +
-  "Keep product files unchanged until ExitCode validates the evaluator and the user approves the plan; request exitcode_stage_tests when acceptance tests need pre-seal edits, and follow diagnostics to repair the evaluator. " +
+  "Keep product files unchanged until ExitCode validates the evaluator and the user approves the plan; submit contract-specific tests as assets with test_asset recipes, and follow diagnostics to repair the evaluator. " +
   "After sealing, implement toward failing criteria, evaluate after meaningful changes, and use a child only when a smaller goal helps one failing parent criterion. " +
   "Only a fresh root PASS completes the goal; pauses, errors, and child PASS do not.";
 
@@ -265,7 +265,7 @@ function validateCheck(check, where, errors) {
   validateExpect(check.expect, `${where}.check`, errors);
 }
 
-/** Controls are optional confined witnesses; E0 supplies independent negatives. */
+/** Controls are optional confined witnesses; E0 supplies deterministic negatives. */
 const isWitness = (control) => isRecord(control) && Array.isArray(control.mutations) && control.mutations.length > 0;
 
 function validateControls(controls, where, errors) {
@@ -309,6 +309,7 @@ export function validateStructure(draft, opts = {}) {
   }
   if(draft.specificationPaths !== undefined && (!Array.isArray(draft.specificationPaths) || !draft.specificationPaths.every(nonEmptyString)))errors.push("specificationPaths must be an array of paths");
   if(draft.mutableDependencies !== undefined && typeof draft.mutableDependencies !== "boolean")errors.push("mutableDependencies must be boolean");
+  try { validateEvaluatorAssetDefinitions(draft); } catch (e) { errors.push(e.message); }
 
   const isChild = draft.parent !== null && draft.parent !== undefined;
   if (!isChild) {
@@ -356,12 +357,95 @@ export function validateStructure(draft, opts = {}) {
       if (type !== "behavior" && type !== "regression") {
         errors.push(`${criterion.id || where}: type must be "behavior" or "regression"`);
       }
+      if (criterion.outcome !== undefined && !nonEmptyString(criterion.outcome))
+        errors.push(`${criterion.id || where}: outcome must be a nonempty outcome id when supplied`);
+      if (type === "regression" && criterion.outcome !== undefined)
+        errors.push(`${criterion.id || where}: regression criteria must not claim a requested outcome`);
       validateCheck(criterion.check, `${criterion.id || where}`, errors);
       validateControls(criterion.controls, `${criterion.id || where}`, errors);
     });
   }
 
+  if (draft.outcomes !== undefined) {
+    if (!Array.isArray(draft.outcomes) || draft.outcomes.length === 0) {
+      errors.push("outcomes must be a nonempty array when supplied");
+    } else {
+      const seen = new Set();
+      draft.outcomes.forEach((outcome, index) => {
+        const where = `outcomes[${index}]`;
+        if (!isRecord(outcome)) { errors.push(`${where} must be an object`); return; }
+        if (!nonEmptyString(outcome.id)) errors.push(`${where}.id must be a nonempty string`);
+        else if (seen.has(outcome.id)) errors.push(`duplicate outcome id ${outcome.id}`);
+        else seen.add(outcome.id);
+        if (!nonEmptyString(outcome.requirement)) errors.push(`${outcome.id || where}: requirement must be a nonempty string`);
+      });
+    }
+  }
+
+  if (draft.sequence !== undefined) {
+    if (isChild) {
+      errors.push("sequence is root-only");
+    } else if (!Array.isArray(draft.sequence) || draft.sequence.length === 0) {
+      errors.push("sequence must be a nonempty array when supplied");
+    } else if (draft.sequence.length > 12) {
+      errors.push("sequence must contain at most 12 slices");
+    } else {
+      const criteria = Array.isArray(draft.criteria) ? draft.criteria : [];
+      const behaviorIds = new Set(criteria.filter(c => (c?.type ?? "behavior") === "behavior").map(c => c?.id));
+      const seen = new Set();
+      const sliceOf = new Map();
+      draft.sequence.forEach((slice, index) => {
+        const where = `sequence[${index}]`;
+        if (!isRecord(slice)) { errors.push(`${where} must be an object`); return; }
+        if (!nonEmptyString(slice.objective)) errors.push(`${where}.objective must be a nonempty string`);
+        else if (slice.objective.trim().length > 200) errors.push(`${where}.objective must be at most 200 characters`);
+        if (!Array.isArray(slice.verify) || slice.verify.length === 0) {
+          errors.push(`${where}.verify must be a nonempty array of behavior criterion ids`);
+        } else {
+          for (const id of slice.verify) {
+            if (typeof id !== "string" || !id) { errors.push(`${where}.verify must contain nonempty criterion ids`); continue; }
+            if (!behaviorIds.has(id)) {
+              const exists = criteria.some(c => c?.id === id);
+              errors.push(exists ? `${where}.verify must reference behavior criteria only` : `${where}.verify references unknown criterion ${id}`);
+            }
+            if (seen.has(id)) errors.push(`criterion ${id} appears in more than one sequence slice`);
+            seen.add(id);
+            sliceOf.set(id, index);
+          }
+        }
+        if (slice.after !== undefined) {
+          if (!Array.isArray(slice.after) || !slice.after.every(id => typeof id === "string" && id)) {
+            errors.push(`${where}.after must be an array of criterion ids when supplied`);
+          } else {
+            for (const id of slice.after) {
+              if (!behaviorIds.has(id)) { errors.push(`${where}.after references unknown behavior criterion ${id}`); continue; }
+              const depSlice = sliceOf.get(id);
+              if (depSlice === undefined || depSlice >= index)
+                errors.push(`${where}.after requires ${id} in an earlier slice`);
+            }
+          }
+        }
+      });
+      for (const id of behaviorIds)
+        if (!seen.has(id)) errors.push(`behavior criterion ${id} is missing from the sequence`);
+    }
+  }
+
   return { ok: errors.length === 0, errors };
+}
+
+/** Assign O1..On to outcomes missing an id; returns a new array. */
+export function assignOutcomeIds(outcomes) {
+  let next = 1;
+  const used = new Set((outcomes ?? []).filter((o) => nonEmptyString(o.id)).map((o) => o.id));
+  return (outcomes ?? []).map((outcome) => {
+    if (nonEmptyString(outcome.id)) return outcome;
+    while (used.has(`O${next}`)) next += 1;
+    const id = `O${next}`;
+    next += 1;
+    used.add(id);
+    return { ...outcome, id };
+  });
 }
 
 /** Assign C1..Cn to criteria missing an id; returns a new array. */
@@ -468,6 +552,22 @@ export function detectRegression(prevOutcomes, nextOutcomes) {
 
 export function formatVector(outcomes) {
   return outcomes.map((o) => `${o.criterionId}=${o.status}`).join(" ");
+}
+
+/** Ordered root proof: cumulative slices, regressions always in horizon. */
+function isOrdered(contract) {
+  return Array.isArray(contract?.sequence) && contract.sequence.length > 0;
+}
+function horizonIds(contract, index) {
+  const seq = contract.sequence;
+  const idx = Math.max(0, Math.min(index ?? 0, seq.length - 1));
+  const behavior = [];
+  for (let i = 0; i <= idx; i++) for (const id of seq[i].verify) if (!behavior.includes(id)) behavior.push(id);
+  const regressions = contract.criteria.filter(c => c.type === "regression").map(c => c.id);
+  return [...behavior, ...regressions];
+}
+function isLastSlice(contract, index) {
+  return (index ?? 0) >= (contract.sequence.length - 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -1060,6 +1160,7 @@ export function childGates({ root, parentState, parentResult, target, goal, sibl
     const outcome = parentResult.outcomes.find((o) => o.criterionId === target);
     if (!outcome) errors.push(`target ${target} is not a parent criterion`);
     else if (outcome.status === "PASS") errors.push(`target ${target} currently passes; a child must target a failing criterion`);
+    else if (outcome.status !== "FAIL") errors.push(`target ${target} needs a current FAIL, not ${outcome.status}; evaluate the active slice first`);
   }
   const goalDigest = fingerprintGoal(goal);
   const repeat = (siblings ?? []).find(
@@ -1434,7 +1535,8 @@ async function refreshStack(io, root, candidateDigest) {
     if (!state || state.status !== NodeState.ACTIVE)continue;
     const verified=verifyBundle(bundle,state);if(!verified.ok)throw operationError("EVALUATOR_DRIFT",verified.reason);
     ensureBudget(io,root);
-    const result = await freshEvaluate(io, bundle, candidateDigest, root.deadlineAt-io.nowMs());
+    const horizon = isOrdered(bundle.contract)&&!state.parentId ? horizonIds(bundle.contract, state.sequenceIndex ?? 0) : null;
+    const result = await freshEvaluate(io, bundle, candidateDigest, root.deadlineAt-io.nowMs(), horizon);
     requireIdentity(io,root,result);
     state.lastResult = result;
     state.lastCandidateDigest = candidateDigest;
@@ -1559,6 +1661,7 @@ function createDraft(io, args) {
   }
   if (args.revise) return reviseDraft(io, index, args);
   const withIds = normalizeEvaluator({criteria:assignCriterionIds(criteria)}).draft.criteria;
+  const withOutcomes = args.outcomes !== undefined ? assignOutcomeIds(args.outcomes) : undefined;
 
   if (args.parentId) {
     if (args.policy !== undefined) return { ok: false, errors: ["children inherit the root policy and cannot override it"] };
@@ -1597,7 +1700,10 @@ function createDraft(io, args) {
       goal: goal.trim(),
       originalRequest: nonEmptyString(originalRequest) ? originalRequest.trim() : parentBundle.contract.originalRequest,
       parent: { id: args.parentId, targets: [args.target] },
+      ...(withOutcomes !== undefined ? { outcomes: withOutcomes } : {}),
       criteria: withIds,
+      ...(args.assets !== undefined ? {assets:args.assets} : {}),
+      ...(args.sequence !== undefined ? { sequence: args.sequence } : {}),
       ...(args.specificationPaths !== undefined ? {specificationPaths:args.specificationPaths} : {}),
       mutableDependencies:parentBundle.contract.mutableDependencies===true,
     };
@@ -1666,7 +1772,10 @@ function createDraft(io, args) {
     goal: goal.trim(),
     originalRequest: nonEmptyString(originalRequest) ? originalRequest.trim() : goal.trim(),
     parent: null,
+    ...(withOutcomes !== undefined ? { outcomes: withOutcomes } : {}),
     criteria: withIds,
+    ...(args.assets !== undefined ? {assets:args.assets} : {}),
+    ...(args.sequence !== undefined ? { sequence: args.sequence } : {}),
     ...(args.specificationPaths !== undefined ? {specificationPaths:args.specificationPaths} : {}),
     ...(args.mutableDependencies !== undefined ? {mutableDependencies:args.mutableDependencies} : {}),
     ...(args.assumptions !== undefined ? { assumptions: args.assumptions } : {}),
@@ -1729,8 +1838,9 @@ function reviseDraft(io, index, args) {
     return { ok: false, errors: [`${node.id} does not belong to the active root`] };
   }
   if (node.testStaging?.status === "open") return { ok: false, errors: [`${node.id} has an open test-staging window; complete it with exitcode_stage_tests before revising`] };
-  const withIds = normalizeEvaluator({criteria:assignCriterionIds(args.criteria)}).draft.criteria;
   const previous = readJson(draftFile(io.cwd, node.id))?.draft;
+  const withIds = normalizeEvaluator({criteria:assignCriterionIds(args.criteria)}).draft.criteria;
+  const resolvedOutcomes = args.outcomes !== undefined ? assignOutcomeIds(args.outcomes) : previous?.outcomes;
   const warnings = [];
   const nowMs = io.nowMs();
   const editable = policyEditable(root, node);
@@ -1770,7 +1880,10 @@ function reviseDraft(io, index, args) {
         ? args.originalRequest.trim()
         : (previous?.originalRequest ?? parentBundle?.contract.originalRequest ?? args.goal.trim()),
       parent: { id: node.parentId, targets: [node.target] },
+      ...(resolvedOutcomes !== undefined ? { outcomes: resolvedOutcomes } : {}),
       criteria: withIds,
+      ...((args.assets !== undefined ? args.assets : previous?.assets) !== undefined ? {assets:args.assets !== undefined ? args.assets : previous.assets} : {}),
+      ...(args.sequence !== undefined ? { sequence: args.sequence } : {}),
       ...(args.specificationPaths !== undefined ? {specificationPaths:args.specificationPaths} : {}),
       mutableDependencies:parentBundle?.contract.mutableDependencies===true,
     };
@@ -1787,9 +1900,11 @@ function reviseDraft(io, index, args) {
       goal: args.goal.trim(),
       originalRequest: previous?.originalRequest ?? (nonEmptyString(args.originalRequest) ? args.originalRequest.trim() : args.goal.trim()),
       parent: null,
+      ...(resolvedOutcomes !== undefined ? { outcomes: resolvedOutcomes } : {}),
       criteria: withIds,
+    ...((args.assets !== undefined ? args.assets : previous?.assets) !== undefined ? {assets:args.assets !== undefined ? args.assets : previous.assets} : {}),
     };
-    for (const key of ["assumptions", "exclusions", "specificationPaths", "mutableDependencies"]) {
+    for (const key of ["assumptions", "exclusions", "specificationPaths", "mutableDependencies", "sequence"]) {
       const value = args[key] !== undefined ? args[key] : previous?.[key];
       if (value !== undefined) draft[key] = value;
     }
@@ -1871,37 +1986,62 @@ function approveDraft(io, { userReply } = {}) {
 
 const RECIPE_EVIDENCE = { test_suite: "the project test suite", build_succeeds: "the project build", typecheck_succeeds: "the project typecheck" };
 
-/** Generated from the validated evaluator, never authored by the drafting agent. */
+/** Generated from validated evidence, never authored by the drafting agent. */
 function verificationSummary(draft, prepared) {
-  const challenges = id => (prepared?.stages ?? []).filter(s => ["discrimination", "sham", "adversarial"].includes(s.stage))
-    .flatMap(s => s.probes ?? []).filter(p => p.criterionId === id && p.expected === "FAIL").length;
+  const probesOf = (stages, id) => (prepared?.stages ?? []).filter(s => stages.includes(s.stage))
+    .flatMap(s => s.probes ?? []).filter(p => p.criterionId === id);
   return draft.criteria.map(c => {
-    const r = c.check.recipe, n = challenges(c.id);
-    const how = r?.kind === "existing_test" ? `existing test "${r.selector}" in ${r.path}` : RECIPE_EVIDENCE[r?.kind] ??
+    const r = c.check.recipe;
+    const how = r?.kind === "test_asset" ? `acceptance asset ${r.asset} via ${r.command}` : r?.kind === "existing_test" ? `existing test "${r.selector}" in ${r.path}` : RECIPE_EVIDENCE[r?.kind] ??
       (r?.path ? `${r.kind.replace(/_/g, " ")} ${r.path}` : r?.kind === "command_exit" ? `isolated command ${r.command}` : "an isolated custom command");
-    return `- ${c.id}: ${how}${n ? `; rejected ${n} independent near-miss${n === 1 ? "" : "es"}` : ""}.`;
+    const evidence = [];
+    const baseline = probesOf(["baseline"], c.id).find(p => p.label === "candidate");
+    if (baseline?.outcome) evidence.push(`baseline ${baseline.outcome.status}`);
+    const accept = probesOf(["discrimination"], c.id).find(p => p.label === "accept");
+    if (accept?.outcome?.status === "PASS") evidence.push("witness PASS");
+    const negatives = probesOf(["discrimination", "adversarial"], c.id).filter(p => p.expected === "FAIL" && p.outcome?.status === "FAIL").length;
+    if (negatives) evidence.push(`rejected ${negatives} negative${negatives === 1 ? "" : "s"}`);
+    return `- ${c.id}: ${how}${evidence.length ? `; ${evidence.join(", ")}` : ""}.`;
   });
 }
 
 /** Human acceptance layer; executable checks stay in the same draft. */
 export function rootReviewText(draft, root, nowMs = Date.now(), prepared = null) {
   if (isExpired(root, nowMs)) return "Validated plan unavailable: shared deadline expired.";
-  const lines = ["Validated plan", "", "Goal", draft.goal, "", "Success means"];
+  const lines = ["Validated plan", "", "Goal", draft.goal];
+  if (draft.outcomes?.length) {
+    lines.push("", "Outcomes");
+    for (const o of draft.outcomes) lines.push(`${o.id}: ${o.requirement}`);
+  }
+  lines.push("", "Success means");
   for (const criterion of draft.criteria) lines.push(`${criterion.id}: ${criterion.requirement}`);
+  if (draft.sequence?.length) {
+    lines.push("", "Implementation order");
+    draft.sequence.forEach((slice, i) => {
+      lines.push(`${i + 1}. ${slice.objective}`);
+      lines.push(`   Proves: ${slice.verify.join(", ")}`);
+    });
+  }
   for (const key of ["assumptions", "exclusions"]) {
     lines.push("", key === "assumptions" ? "Assumptions" : "Exclusions");
     lines.push(...(draft[key]?.length ? draft[key].map(x=>`- ${x}`) : ["- None stated."]));
   }
+  const critic = (prepared?.stages ?? []).find(s => s.stage === "critic");
   lines.push("", "Verification", ...verificationSummary(draft, prepared),
+    `Semantic critic: ${critic ? critic.status : "unavailable"}`,
+    "Mechanical evaluator validation: PASS",
     "Every check ran isolated, rejected an empty project, and was recorded against the current candidate. Finite challenges do not prove semantic equivalence.",
     "", "Approve this plan, or tell me what to change. /exitcode status shows policy and evaluator evidence. /exitcode exit cancels.");
   return lines.join("\n");
 }
 
 function intentDigestOf(draft) {
-  return sha256Hex(stableStringify({goal:draft.goal,originalRequest:draft.originalRequest,criteria:draft.criteria.map(c=>({id:c.id,requirement:c.requirement,type:c.type??'behavior'})),assumptions:draft.assumptions,exclusions:draft.exclusions}));
+  return sha256Hex(stableStringify({goal:draft.goal,originalRequest:draft.originalRequest,
+    outcomes:(draft.outcomes ?? []).map(o=>({id:o.id,requirement:o.requirement})),
+    criteria:draft.criteria.map(c=>({id:c.id,outcome:c.outcome,requirement:c.requirement,type:c.type??'behavior'})),
+    sequence:draft.sequence,assumptions:draft.assumptions,exclusions:draft.exclusions}));
 }
-function evaluatorDigestOf(draft) { return sha256Hex(stableStringify(draft.criteria.map(c=>({id:c.id,check:c.check,controls:c.controls})))); }
+function evaluatorDigestOf(draft) { return sha256Hex(stableStringify({criteria:draft.criteria.map(c=>({id:c.id,check:c.check,controls:c.controls})),assets:draft.assets ?? {}})); }
 function preparationMatches(io,node) {
   try {
     const draft=readJson(draftFile(io.cwd,node.id))?.draft,p=node.prepared,root=loadRoot(io,node.rootId);
@@ -2077,6 +2217,13 @@ async function sealPrepared(io, nodeId, { userApproval } = {}) {
   node.sealedBundleDigest=sha256Hex(stableStringify(bundle));
   node.status=NodeState.ACTIVE;node.phase="EXECUTION";node.sealAttempts++;
   node.lastResult=resultFromBaseline(bundle);node.lastCandidateDigest=bundle.candidateDigest;
+  if(isOrdered(bundle.contract)&&!node.parentId){
+    node.sequenceIndex=0;
+    node.sequence=structuredClone(bundle.contract.sequence);
+    const ids=new Set(horizonIds(bundle.contract,0));
+    const outcomes=node.lastResult.outcomes.filter(o=>ids.has(o.criterionId));
+    node.lastResult={...node.lastResult,outcomes,allPass:allPass(outcomes)};
+  }
   node.lastEnvironmentIdentity=digest(bundle.env);
   if(digestTree(io.cwd)!==bundle.candidateDigest || stableStringify(evaluatorEnvironment(io.cwd))!==stableStringify(bundle.env))throw operationError("CANDIDATE_MUTATED","candidate or environment changed while sealing");
   ensureBudget(io,root);
@@ -2090,7 +2237,7 @@ async function sealPrepared(io, nodeId, { userApproval } = {}) {
 
 // --- evaluate ------------------------------------------------------------
 
-async function freshEvaluate(io, bundle, candidateDigest, timeoutMs) {
+async function freshEvaluate(io, bundle, candidateDigest, timeoutMs, criterionIds = null) {
   const outcomes=[],metrics=emptyMetrics();
   let base;
   ensureRunning(io.signal,io.deadlineAt,io.nowMs);
@@ -2098,11 +2245,12 @@ async function freshEvaluate(io, bundle, candidateDigest, timeoutMs) {
   if(!compatibleEnvironment(bundle.env,environment,bundle.contract.mutableDependencies===true,bundle.assets))
     throw operationError("ENVIRONMENT_CHANGED","sealed evaluator environment changed; restore its trusted runtime or frozen dependencies");
   verifyEvaluatorAssets(io.cwd,bundle.assetsDirectory,bundle.assets);
+  const wanted = criterionIds ? new Set(criterionIds) : null;
   try {
     base=fixtureDirectory(io.cwd,"exitcode-fresh-base-");
     metrics.fixtureBytes+=copyCandidate(io.cwd,base,SNAPSHOT_MAX_BYTES,io.signal,io);metrics.fixtureCopies++;
     if(digestTree(base,io)!==candidateDigest || digestTree(io.cwd,io)!==candidateDigest)throw operationError("CANDIDATE_MUTATED","candidate changed while taking evaluation snapshot");
-    for(const criterion of bundle.contract.criteria) {
+    for(const criterion of bundle.contract.criteria.filter(c=>!wanted||wanted.has(c.id))) {
       ensureRunning(io.signal,io.deadlineAt,io.nowMs);
       const fixture=fixtureDirectory(io.cwd,"exitcode-fresh-");
       try {
@@ -2112,7 +2260,7 @@ async function freshEvaluate(io, bundle, candidateDigest, timeoutMs) {
         outcomes.push(await runCheck(criterion,io.exec,fixture,timeoutMs,
           {signal:io.signal,deadlineAt:io.deadlineAt,nowMs:io.nowMs,readOnlyPaths:bundle.assets.readOnlyPaths,onExecution:()=>metrics.shellExecutions++}));
         ensureRunning(io.signal,io.deadlineAt,io.nowMs);
-        verifyEvaluatorAssets(fixture,bundle.assetsDirectory,bundle.assets);
+        verifyEvaluatorAssets(fixture,bundle.assetsDirectory,bundle.assets,{installed:true});
       } finally {fs.rmSync(fixture,{recursive:true,force:true});}
     }
     if(digestTree(io.cwd,io)!==candidateDigest)throw operationError("CANDIDATE_MUTATED","candidate changed during evaluation; checked evidence is stale");
@@ -2203,7 +2351,9 @@ async function evaluateActive(io, nodeId) {
   }
 
   const timeoutMs = Math.max(0,root.deadlineAt-io.nowMs());
-  let result = await freshEvaluate(io, bundle, candidateDigest, timeoutMs);
+  const ordered = isOrdered(bundle.contract)&&!node.parentId;
+  const horizon = ordered ? horizonIds(bundle.contract, node.sequenceIndex ?? 0) : null;
+  let result = await freshEvaluate(io, bundle, candidateDigest, timeoutMs, horizon);
   requireIdentity(io,root,result);
   const verifiedStack={[node.id]:result};
 
@@ -2245,7 +2395,8 @@ async function evaluateActive(io, nodeId) {
     const ancestorBundle = loadBundle(io, ancestorId);
     if(!ancestorState?.lastResult || !ancestorBundle)throw operationError("EVALUATOR_DRIFT",`ancestor ${ancestorId} lost trusted evidence`);
     const verified=verifyBundle(ancestorBundle,ancestorState);if(!verified.ok)throw operationError("EVALUATOR_DRIFT",verified.reason);
-    const ancestorResult = await freshEvaluate(io, ancestorBundle, candidateDigest, timeoutMs);
+    const ancestorHorizon = isOrdered(ancestorBundle.contract)&&!ancestorState.parentId ? horizonIds(ancestorBundle.contract, ancestorState.sequenceIndex ?? 0) : null;
+    const ancestorResult = await freshEvaluate(io, ancestorBundle, candidateDigest, timeoutMs, ancestorHorizon);
     requireIdentity(io,root,ancestorResult);
     verifiedStack[ancestorId]=ancestorResult;
     const regressed = detectRegression(ancestorState.lastResult.outcomes, ancestorResult.outcomes);
@@ -2273,6 +2424,17 @@ async function evaluateActive(io, nodeId) {
     ancestorState.lastResult = ancestorResult;
     ancestorState.lastCandidateDigest = candidateDigest;
     ancestorState.lastEnvironmentIdentity=ancestorResult.environmentIdentity;
+    // An ordered ancestor advances only on its own fresh horizon PASS, never
+    // inferred from a child result. Advance here when the rerun proves it.
+    if(isOrdered(ancestorBundle.contract)&&!ancestorState.parentId&&ancestorResult.allPass&&!isLastSlice(ancestorBundle.contract,ancestorState.sequenceIndex ?? 0)){
+      const prevIndex=ancestorState.sequenceIndex ?? 0;
+      const nextIds=horizonIds(ancestorBundle.contract,prevIndex+1);
+      const seen=new Set(ancestorResult.outcomes.map(o=>o.criterionId));
+      const pending=nextIds.filter(id=>!seen.has(id)).map(criterionId=>({criterionId,status:"PENDING",reasons:["slice not yet evaluated"]}));
+      ancestorState.sequenceIndex=prevIndex+1;
+      ancestorState.lastResult={...ancestorResult,outcomes:[...ancestorResult.outcomes,...pending],allPass:false};
+      verifiedStack[ancestorId]=ancestorState.lastResult;
+    }
     saveNodeState(io, ancestorState);
   }
 
@@ -2281,6 +2443,33 @@ async function evaluateActive(io, nodeId) {
   requireIdentity(io,root,result);
   const warnings = snap.ok ? [] : [snap.warning];
   delete root.candidateReservation;
+  // Ordered proof advances one slice per fresh horizon PASS; only the final
+  // slice can close the root. An inconclusive commit never advances.
+  if(ordered&&result.allPass&&!isLastSlice(bundle.contract,node.sequenceIndex ?? 0)){
+    const prevIndex=node.sequenceIndex ?? 0;
+    const prevResult=result;
+    try{
+      const nextIds=horizonIds(bundle.contract,prevIndex+1);
+      const seen=new Set(result.outcomes.map(o=>o.criterionId));
+      const pending=nextIds.filter(id=>!seen.has(id)).map(criterionId=>({criterionId,status:"PENDING",reasons:["slice not yet evaluated"]}));
+      node.sequenceIndex=prevIndex+1;
+      node.lastResult={...result,outcomes:[...result.outcomes,...pending],allPass:false};
+      result=node.lastResult;
+      saveNodeState(io,node);
+      saveRoot(io,root);
+      requireIdentity(io,root,prevResult);
+      ensureBudget(io,root);
+    }catch(e){
+      node.sequenceIndex=prevIndex;
+      node.lastResult=prevResult;
+      saveNodeState(io,node);
+      throw e;
+    }
+    saveNodeState(io,node);
+    saveRoot(io,root);
+    ensureBudget(io,root);
+    return {ok:true,node:node.id,status:node.status,vector:formatVector(prevResult.outcomes),warnings,next:nextAction(root,node,null,io.nowMs())};
+  }
   saveNodeState(io,node);
   saveRoot(io, root);
 
@@ -2426,18 +2615,22 @@ export function nextAction(root, node, draft = null, nowMs = Date.now()) {
         : "shared deadline exceeded; the user must cancel with /exitcode exit and start a fresh root with fresh review";
     }
     if (node.parentId) return `seal ${node.id} with exitcode_seal (prepares the child evaluator first)`;
-    if (node.phase !== "READY_FOR_APPROVAL") return `revise ${node.id} evaluator with exitcode_draft, request test staging, or retry preparation before user review`;
+    if (node.phase !== "READY_FOR_APPROVAL") return `revise ${node.id} evaluator with exitcode_draft (including acceptance assets), or retry preparation before user review`;
     if (!node.parentId && !approvalMatches(root,draft)) return "present the validated plan and wait for explicit approval";
     return `seal ${node.id} with exitcode_seal`;
   }
   if (node.status !== NodeState.ACTIVE) return `${node.id} is ${node.status}`;
-  const failing = (node.lastResult?.outcomes ?? []).filter((o) => o.status !== "PASS").map((o) => o.criterionId);
+  const failing = (node.lastResult?.outcomes ?? []).filter((o) => o.status === "FAIL").map((o) => o.criterionId);
+  const pending = (node.lastResult?.outcomes ?? []).filter((o) => o.status === "PENDING").map((o) => o.criterionId);
   const repairs = root.policy.localRepairs ?? DEFAULT_POLICY.localRepairs;
   const attempts = `attempts ${root.consumedAttempts ?? 0}/${root.attemptLimit??root.policy.maxTotalAttempts}`;
+  const slice = Array.isArray(node.sequence) && node.sequence.length ? node.sequence[Math.min(node.sequenceIndex ?? 0, node.sequence.length - 1)] : null;
+  const prefix = slice ? `slice ${(node.sequenceIndex ?? 0) + 1}/${node.sequence.length}: ${slice.objective}; ` : "";
+  if (pending.length) return `${prefix}evaluate ${node.id} to prove ${pending.join(", ")} fresh (${attempts})`;
   if ((node.attempts ?? 0) < repairs) {
-    return `repair ${node.id} to achieve its goal; use failures [${failing.join(", ") || "none"}] as feedback, then exitcode_evaluate (${attempts})`;
+    return `${prefix}repair ${node.id} to achieve its goal; use failures [${failing.join(", ") || "none"}] as feedback, then exitcode_evaluate (${attempts})`;
   }
-  return `exitcode_evaluate ${node.id}; if a smaller goal offers a clearer path, propose exitcode_child targeting one of [${failing.join(", ") || "none"}], subject to supervisor gates (${attempts})`;
+  return `${prefix}exitcode_evaluate ${node.id}; if a smaller goal offers a clearer path, propose exitcode_child targeting one of [${failing.join(", ") || "none"}], subject to supervisor gates (${attempts})`;
 }
 
 export function statusSnapshot(io) {
@@ -2505,6 +2698,18 @@ function leafContract(io, snap) {
   return leafId ? loadBundle(io, leafId)?.contract ?? readJson(draftFile(io.cwd, leafId))?.draft : null;
 }
 
+function sliceLines(io, snap) {
+  const leafId = snap.stack.at(-1);
+  if (!leafId) return [];
+  const node = loadNodeState(io, leafId);
+  const contract = leafContract(io, snap);
+  if (!node || node.parentId || node.status !== NodeState.ACTIVE || !isOrdered(contract)) return [];
+  const index = node.sequenceIndex ?? 0;
+  const slice = contract.sequence[Math.min(index, contract.sequence.length - 1)];
+  const vector = node.lastResult ? formatVector(node.lastResult.outcomes) : "unevaluated";
+  return [`slice ${index + 1}/${contract.sequence.length}: ${slice.objective}`, `proof: ${vector}`];
+}
+
 /**
  * Bounded control-plane state injected into every agent turn. Never contains
  * checks, controls, evaluator evidence, or metrics; those are explicit-only.
@@ -2514,6 +2719,7 @@ export function promptStatusText(io) {
   if (!snap.active) return "exitcode: no active root";
   const lines = [`exitcode root ${snap.root} [${snap.status}] phase ${snap.phase}; stack ${snap.stack.join(" > ") || "(empty)"}`];
   for (const [id, node] of Object.entries(snap.nodes)) lines.push(`${id} ${node.status} :: ${node.vector} :: ${clip(node.goal, 160)}`);
+  for (const line of sliceLines(io, snap)) lines.push(line);
   const contract = leafContract(io, snap);
   for (const c of contract?.criteria ?? []) lines.push(`  ${c.id}${c.type === "regression" ? " (regression)" : ""}: ${clip(c.requirement, 120)}`);
   lines.push(`approval: ${snap.awaitingApproval ? "awaiting the user's reply to the validated plan" : snap.approval ? "approved" : "none"}`);
@@ -2538,6 +2744,7 @@ export function statusText(io, { detail = "normal" } = {}) {
     lines.push(`  ${id} ${node.status} attempts=${node.attempts} :: ${node.vector}`);
     if (node.goal) lines.push(`    goal: ${node.goal.slice(0, 160)}`);
   }
+  for (const line of sliceLines(io, snap)) lines.push(`  ${line}`);
   for (const c of leafContract(io, snap)?.criteria ?? []) lines.push(`  ${c.id}${c.type === "regression" ? " (regression)" : ""}: ${clip(c.requirement, 200)}`);
   lines.push(`  budget: ${snap.consumedAttempts}/${snap.maxTotalAttempts} attempts, deadline ${snap.clockStarted?snap.deadlineAt:"starts at root seal"}${snap.expired ? " (EXPIRED)" : ""}`);
   lines.push(`  effective policy: ${JSON.stringify(snap.policy)}`);
@@ -2547,6 +2754,13 @@ export function statusText(io, { detail = "normal" } = {}) {
   if (snap.staging) lines.push(`  test staging: ${snap.staging.node} ${snap.staging.status}: ${snap.staging.reason}${snap.staging.paths ? ` (${snap.staging.paths.join(", ")})` : ""}`);
   lines.push(`  phase: ${snap.phase}`, ...(snap.pause?[`  pause: ${snap.pause.code}: ${snap.pause.reason}`]:[]));
   if (detail === "evidence") {
+    const contract = leafContract(io, snap), nodeId = snap.stack.at(-1);
+    const evidence = loadBundle(io,nodeId) ?? loadNodeState(io,nodeId)?.prepared;
+    for (const c of contract?.criteria ?? []) if (c.check.recipe.kind === 'test_asset') {
+      const r = c.check.recipe;
+      lines.push(`  ${c.id} acceptance asset: ${path.relative(io.cwd,evidence?.assetsDirectory ?? path.join(storePaths(io.cwd).assetsDir,`${nodeId}.prepared`))}/.exitcode-evaluator/${r.asset}`,
+        `    command: ${r.command} ${(r.args ?? []).join(' ')} .exitcode-evaluator/${r.asset}`);
+    }
     lines.push(`  evaluator metrics: ${JSON.stringify(snap.evaluatorMetrics)}`, `  intent digest: ${snap.intentDigest}`, `  evaluator digest: ${snap.evaluatorDigest}`,
       `  diagnostics: ${JSON.stringify(snap.diagnostics)}`, `  evaluator evidence: ${JSON.stringify(snap.evaluatorEvidence)}`,
       `  test staging history: ${JSON.stringify(snap.stagingHistory)}`, `  contract: ${JSON.stringify(snap.contract)}`);
@@ -2583,5 +2797,5 @@ export function resumePreparation(io) {
   });
 }
 
-export { reviewPrompt, REVIEW_TIMEOUT_MS, REVIEW_MAX_TOKENS, REVIEW_RETRY_MAX_TOKENS, REVIEW_TOOL_NAME, parseReviewText } from './exitcode-quality.mjs';
+export { reviewPrompt, REVIEW_TIMEOUT_MS, REVIEW_MAX_TOKENS, REVIEW_RETRY_MAX_TOKENS, REVIEW_TOOL_NAME, CRITIC_CODES, parseReviewText, validateCritic, criticInput, callReview } from './exitcode-quality.mjs';
 export { reviewFailure } from './exitcode-operation.mjs';

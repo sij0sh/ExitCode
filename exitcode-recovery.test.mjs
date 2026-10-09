@@ -15,11 +15,12 @@ const read = (cwd, file) => fs.existsSync(path.join(cwd, file)) ? fs.readFileSyn
 const run = (exit, extra = {}) => ({ exit, stdout: '', stderr: '', timedOut: false, ...extra });
 const custom = command => ({ recipe: { kind: 'custom_command', command } });
 const criterion = (id, file, commands = false) => ({
-  id, requirement: `The literal ${file} artifact contains done`,
+  id, requirement: `The literal ${file} artifact contains done`, outcome: 'O1',
   check: commands ? custom(`observe:${file}`) : { recipe: { kind: 'file_contains', path: file, value: 'done' } },
   ...(commands ? { controls: { accept: { mutations: [{ kind: 'write_file', path: file, content: 'done' }] },
     reject: [{ mutations: [{ kind: 'write_file', path: file, content: 'pending' }] }] } } : {}),
 });
+const OUTCOMES = [{ id: 'O1', requirement: 'The literal feature artifact contains done' }];
 function project(t, { done = false, commands = false, files = {}, policy = {}, draft = {} } = {}) {
   const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'exitcode-recovery-'));
   const cwd = path.join(parent, 'project');
@@ -36,7 +37,7 @@ function project(t, { done = false, commands = false, files = {}, policy = {}, d
   const io = core.makeIo(cwd, { review: structuralReview, exec, nowMs: () => now });
   const criteria = [criterion('C1', 'feature', commands), { id: 'C2', requirement: 'The existing feature artifact remains present', type: 'regression',
     check: commands ? custom('preserve') : { recipe: { kind: 'file_exists', path: 'feature' } } }];
-  const args = { goal: 'Complete the literal feature artifact', criteria, policy, ...draft };
+  const args = { goal: 'Complete the literal feature artifact', outcomes: OUTCOMES, criteria, policy, ...draft };
   assert.equal(core.draftNode(io, args).ok, true);
   t.after(() => { releasePreparation(cwd); fs.rmSync(parent, { recursive: true, force: true }); });
   return { cwd, parent, io, args, exec, setNow: value => { now = value; } };
@@ -49,7 +50,8 @@ async function seal(f) {
   return core.loadRoot(f.io, 'G1');
 }
 async function child(f) {
-  const result = core.draftNode(f.io, { parentId: 'G1', target: 'C1', goal: 'Create the literal helper artifact', criteria: [criterion('D1', 'helper', true)],
+  const result = core.draftNode(f.io, { parentId: 'G1', target: 'C1', goal: 'Create the literal helper artifact',
+    outcomes: [{ id: 'O1', requirement: 'Helper done' }], criteria: [criterion('D1', 'helper', true)],
     reason: 'The helper is a prerequisite for C1', prerequisite: true, prerequisiteArtifact: 'helper' });
   assert.equal(result.ok, true, JSON.stringify(result.errors));
   assert.equal((await core.sealNode(f.io, result.id)).ok, true);
@@ -62,27 +64,36 @@ async function waitFor(predicate) {
 const done = f => fs.writeFileSync(path.join(f.cwd, 'feature'), 'done');
 
 test('recovery: infrastructure faults during root preparation remain editable without spending evaluator quality budget', async t => {
-  // Retryable transport errors are retried a bounded number of times.
-  const retried = project(t);
-  let calls = 0;
-  retried.io.review = async input => { if (++calls <= 2) throw Object.assign(Error('provider returned 429'), { status: 429 }); return structuralReview(input); };
-  const ok = await core.prepareNode(retried.io);
-  assert.equal(ok.ok, true);
-  assert.deepEqual([calls, ok.stages.filter(s => s.stage === 'review-transport').length], [4, 2]);
-  assert.equal(core.loadNodeState(retried.io, 'G1').evaluatorMetrics.transportRetries, 2);
+  // Best-effort critic failures never block deterministic evidence.
+  for (const [label, review] of [
+    ['transport retry', async input => { throw Object.assign(Error('provider returned 429'), { status: 429 }); }],
+    ['incompatible request', async () => { throw Object.assign(Error('400 incompatible request'), { status: 400 }); }],
+    ['provider authority', async () => { throw Object.assign(Error('401 invalid credentials'), { status: 401 }); }],
+    ['malformed review', async () => ({ concerns: [{ code: 'BOGUS', evidence: '' }] })],
+    ['length exhausted', async () => { throw Object.assign(Error('review exceeds bounded response'), { code: 'REVIEW_TOO_LARGE' }); }],
+    ['missing specification', null],
+  ]) await t.test(label, async t => {
+    const f = project(t, { commands: true });
+    if (review) f.io.review = review;
+    if (label === 'missing specification')
+      assert.equal(core.draftNode(f.io, { ...f.args, revise: 'G1', specificationPaths: ['.agents/artifacts/missing.md'] }).ok, true);
+    const ok = await core.prepareNode(f.io);
+    assert.equal(ok.ok, true, `${label}: ${JSON.stringify(ok.diagnostics)}`);
+    if (label === 'missing specification') {
+      assert.equal(ok.stages.find(s => s.stage === 'critic').status, 'pass', 'missing specs are omitted, not blocking');
+    } else {
+      assert.equal(ok.stages.find(s => s.stage === 'critic').status, 'unavailable');
+      assert.match(ok.review, /Semantic critic: unavailable/);
+    }
+  });
   for (const [label, setup, code] of [
-    ['incompatible request', f => { f.io.review = async () => { throw Object.assign(Error('400 incompatible request'), { status: 400 }); }; }, 'REVIEW_INCOMPATIBLE'],
-    ['provider authority', f => { f.io.review = async () => { throw Object.assign(Error('401 invalid credentials'), { status: 401 }); }; }, 'REVIEW_CONFIGURATION'],
-    ['malformed review', f => { f.io.review = async () => ({criteria:[]}); }, 'REVIEW_RESPONSE_INVALID'],
-    ['length exhausted', f => { f.io.review = async () => { throw Object.assign(Error('review exceeds bounded response'), {code:'REVIEW_TOO_LARGE'}); }; }, 'REVIEW_TOO_LARGE'],
     ['runner', f => { f.io.exec = async (command, options) => command === 'observe:feature' && read(options.cwd, 'feature') === 'pending'
       ? run(null, { error: 'temporary runner failure', errorCode: 'RUNNER_ERROR' }) : f.exec(command, options); }, 'RUNNER_ERROR'],
     ['runtime IO', f => { fs.writeFileSync(path.join(f.cwd, 'node_modules'), 'not a directory'); core.releaseBaseline(f.cwd); }, 'ENOTDIR'],
     ['late supervisor IO', f => { f.io.review=async input=>{
-      if(input.phase==='assess')fs.writeFileSync(path.join(core.storePaths(f.cwd).baselineDir,'manifest.json'),'{');
+      fs.writeFileSync(path.join(core.storePaths(f.cwd).baselineDir,'manifest.json'),'{');
       return structuralReview(input);
     }; }, 'IO_ERROR'],
-    ['missing specification', f => { assert.equal(core.draftNode(f.io, { ...f.args, revise: 'G1', specificationPaths: ['.agents/artifacts/missing.md'] }).ok, true); }, 'SPECIFICATION_UNAVAILABLE'],
   ]) {
     const f = project(t, { commands: true });
     setup(f);
@@ -178,7 +189,7 @@ test('recovery: interrupted preparation never restores approval and its evaluato
 test('recovery: live operations and transcript root ownership cannot be cleared or bypassed', async t => {
   const f = project(t);
   let complete;
-  f.io.review = async input => input.phase === 'derive' ? new Promise(resolve => { complete = () => resolve(structuralReview(input)); }) : structuralReview(input);
+  f.io.review = async input => new Promise(resolve => { complete = () => resolve(structuralReview(input)); });
   const pending = core.prepareNode(f.io);
   await waitFor(() => typeof complete === 'function');
   const other = core.makeIo(f.cwd, { expectedRootId: 'G1' });
@@ -375,7 +386,8 @@ test('recovery: deadline crossings never yield PASS, and only explicit user gran
   // Child review after sealing shares the root deadline without restarting it.
   const shared = project(t, { policy: { deadlineMinutes: 1 } });
   const sharedRoot = await seal(shared);
-  const proposal = core.draftNode(shared.io, { parentId: 'G1', target: 'C1', goal: 'Create helper', criteria: [criterion('D1', 'helper')],
+  const proposal = core.draftNode(shared.io, { parentId: 'G1', target: 'C1', goal: 'Create helper',
+    outcomes: [{ id: 'O1', requirement: 'Helper done' }], criteria: [criterion('D1', 'helper')],
     reason: 'Prerequisite', prerequisite: true, prerequisiteArtifact: 'helper' });
   shared.io.review = async input => { shared.setNow(sharedRoot.deadlineAt); return structuralReview(input); };
   assert.equal((await core.sealNode(shared.io, proposal.id)).status, 'PAUSED');

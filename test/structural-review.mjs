@@ -1,11 +1,9 @@
-/** Deterministic reviewer for existing supervisor tests' literal artifact fixtures.
- * Not a production fallback. Semantic tests supply independent scenario responses.
+/** Deterministic critic for supervisor tests. Approves the intent contract.
+ * Not a production fallback. Semantic tests supply scenario responses.
  */
 export async function structuralReview(input) {
-  const behavior=input.criteria.filter(c=>(c.type??'behavior')==='behavior');
-  if(input.phase==='derive')return {uncovered:[],
-    criteria:behavior.map(c=>({criterionId:c.id,structural:true,observation:'Observe literal content in this supervisor test fixture',nearMisses:[]}))};
-  return {criteria:behavior.map(c=>({criterionId:c.id,outcomeObserved:true,shams:[]})),issues:[]};
+  if (input.phase !== 'critic') throw Object.assign(new Error(`unknown review phase: ${input.phase}`), { code: 'REVIEW_RESPONSE_INVALID' });
+  return { concerns: [] };
 }
 export function structuralRegistry() {
   return {streamSimple(_model,context){return {async result(){return {

@@ -7,13 +7,12 @@ export function reviewRegistry(mode='success') {
     return {async result(){
       if(mode==='cancel'){options.signal.addEventListener('abort',()=>{}, {once:true});return new Promise(()=>{});}
       if(mode==='error')return {stopReason:'error',errorMessage:'provider unavailable',content:[],usage};
-      // Request-shape incompatibility (400) versus real provider authority failures (401).
-      if(mode==='reject-all'||mode==='reject-constrained'&&context.tools?.[0]?.constrainedSampling)
+      if(mode==='reject-all'||mode==='reject-constrained')
         return {stopReason:'error',errorMessage:'400 Bad Request: unsupported request option',content:[],usage};
       if(mode==='unauthorized')return {stopReason:'error',errorMessage:'401 Unauthorized',content:[],usage};
       const data=await structuralReview(input);
-      if(mode==='malformed'||mode==='tool-malformed')data.criteria=[];
-      if(mode==='tool-call'||mode==='tool-malformed'||mode==='reject-constrained'&&context.tools)
+      if(mode==='malformed'||mode==='tool-malformed')data.concerns=[{code:'BOGUS',evidence:''}];
+      if(mode==='tool-call'||mode==='tool-malformed')
         return {stopReason:'toolUse',usage,content:[{type:'toolCall',id:'call-1',name:'submit_review',arguments:data}]};
       if(mode==='wrong-tool')
         return {stopReason:'toolUse',usage,content:[{type:'toolCall',id:'call-1',name:'other_tool',arguments:data}]};

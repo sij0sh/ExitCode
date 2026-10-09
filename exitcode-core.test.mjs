@@ -30,15 +30,16 @@ const FIXTURES = {
 };
 const witness = (id, content) => ({ mutations: [{ kind: "write_file", path: FIXTURES[id].file, content }] });
 const custom = (command) => ({ recipe: { kind: "custom_command", command } });
-const behavior = (id, cmd) => ({
-  id, requirement: `requirement ${id}`, check: custom(cmd),
+const behavior = (id, cmd, outcome) => ({
+  id, requirement: `requirement ${id}`, ...(outcome === null ? {} : { outcome: outcome ?? `O${id.replace(/\D/g, "") || "1"}` }), check: custom(cmd),
   controls: { accept: witness(id, FIXTURES[id].valid), reject: [{ ...witness(id, FIXTURES[id].invalid), reason: `broken ${id}` }] },
 });
 const regression = (id, cmd) => ({ id, requirement: `requirement ${id}`, type: "regression", check: custom(cmd) });
 
 function rootDraft(overrides = {}) {
   return { id: "G1", goal: "Add the thing", originalRequest: "user: add the thing", parent: null,
-    criteria: [behavior("C1", "check:c1"), regression("C2", "check:reg")], ...overrides };
+    outcomes: [{ id: "O1", requirement: "The thing is added" }],
+    criteria: [behavior("C1", "check:c1", "O1"), regression("C2", "check:reg")], ...overrides };
 }
 
 /** Fake exec: checks always read the supplied cwd. */
@@ -80,19 +81,22 @@ function testIo(dir, exec, nowRef = { now: Date.now() }) {
   return { io: makeIo(dir, { exec, nowMs: () => nowRef.now }), nowRef };
 }
 
-const ROOT_CRITERIA = [behavior("C1", "check:c1"), regression("C2", "check:reg")];
+const ROOT_OUTCOMES = [{ id: "O1", requirement: "The thing is added" }];
+const ROOT_CRITERIA = [behavior("C1", "check:c1", "O1"), regression("C2", "check:reg")];
 const ROOT_SEQUENCE = [{ objective: "Establish the first proof", verify: ["C1"] }, { objective: "Finish the last proof", verify: ["C3"] }];
-const ORDERED_CRITERIA = [...ROOT_CRITERIA, { id: "C3", requirement: "The last literal artifact contains done",
+const ORDERED_OUTCOMES = [...ROOT_OUTCOMES, { id: "O3", requirement: "The last artifact is done" }];
+const ORDERED_CRITERIA = [...ROOT_CRITERIA, { id: "C3", requirement: "The last literal artifact contains done", outcome: "O3",
   check: { recipe: { kind: "file_contains", path: "last.txt", value: "done" } } }];
-const childCriteria = () => [behavior("D1", "check:d1")];
-const childArgs = (extra = {}) => ({ parentId: "G1", target: "C1", goal: "sub", criteria: childCriteria(), reason: "r",
+const childCriteria = () => [behavior("D1", "check:d1", "O1")];
+const CHILD_OUTCOMES = [{ id: "O1", requirement: "The child outcome is done" }];
+const childArgs = (extra = {}) => ({ parentId: "G1", target: "C1", goal: "sub", outcomes: CHILD_OUTCOMES, criteria: childCriteria(), reason: "r",
   prerequisite: true, prerequisiteArtifact: "a", ...extra });
 
 async function sealedRoot(t, { files, policy, sequence, nowRef = { now: Date.now() } } = {}) {
   const dir = tempProject(t, files);
   const exec = fileExec(dir, { checks: standardChecks });
   const { io } = testIo(dir, exec, nowRef);
-  const draft = draftNode(io, { goal: "Add the thing", criteria: sequence ? ORDERED_CRITERIA : ROOT_CRITERIA, ...(sequence ? { sequence } : {}), ...(policy ? { policy } : {}) });
+  const draft = draftNode(io, { goal: "Add the thing", outcomes: sequence ? ORDERED_OUTCOMES : ROOT_OUTCOMES, criteria: sequence ? ORDERED_CRITERIA : ROOT_CRITERIA, ...(sequence ? { sequence } : {}), ...(policy ? { policy } : {}) });
   assert.equal(draft.ok, true, JSON.stringify(draft.errors));
   assert.equal((await prepareNode(io)).ok, true);
   assert.equal(approveRoot(io).ok, true);
@@ -132,7 +136,7 @@ test("structure: drafts are validated before any probe, and controls are optiona
     assert.ok(result.errors.some((e) => e.includes(fragment)), `${label}: ${result.errors.join("; ")}`);
   }
   assert.deepEqual(assignCriterionIds([{ requirement: "a" }, { id: "C9", requirement: "b" }, { requirement: "c" }]).map((c) => c.id), ["C1", "C9", "C2"]);
-  const ordered = rootDraft({ criteria: ORDERED_CRITERIA, sequence: ROOT_SEQUENCE });
+  const ordered = rootDraft({ outcomes: ORDERED_OUTCOMES, criteria: ORDERED_CRITERIA, sequence: ROOT_SEQUENCE });
   assert.equal(validateStructure(ordered).ok, true);
   assert.equal(validateStructure({ ...ordered, sequence: [{ objective: "x".repeat(200), verify: ["C1", "C3"] }] }).ok, true);
   for (const [label, sequence] of [
@@ -149,7 +153,7 @@ test("structure: drafts are validated before any probe, and controls are optiona
   ]) {
     assert.equal(validateStructure({ ...ordered, sequence }).ok, false, label);
     const dir = tempProject(t), exec = fileExec(dir), io = makeIo(dir, { exec });
-    const rejected = draftNode(io, { goal: "g", criteria: ORDERED_CRITERIA, sequence });
+    const rejected = draftNode(io, { goal: "g", outcomes: ORDERED_OUTCOMES, criteria: ORDERED_CRITERIA, sequence });
     assert.equal(rejected.ok, false, `${label} rejected at the draft boundary`);
     assert.equal(exec.calls.length, 0);
     assert.equal(core.loadIndex(dir).activeRootId, null, "invalid order creates no root");
@@ -158,11 +162,11 @@ test("structure: drafts are validated before any probe, and controls are optiona
   assert.equal(validateStructure(rootDraft({ criteria: twelve, sequence: twelve.map(c => ({ objective: c.requirement, verify: [c.id] })) })).ok, true);
   assert.equal(validateStructure(child(["C1"], { sequence: [{ objective: "Child", verify: ["C1"] }] }), { parent, parentDepth: 0 }).ok, false, "sequences are root-only");
   const dir = tempProject(t), io = makeIo(dir);
-  const assigned = draftNode(io, { goal: "g", criteria: ORDERED_CRITERIA.map(({ id, ...c }) => c), sequence: ROOT_SEQUENCE });
+  const assigned = draftNode(io, { goal: "g", outcomes: ORDERED_OUTCOMES, criteria: ORDERED_CRITERIA.map(({ id, ...c }) => c), sequence: ROOT_SEQUENCE });
   assert.equal(assigned.ok, true, "sequence references supervisor-assigned criterion IDs");
   assert.deepEqual(assigned.draft.sequence, ROOT_SEQUENCE);
   const before = [fs.readFileSync(core.draftFile(dir, "G1"), "utf8"), loadRoot(io, "G1"), loadNodeState(io, "G1")];
-  assert.equal(draftNode(io, { revise: "G1", goal: "bad", criteria: ORDERED_CRITERIA, sequence: [] }).ok, false);
+  assert.equal(draftNode(io, { revise: "G1", goal: "bad", outcomes: ORDERED_OUTCOMES, criteria: ORDERED_CRITERIA, sequence: [] }).ok, false);
   assert.deepEqual([fs.readFileSync(core.draftFile(dir, "G1"), "utf8"), loadRoot(io, "G1"), loadNodeState(io, "G1")], before, "invalid revision is atomic");
   assert.deepEqual(draftNode(io, { revise: "G1", goal: "g", criteria: ORDERED_CRITERIA }).draft.sequence, ROOT_SEQUENCE, "omitted order is retained on revision");
 });
@@ -195,7 +199,7 @@ test("lifecycle: an approved, validated draft seals exactly and only a fresh eva
   const dir = tempProject(t);
   const nowRef = { now: Date.now() };
   const { io } = testIo(dir, fileExec(dir, { checks: standardChecks }), nowRef);
-  const draft = draftNode(io, { goal: "Add the thing", criteria: ROOT_CRITERIA });
+  const draft = draftNode(io, { goal: "Add the thing", outcomes: ROOT_OUTCOMES, criteria: ROOT_CRITERIA });
   assert.equal(draft.id, "G1");
   assert.match(draft.next, /revise G1 evaluator with exitcode_draft/);
   const prepared = await prepareNode(io);
@@ -228,10 +232,10 @@ test("lifecycle: an approved, validated draft seals exactly and only a fresh eva
 test("lifecycle: one root at a time; a second draft must revise", async (t) => {
   const dir = tempProject(t);
   const { io } = testIo(dir, fileExec(dir, { checks: standardChecks }));
-  assert.equal(draftNode(io, { goal: "g", criteria: ROOT_CRITERIA }).ok, true);
-  assert.ok(draftNode(io, { goal: "g", criteria: ROOT_CRITERIA }).errors.some((e) => e.includes('revise:"G1"')));
+  assert.equal(draftNode(io, { goal: "g", outcomes: ROOT_OUTCOMES, criteria: ROOT_CRITERIA }).ok, true);
+  assert.ok(draftNode(io, { goal: "g", outcomes: ROOT_OUTCOMES, criteria: ROOT_CRITERIA }).errors.some((e) => e.includes('revise:"G1"')));
   const { io: sealed } = await sealedRoot(t);
-  assert.ok(draftNode(sealed, { goal: "other", criteria: ROOT_CRITERIA }).errors.some((e) => e.includes("still ACTIVE")));
+  assert.ok(draftNode(sealed, { goal: "other", outcomes: ROOT_OUTCOMES, criteria: ROOT_CRITERIA }).errors.some((e) => e.includes("still ACTIVE")));
 });
 
 // ---------------------------------------------------------------------------
@@ -242,7 +246,7 @@ test("approval: unapproved roots and invalid replies never seal or spend proposa
   const dir = tempProject(t);
   const exec = fileExec(dir, { checks: standardChecks });
   const { io } = testIo(dir, exec);
-  draftNode(io, { goal: "g", criteria: ROOT_CRITERIA });
+  draftNode(io, { goal: "g", outcomes: ROOT_OUTCOMES, criteria: ROOT_CRITERIA });
   for (let n = 0; n < 3; n++) assert.match((await sealNode(io, "G1")).errors[0], /requires explicit user approval/);
   for (const userApproval of ["", "  ", null, true, 123]) assert.match((await sealNode(io, "G1", { userApproval })).errors[0], /nonempty string/);
   assert.equal(exec.calls.length, 0);
@@ -254,7 +258,7 @@ test("approval: unapproved roots and invalid replies never seal or spend proposa
 test("approval: a conversational reply is recorded against the exact root draft", async (t) => {
   const dir = tempProject(t);
   const { io } = testIo(dir, fileExec(dir, { checks: standardChecks }));
-  draftNode(io, { goal: "g", criteria: ROOT_CRITERIA });
+  draftNode(io, { goal: "g", outcomes: ROOT_OUTCOMES, criteria: ROOT_CRITERIA });
   await prepareNode(io);
   const reply = "Looks good, go ahead.";
   assert.equal((await sealNode(io, "G1", { userApproval: reply })).ok, true);
@@ -268,14 +272,14 @@ test("approval: every revision or on-disk edit invalidates approval", async (t) 
   const dir = tempProject(t);
   const exec = fileExec(dir, { checks: standardChecks });
   const { io } = testIo(dir, exec);
-  draftNode(io, { goal: "g", criteria: ROOT_CRITERIA, sequence: [{ objective: "Prove the feature", verify: ["C1"] }], assumptions: ["Existing policy"], exclusions: ["No redesign"], policy: { evaluatorAttempts: 12 } });
+  draftNode(io, { goal: "g", outcomes: ROOT_OUTCOMES, criteria: ROOT_CRITERIA, sequence: [{ objective: "Prove the feature", verify: ["C1"] }], assumptions: ["Existing policy"], exclusions: ["No redesign"], policy: { evaluatorAttempts: 12 } });
   assert.equal((await prepareNode(io)).ok, true);
   assert.equal(approveRoot(io).ok, true);
   exec.calls.length = 0;
   assert.equal(draftNode(io, { goal: "g", criteria: [], revise: "G1" }).ok, false);
   assert.ok(loadRoot(io, "G1").approval, "a rejected revision keeps approval");
   // Even an identical resubmission is a revision and requires new approval; review context is retained.
-  const revised = draftNode(io, { goal: "g", criteria: ROOT_CRITERIA, revise: "G1" });
+  const revised = draftNode(io, { goal: "g", outcomes: ROOT_OUTCOMES, criteria: ROOT_CRITERIA, revise: "G1" });
   assert.equal(loadRoot(io, "G1").approval, undefined);
   assert.deepEqual(revised.draft.assumptions, ["Existing policy"]);
   assert.match(rootReviewText(revised.draft, loadRoot(io, "G1")), /No redesign/);
@@ -303,7 +307,7 @@ test("approval: every revision or on-disk edit invalidates approval", async (t) 
     assert.equal((await sealNode(io, "G1", { userApproval: "Go ahead." })).ok, false);
     assert.equal(exec.calls.length, 0);
     fs.writeFileSync(draftFile(dir, "G1"), JSON.stringify(original));
-    draftNode(io, { goal: "g", criteria: ROOT_CRITERIA, revise: "G1" });
+    draftNode(io, { goal: "g", outcomes: ROOT_OUTCOMES, criteria: ROOT_CRITERIA, revise: "G1" });
   }
   // A root whose review digest is missing fails closed until revised.
   const root = loadRoot(io, "G1");
@@ -311,7 +315,7 @@ test("approval: every revision or on-disk edit invalidates approval", async (t) 
   core.saveRoot(io, root);
   assert.equal(approveRoot(io).ok, false);
   assert.equal((await sealNode(io, "G1", { userApproval: "Proceed." })).ok, false);
-  assert.equal(draftNode(io, { goal: "g", criteria: ROOT_CRITERIA, revise: "G1" }).ok, true);
+  assert.equal(draftNode(io, { goal: "g", outcomes: ROOT_OUTCOMES, criteria: ROOT_CRITERIA, revise: "G1" }).ok, true);
   assert.equal((await prepareNode(io)).ok, true);
   assert.equal((await sealNode(io, "G1", { userApproval: "Proceed." })).ok, true);
   assert.equal(loadNodeState(io, "G1").sealAttempts, 1);
@@ -323,7 +327,7 @@ test("approval: review and approval bind every limit and the shared clock", asyn
     const dir = tempProject(t);
     const exec = fileExec(dir, { checks: standardChecks });
     const io = makeIo(dir, { exec });
-    draftNode(io, { goal: "g", criteria: ROOT_CRITERIA });
+    draftNode(io, { goal: "g", outcomes: ROOT_OUTCOMES, criteria: ROOT_CRITERIA });
     const file = path.join(dir, ".exitcode/roots/G1.json");
     const before = loadRoot(io, "G1");
     const mutated = structuredClone(before);
@@ -353,16 +357,16 @@ test("policy: limits are editable before first approval, atomic when invalid, an
   const nowRef = { now: Date.parse("2026-10-07T22:02:15.029Z") }, exec = fileExec(dir, { checks: standardChecks });
   const { io } = testIo(dir, exec, nowRef);
   for (const policy of [null, { deadlineMinutes: Infinity }, { deadlineMinutes: Number.MAX_VALUE }, { evalTimeoutSeconds: NaN }, { maxTotalAttempts: -1 }, { constructor: 1 }]) {
-    assert.equal(draftNode(io, { goal: "g", criteria: ROOT_CRITERIA, policy }).ok, false);
+    assert.equal(draftNode(io, { goal: "g", outcomes: ROOT_OUTCOMES, criteria: ROOT_CRITERIA, policy }).ok, false);
     assert.deepEqual(statusSnapshot(io).roots, [], "invalid root creation consumes no identity");
   }
-  draftNode(io, { goal: "Initial scope", originalRequest: "Complete the implementation", criteria: ROOT_CRITERIA, policy: { maxDepth: 1, evalTimeoutSeconds: 900 } });
+  draftNode(io, { goal: "Initial scope", originalRequest: "Complete the implementation", outcomes: ROOT_OUTCOMES, criteria: ROOT_CRITERIA, policy: { maxDepth: 1, evalTimeoutSeconds: 900 } });
   const createdAt = loadRoot(io, "G1").createdAt;
   const files = [draftFile(dir, "G1"), path.join(dir, ".exitcode/roots/G1.json"), path.join(dir, ".exitcode/nodes/G1.json")];
   const before = files.map((file) => fs.readFileSync(file, "utf8"));
   for (const policy of [null, [], { bogus: 1 }, { toString: 1 }, { deadlineMinutes: Infinity }, { deadlineMinutes: NaN },
     { deadlineMinutes: 0 }, { deadlineMinutes: -1 }, { deadlineMinutes: "480" }, { deadlineMinutes: Number.MAX_VALUE }]) {
-    assert.equal(draftNode(io, { revise: "G1", goal: "Should not persist", criteria: ROOT_CRITERIA, policy }).ok, false);
+    assert.equal(draftNode(io, { revise: "G1", goal: "Should not persist", outcomes: ROOT_OUTCOMES, criteria: ROOT_CRITERIA, policy }).ok, false);
     assert.deepEqual(files.map((file) => fs.readFileSync(file, "utf8")), before);
   }
   assert.equal(draftNode(io, { revise: "G1", goal: "Invalid", criteria: [behavior("C1", "check:c1"), behavior("C1", "check:c1")], policy: { deadlineMinutes: 900 } }).ok, false);
@@ -370,7 +374,7 @@ test("policy: limits are editable before first approval, atomic when invalid, an
   // Partial corrections retain effective values; the retained request outranks a later one.
   nowRef.now += 14 * 86400000;
   const policy = { localRepairs: 4, maxTotalAttempts: 24, deadlineMinutes: 480, evalTimeoutSeconds: 1200 };
-  const revised = draftNode(io, { revise: "G1", goal: "Implementation", criteria: ROOT_CRITERIA, originalRequest: "Housekeeping", policy });
+  const revised = draftNode(io, { revise: "G1", goal: "Implementation", outcomes: ROOT_OUTCOMES, criteria: ROOT_CRITERIA, originalRequest: "Housekeeping", policy });
   assert.equal(revised.draft.originalRequest, "Complete the implementation");
   assert.deepEqual(revised.policy, { ...DEFAULT_POLICY, maxDepth: 1, ...policy });
   assert.equal(revised.createdAt, createdAt);
@@ -381,15 +385,15 @@ test("policy: limits are editable before first approval, atomic when invalid, an
   assert.equal((await prepareNode(io)).ok, true);
   assert.equal(approveRoot(io).ok, true);
   const approved = loadRoot(io, "G1");
-  const rejected = draftNode(io, { revise: "G1", goal: "Rejected scope", criteria: ROOT_CRITERIA, policy: { deadlineMinutes: 960 } });
+  const rejected = draftNode(io, { revise: "G1", goal: "Rejected scope", outcomes: ROOT_OUTCOMES, criteria: ROOT_CRITERIA, policy: { deadlineMinutes: 960 } });
   assert.match(rejected.errors[0], /locked/);
   assert.match(rejected.next, /user must cancel/);
   assert.deepEqual(loadRoot(io, "G1"), approved);
   // An identical policy is not an amendment, but it is still a fresh revision.
-  const same = draftNode(io, { revise: "G1", goal: "Implementation", criteria: ROOT_CRITERIA, policy: { ...approved.policy } });
+  const same = draftNode(io, { revise: "G1", goal: "Implementation", outcomes: ROOT_OUTCOMES, criteria: ROOT_CRITERIA, policy: { ...approved.policy } });
   assert.equal(same.ok, true);
   assert.equal(same.policyEditable, false);
-  assert.equal(draftNode(makeIo(dir), { revise: "G1", goal: "g", criteria: ROOT_CRITERIA, policy: { maxTotalAttempts: 99 } }).ok, false);
+  assert.equal(draftNode(makeIo(dir), { revise: "G1", goal: "g", outcomes: ROOT_OUTCOMES, criteria: ROOT_CRITERIA, policy: { maxTotalAttempts: 99 } }).ok, false);
   assert.equal((await prepareNode(io)).ok, true);
   assert.equal((await sealNode(io, "G1", { userApproval: "Approve scope and limits" })).sealed, "G1");
   assert.ok(exec.calls.every((call) => call.timeoutMs === 1200 * 1000));
@@ -398,24 +402,24 @@ test("policy: limits are editable before first approval, atomic when invalid, an
     (_r, node) => { node.lastResult = { outcomes: [] }; }, (_r, node) => { node.lastCandidateDigest = "evaluated"; },
     (_r, node) => { node.checkpoints.push({ id: "work" }); }, (_r, node) => { node.children.push("G1.1"); }]) {
     const other = tempProject(t), otherIo = makeIo(other);
-    draftNode(otherIo, { goal: "g", criteria: ROOT_CRITERIA });
+    draftNode(otherIo, { goal: "g", outcomes: ROOT_OUTCOMES, criteria: ROOT_CRITERIA });
     const root = loadRoot(otherIo, "G1"), node = loadNodeState(otherIo, "G1");
     mutate(root, node);
     core.saveRoot(otherIo, root);
     core.saveNodeState(otherIo, node);
     assert.equal(statusSnapshot(otherIo).policyEditable, false);
-    assert.equal(draftNode(otherIo, { revise: "G1", goal: "g", criteria: ROOT_CRITERIA, policy: { maxTotalAttempts: 99 } }).ok, false);
+    assert.equal(draftNode(otherIo, { revise: "G1", goal: "g", outcomes: ROOT_OUTCOMES, criteria: ROOT_CRITERIA, policy: { maxTotalAttempts: 99 } }).ok, false);
   }
 });
 
 test("policy: discovery, preparation, review and approval spend no execution time; the clock starts once at seal", async (t) => {
   const dir = tempProject(t);
   const { io, nowRef } = testIo(dir, fileExec(dir, { checks: standardChecks }));
-  draftNode(io, { goal: "g", criteria: ROOT_CRITERIA });
+  draftNode(io, { goal: "g", outcomes: ROOT_OUTCOMES, criteria: ROOT_CRITERIA });
   const created = loadRoot(io, "G1").createdAt;
   nowRef.now += 30 * 60000;
   // A shorter duration does not expire an unsealed preparation.
-  const shorter = draftNode(io, { revise: "G1", goal: "New scope", criteria: ROOT_CRITERIA, policy: { deadlineMinutes: 20 } });
+  const shorter = draftNode(io, { revise: "G1", goal: "New scope", outcomes: ROOT_OUTCOMES, criteria: ROOT_CRITERIA, policy: { deadlineMinutes: 20 } });
   assert.equal(shorter.expired, false);
   assert.equal(shorter.deadlineAt, null);
   io.review = async (input) => { nowRef.now += 7 * 86400000; return structuralReview(input); };
@@ -434,7 +438,7 @@ test("policy: discovery, preparation, review and approval spend no execution tim
 test("policy: children inherit the root's limits and approval and cannot amend or reset them", async (t) => {
   const dir = tempProject(t);
   const io = makeIo(dir, { exec: fileExec(dir, { checks: standardChecks }) });
-  draftNode(io, { goal: "g", criteria: ROOT_CRITERIA, policy: { maxDepth: 1, deadlineMinutes: 480 } });
+  draftNode(io, { goal: "g", outcomes: ROOT_OUTCOMES, criteria: ROOT_CRITERIA, policy: { maxDepth: 1, deadlineMinutes: 480 } });
   assert.equal((await prepareNode(io)).ok, true);
   assert.equal((await sealNode(io, "G1", { userApproval: "Proceed" })).sealed, "G1");
   const before = loadRoot(io, "G1"), parentDigest = loadBundle(io, "G1").digest;
@@ -467,7 +471,7 @@ test("prepare: failures spend only the evaluator budget, repair precedes first a
     return exec(command, opts);
   };
   const { io } = testIo(dir, wrapped);
-  draftNode(io, { goal: "g", criteria: ROOT_CRITERIA, policy: { evaluatorAttempts: 3 } });
+  draftNode(io, { goal: "g", outcomes: ROOT_OUTCOMES, criteria: ROOT_CRITERIA, policy: { evaluatorAttempts: 3 } });
   const failed = await prepareNode(io);
   assert.ok(failed.diagnostics.some((d) => d.code === "REJECT_NOT_DISCRIMINATED"));
   assert.equal(failed.review, undefined);
@@ -479,7 +483,7 @@ test("prepare: failures spend only the evaluator budget, repair precedes first a
   assert.match(misuse.next, /revise G1 evaluator with exitcode_draft/);
   assert.equal(loadRoot(io, "G1").status, NodeState.ACTIVE);
   // Operational corrections remain possible after a failed E0.
-  assert.equal(draftNode(makeIo(dir, { exec: wrapped }), { revise: "G1", goal: "g", criteria: ROOT_CRITERIA, policy: { deadlineMinutes: 480, evaluatorAttempts: 3 } }).ok, true);
+  assert.equal(draftNode(makeIo(dir, { exec: wrapped }), { revise: "G1", goal: "g", outcomes: ROOT_OUTCOMES, criteria: ROOT_CRITERIA, policy: { deadlineMinutes: 480, evaluatorAttempts: 3 } }).ok, true);
   assert.equal((await prepareNode(io)).ok, false);
   assert.equal((await prepareNode(io)).ok, false);
   const exhausted = await prepareNode(io);
@@ -507,7 +511,7 @@ test("prepare: candidate, policy, or concurrent changes during E0 invalidate the
       return result;
     };
     const io = makeIo(dir, { exec: wrapped });
-    draftNode(io, { goal: "g", criteria: ROOT_CRITERIA });
+    draftNode(io, { goal: "g", outcomes: ROOT_OUTCOMES, criteria: ROOT_CRITERIA });
     const p = await prepareNode(io);
     assert.ok(p.diagnostics.some((d) => d.code === "CANDIDATE_MUTATED"), phase);
     assert.equal(p.review, undefined);
@@ -523,14 +527,14 @@ test("prepare: candidate, policy, or concurrent changes during E0 invalidate the
   const io = makeIo(dir, { exec: async (command, opts) => {
     if (!once) {
       once = true;
-      assert.equal(draftNode(io, { goal: "new goal", criteria: ROOT_CRITERIA, revise: "G1" }).code, "OPERATION_BUSY");
+      assert.equal(draftNode(io, { goal: "new goal", outcomes: ROOT_OUTCOMES, criteria: ROOT_CRITERIA, revise: "G1" }).code, "OPERATION_BUSY");
       const root = loadRoot(io, "G1");
       root.policy.evalTimeoutSeconds = 1200;
       core.saveRoot(io, root);
     }
     return exec(command, opts);
   } });
-  draftNode(io, { goal: "g", criteria: ROOT_CRITERIA });
+  draftNode(io, { goal: "g", outcomes: ROOT_OUTCOMES, criteria: ROOT_CRITERIA });
   const result = await prepareNode(io);
   assert.match(result.errors[0], /changed during preparation/);
   assert.equal(loadBundle(io, "G1"), null);
@@ -549,7 +553,7 @@ test("baseline: pre-seal changes from any source are saved, restored, reported, 
   fs.mkdirSync(path.join(dir, "empty"));
   const { io } = testIo(dir, fileExec(dir, { checks: standardChecks }));
   assert.equal(baselineScope(io), "G1");
-  draftNode(io, { goal: "g", criteria: ROOT_CRITERIA });
+  draftNode(io, { goal: "g", outcomes: ROOT_OUTCOMES, criteria: ROOT_CRITERIA });
   const before = digestTree(dir);
   const untouched = fs.statSync(path.join(dir, "docs/guide.md")).mtimeMs;
   write(dir, "feature.txt", "done\n");
@@ -583,7 +587,7 @@ test("staging: user-authorized test windows preserve product, invalidate approva
     const dir = tempProject(t, { "feature.txt": "todo\n", "keep.txt": "preserved", "proof.test.mjs": oldTest, "other.test.mjs": oldTest,
       "test/old.test.mjs": oldTest, "scripts/verify": "old verify", "node_modules/pkg/index.js": "dependency" });
     const { io } = testIo(dir, fileExec(dir, { checks: standardChecks }));
-    draftNode(io, { goal: "g", criteria: ROOT_CRITERIA });
+    draftNode(io, { goal: "g", outcomes: ROOT_OUTCOMES, criteria: ROOT_CRITERIA });
     assert.equal((await prepareNode(io)).ok, true);
     assert.equal(approveRoot(io).ok, true);
     const attempts = loadNodeState(io, "G1").evaluatorMetrics.e0Attempts;
@@ -622,7 +626,7 @@ test("staging: user-authorized test windows preserve product, invalidate approva
     const fresh = makeIo(dir, { exec: io.exec });
     assert.equal(core.resumePreparation(fresh).ok, true);
     assert.equal(statusSnapshot(fresh).staging.status, "open", "window survives reload");
-    assert.equal(draftNode(fresh, { goal: "g", criteria: ROOT_CRITERIA, revise: "G1" }).ok, false);
+    assert.equal(draftNode(fresh, { goal: "g", outcomes: ROOT_OUTCOMES, criteria: ROOT_CRITERIA, revise: "G1" }).ok, false);
     assert.equal((await prepareNode(fresh)).ok, false);
     assert.equal((await sealNode(fresh, "G1")).ok, false);
     // Supervisor calls above also enforce the guard. Add another product edit
@@ -665,7 +669,7 @@ test("staging: user-authorized test windows preserve product, invalidate approva
   for (const limit of ["draft-request", "files", "bytes", "windows", "missing-snapshot", "symlink", "no-changes", "revise-request"]) await t.test(limit, async (t) => {
     const dir = tempProject(t, { "feature.txt": "todo\n", "proof.test.mjs": "old" });
     const { io } = testIo(dir, fileExec(dir, { checks: standardChecks }));
-    draftNode(io, { goal: "g", criteria: ROOT_CRITERIA });
+    draftNode(io, { goal: "g", outcomes: ROOT_OUTCOMES, criteria: ROOT_CRITERIA });
     if(limit==="draft-request") {
       const before=[fs.readFileSync(draftFile(dir,"G1"),"utf8"),loadRoot(io,"G1"),loadNodeState(io,"G1")];
       for(const testStaging of [null,{}, {reason:""},{reason:"x".repeat(1001)}, {reason:"Tests",paths:["feature.txt"]},{reason:"Tests",paths:[]}]) {
@@ -692,7 +696,7 @@ test("staging: user-authorized test windows preserve product, invalidate approva
     }
     core.requestTestStaging(io, "G1", { reason: "Update acceptance" });
     if (limit === "revise-request") {
-      assert.equal(draftNode(io, { goal: "g", criteria: ROOT_CRITERIA, revise: "G1" }).ok, true);
+      assert.equal(draftNode(io, { goal: "g", outcomes: ROOT_OUTCOMES, criteria: ROOT_CRITERIA, revise: "G1" }).ok, true);
       assert.equal(statusSnapshot(io).staging, null); return;
     }
     if (limit === "missing-snapshot") {
@@ -724,7 +728,7 @@ test("staging: user-authorized test windows preserve product, invalidate approva
 test("baseline: review-time changes are discarded, sealing releases, and children and pauses freeze their own work", async (t) => {
   const dir = tempProject(t);
   const { io } = testIo(dir, fileExec(dir, { checks: standardChecks }));
-  draftNode(io, { goal: "g", criteria: ROOT_CRITERIA });
+  draftNode(io, { goal: "g", outcomes: ROOT_OUTCOMES, criteria: ROOT_CRITERIA });
   assert.equal((await prepareNode(io)).ok, true);
   write(dir, "feature.txt", "edited during review\n");
   assert.match(approveRoot(io).warnings[0], /restored to the pre-seal baseline/);
@@ -756,7 +760,7 @@ test("baseline: review-time changes are discarded, sealing releases, and childre
 test("baseline: changes that cannot be saved or restored are never silently destroyed", async (t) => {
   const dir = tempProject(t);
   const { io } = testIo(dir, fileExec(dir, { checks: standardChecks }));
-  draftNode(io, { goal: "g", criteria: ROOT_CRITERIA });
+  draftNode(io, { goal: "g", outcomes: ROOT_OUTCOMES, criteria: ROOT_CRITERIA });
   fs.writeFileSync(path.join(dir, ".exitcode/discarded"), "not a directory");
   write(dir, "feature.txt", "unsaved\n");
   const unsaved = await prepareNode(io);
@@ -794,7 +798,7 @@ test("evaluate: only changed trees spend attempts; exhausted attempts and deadli
   assert.equal(loadRoot(timed.io, "G1").pause.code, "DEADLINE_EXCEEDED");
   // Expiry can neither revise acceptance nor revive the budget without a user grant.
   const before = loadRoot(timed.io, "G1");
-  assert.equal(draftNode(timed.io, { revise: "G1", goal: "New scope", criteria: ROOT_CRITERIA }).ok, false);
+  assert.equal(draftNode(timed.io, { revise: "G1", goal: "New scope", outcomes: ROOT_OUTCOMES, criteria: ROOT_CRITERIA }).ok, false);
   assert.equal(core.resumeRoot(timed.io).ok, false);
   assert.equal(loadRoot(timed.io, "G1").deadlineAt, before.deadlineAt);
 });
@@ -985,7 +989,7 @@ test("snapshots: fixtures and checkpoints copy large trees independently and out
     }
     return exec(command, opts);
   });
-  draftNode(io, { goal: "Large candidate", criteria: ROOT_CRITERIA });
+  draftNode(io, { goal: "Large candidate", outcomes: ROOT_OUTCOMES, criteria: ROOT_CRITERIA });
   assert.equal((await prepareNode(io)).ok, true);
   assert.equal(approveRoot(io).ok, true);
   assert.deepEqual((await sealNode(io, "G1")).warnings, []);
@@ -1065,9 +1069,9 @@ test("status: injected state is bounded and evidence-free; explicit evidence is 
   const huge = structuredClone(ROOT_CRITERIA);
   huge[0].requirement = "r".repeat(5000);
   for (let i = 3; i < 40; i++) huge.push(regression(`C${i}`, "check:reg"));
-  draftNode(io, { goal: "g".repeat(5000), criteria: huge });
+  draftNode(io, { goal: "g".repeat(5000), outcomes: ROOT_OUTCOMES, criteria: huge });
   const node = loadNodeState(io, "G1");
-  node.diagnostics = Array.from({ length: 50 }, (_, i) => ({ code: "SHAM_SURVIVED", criterionId: "C1", evidence: "x".repeat(10000), recommendedRepair: "fix" }));
+  node.diagnostics = Array.from({ length: 50 }, (_, i) => ({ code: "REJECT_NOT_DISCRIMINATED", criterionId: "C1", evidence: "x".repeat(10000), recommendedRepair: "fix" }));
   core.saveNodeState(io, node);
   const prompt = promptStatusText(io);
   assert.ok(Buffer.byteLength(prompt) <= PROMPT_STATUS_MAX_BYTES, `${Buffer.byteLength(prompt)} bytes`);
@@ -1076,11 +1080,13 @@ test("status: injected state is bounded and evidence-free; explicit evidence is 
   assert.doesNotMatch(statusText(io), /evaluator evidence|check:c1/);
   assert.match(statusText(io, { detail: "evidence" }), /check:c1/);
   // The loop position drives the next action.
-  draftNode(io, { goal: "g", criteria: ROOT_CRITERIA, revise: "G1" });
+  draftNode(io, { goal: "g", outcomes: ROOT_OUTCOMES, criteria: ROOT_CRITERIA, revise: "G1" });
   assert.match(statusSnapshot(io).next, /revise G1 evaluator with exitcode_draft/);
   assert.equal((await prepareNode(io)).ok, true);
   assert.match(promptStatusText(io), /awaiting the user's reply/);
-  assert.match(statusSnapshot(io).review, /Verification\n- C1: an isolated custom command; rejected 1 independent near-miss\./);
+  assert.match(statusSnapshot(io).review, /Verification\n- C1: an isolated custom command; baseline FAIL, witness PASS, rejected 1 negative\./);
+  assert.match(statusSnapshot(io).review, /Semantic critic: pass/);
+  assert.match(statusSnapshot(io).review, /Mechanical evaluator validation: PASS/);
   assert.equal(approveRoot(io).ok, true);
   assert.equal((await sealNode(io, "G1")).ok, true);
   assert.match(promptStatusText(io), /G1 ACTIVE :: C1=FAIL C2=PASS/);
