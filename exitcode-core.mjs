@@ -3,7 +3,7 @@ import * as path from 'node:path';
 import * as os from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
-import { FORMAT, fail, digest, sha, stable, confined, readJson, writeJson, inventory, treeDigest, copyTree, writeFiles, ensureStore, locked, resolveProgram } from './exitcode-files.mjs';
+import { FORMAT, DEFAULT_STORE_DIR, fail, digest, sha, stable, confined, readJson, writeJson, inventory, treeDigest, copyTree, writeFiles, ensureStore, locked, resolveProgram } from './exitcode-files.mjs';
 import { validateProject, validateContract, compare } from './exitcode-spec.mjs';
 import { invoke } from './exitcode-runner.mjs';
 
@@ -13,7 +13,7 @@ export const PROTOCOL = 'EXITCODE. Describe the current problem and observable h
 
 const timestamp = () => new Date().toISOString();
 const errorResult = error => ({ ok: false, status: 'ERROR', code: error.code ?? 'IO_ERROR', message: error.message, ...(error.runId ? { runId: error.runId } : {}) });
-const candidate = cwd => treeDigest(cwd, { candidate: true });
+const candidateDigest = (cwd, storeDir) => treeDigest(cwd, { candidate: true, storeDir });
 const short = (text, max = 240) => typeof text === 'string' ? text.slice(0, max) : '';
 
 function runtimeIdentity(manifest) {
@@ -27,10 +27,10 @@ function runtimeIdentity(manifest) {
 }
 
 export class ExitCode {
-  constructor(cwd, { signal, expectedTask, runner = invoke, progress = () => {} } = {}) {
-    this.cwd = fs.realpathSync(cwd); this.signal = signal; this.expectedTask = expectedTask; this.runner = runner; this.progress = progress;
+  constructor(cwd, { storeDir = DEFAULT_STORE_DIR, signal, expectedTask, runner = invoke, progress = () => {} } = {}) {
+    this.cwd = fs.realpathSync(cwd); this.storeDir = storeDir; this.signal = signal; this.expectedTask = expectedTask; this.runner = runner; this.progress = progress;
   }
-  store() { return ensureStore(this.cwd); }
+  store() { return ensureStore(this.cwd, this.storeDir, { create: false }); }
   taskFile(id) {
     if (typeof id !== 'string' || !/^T[A-Za-z0-9_-]{1,80}$/.test(id)) fail('INVALID_ID', 'Invalid task id');
     return confined(this.store().state, `tasks/${id}/task.json`);
@@ -57,12 +57,12 @@ export class ExitCode {
           if (task && (this.expectedTask === undefined || task.id === this.expectedTask)) { task.lastIssue = { ...errorResult(error), at: timestamp(), operation: name }; this.save(task); }
           return errorResult(error);
         }
-      });
+      }, this.storeDir);
     } catch (error) { return errorResult(error); }
   }
   unsealed(task) {
     if (!['DISCOVERY', 'READY'].includes(task.phase)) fail('SEALED', 'Acceptance and project definitions cannot change after approval. Start a new task to supersede them.');
-    if (candidate(this.cwd) !== task.baselineDigest) {
+    if (candidateDigest(this.cwd, this.storeDir) !== task.baselineDigest) {
       task.phase = 'DISCOVERY'; delete task.prepared; this.save(task);
       fail('CANDIDATE_CHANGED', 'Product changed before approval. Edits are preserved. Exit or explicitly resume to accept the current workspace and rebuild preparation.');
     }
@@ -81,7 +81,7 @@ export class ExitCode {
       if (typeof problem !== 'string' || !problem.trim() || problem.length > 8192) fail('INVALID_SPEC', 'Provide a problem within 8192 characters');
       if (store.index.active) { const previous = this.load(store.index.active); previous.detachedAt = timestamp(); this.save(previous); }
       const task = { format: FORMAT, id: `T${Date.now().toString(36)}-${randomUUID().slice(0, 8)}`, problem: problem.trim(),
-        phase: 'DISCOVERY', enteredAt: timestamp(), baselineDigest: candidate(this.cwd), runCount: 0 };
+        phase: 'DISCOVERY', enteredAt: timestamp(), baselineDigest: candidateDigest(this.cwd, this.storeDir), runCount: 0 };
       this.save(task); store.index.active = task.id; store.index.latest = task.id; writeJson(store.file, store.index);
       return { ok: true, task: task.id, phase: task.phase, next: 'Inspect the project and configure or reuse its validation driver.' };
     });
@@ -148,7 +148,7 @@ export class ExitCode {
     const runtime = confined(root, `preparing-${setupId}`);
     fs.mkdirSync(runtime, { recursive: true }); fs.mkdirSync(directory, { recursive: true });
     const projectDirectory = path.join(directory, 'project'), candidateDirectory = path.join(directory, 'candidate');
-    this.materializeProject(project, projectDirectory); copyTree(this.cwd, candidateDirectory, { candidate: true, signal: this.signal });
+    this.materializeProject(project, projectDirectory); copyTree(this.cwd, candidateDirectory, { candidate: true, storeDir: this.storeDir, signal: this.signal });
     const request = { operation: 'prepare', projectDirectory, candidateDirectory, runtimeDirectory: runtime, runDirectory: directory };
     let issue;
     try {
@@ -197,7 +197,7 @@ export class ExitCode {
     fs.mkdirSync(directory, { recursive: true });
     const projectDirectory = path.join(directory, 'project'), candidateDirectory = path.join(directory, 'candidate');
     this.materializeProject(project, projectDirectory);
-    if (empty) fs.mkdirSync(candidateDirectory); else copyTree(this.cwd, candidateDirectory, { candidate: true, signal: this.signal });
+    if (empty) fs.mkdirSync(candidateDirectory); else copyTree(this.cwd, candidateDirectory, { candidate: true, storeDir: this.storeDir, signal: this.signal });
     const request = { operation: 'run', projectDirectory, candidateDirectory, runtimeDirectory: environment.directory, runDirectory: directory,
       scenario: { id: scenario.id, instructions: scenario.instructions, input: scenario.input }, trial: index };
     let result, issue;
@@ -235,6 +235,7 @@ export class ExitCode {
     return result;
   }
   async run(contract, project, task, { prepare = false, environment: pinned } = {}) {
+    const candidate = cwd => candidateDigest(cwd, this.storeDir);
     const runId = `R${randomUUID()}`, directory = confined(this.store().state, `tasks/${task.id}/runs/${runId}`), started = performance.now();
     const before = candidate(this.cwd), environment = await this.environment(project, task, pinned);
     if (pinned && (environment.digest !== pinned.digest || stable(environment.runtimeIdentity) !== stable(pinned.runtimeIdentity))) fail('ENVIRONMENT_CHANGED', 'Environment no longer matches the approved contract');
@@ -280,7 +281,7 @@ export class ExitCode {
       if (task.phase !== 'READY' || !task.prepared) fail('NOT_READY', 'Prepare and review a contract before approval');
       const prepared = task.prepared, environment = await this.environment(prepared.project, task);
       if (this.signal?.aborted) fail('CANCELLED', 'Approval operation cancelled');
-      if (digest(this.project()) !== digest(prepared.project) || candidate(this.cwd) !== prepared.run.candidateDigest
+      if (digest(this.project()) !== digest(prepared.project) || candidateDigest(this.cwd, this.storeDir) !== prepared.run.candidateDigest
         || environment.digest !== prepared.run.environment.digest || stable(environment.runtimeIdentity) !== stable(prepared.run.environment.runtimeIdentity)) fail('STALE_PREPARATION', 'Candidate, project, or environment changed. Prepare and review again.');
       const bundle = { format: FORMAT, problem: task.problem, contract: prepared.contract, project: prepared.project, environment: prepared.run.environment };
       const file = confined(this.store().state, `tasks/${task.id}/sealed.json`);
@@ -303,7 +304,7 @@ export class ExitCode {
       task.runCount++; this.save(task);
       const run = await this.run(bundle.contract, bundle.project, task, { environment: bundle.environment });
       this.sealed(task);
-      if (candidate(this.cwd) !== run.candidateDigest) fail('CANDIDATE_CHANGED', 'Product changed before completion was recorded; run acceptance again');
+      if (candidateDigest(this.cwd, this.storeDir) !== run.candidateDigest) fail('CANDIDATE_CHANGED', 'Product changed before completion was recorded; run acceptance again');
       task.lastRun = run; delete task.lastIssue;
       if (run.status === 'PASS') { task.phase = 'PASS'; task.completedAt = timestamp(); store.index.active = null; writeJson(store.file, store.index); }
       this.save(task);
@@ -340,7 +341,7 @@ export class ExitCode {
         || !['keep', 'revert', 'unresolved'].includes(note.disposition) || !Array.isArray(note.evidence) || note.evidence.length > 16
         || note.evidence.some(id => typeof id !== 'string' || !/^[RE][a-f0-9-]{36}$/.test(id) || !fs.existsSync(this.evidenceFile(task.id, id)))
         || note.waitingFor !== undefined && (typeof note.waitingFor !== 'string' || note.waitingFor.length > 2048)) fail('INVALID_NOTE', 'Provide a short work note, a disposition, and known run IDs; observations and agent interpretation remain distinct');
-      const entry = { ...note, at: timestamp(), candidateDigest: candidate(this.cwd) };
+      const entry = { ...note, at: timestamp(), candidateDigest: candidateDigest(this.cwd, this.storeDir) };
       fs.appendFileSync(confined(this.store().state, `tasks/${task.id}/journal.jsonl`), JSON.stringify(entry) + '\n', { mode: 0o600 });
       task.lastNote = entry; task.waitingFor = note.waitingFor || null; this.save(task);
       return { ok: true, note: entry, next: 'Continue from the saved hypothesis and evidence.' };
@@ -355,7 +356,7 @@ export class ExitCode {
     return this.operation('audit', async () => {
       const task = this.owned();
       if (task.phase === 'SEALED') this.sealed(task); else this.unsealed(task);
-      return { ok: true, candidateDigest: candidate(this.cwd) };
+      return { ok: true, candidateDigest: candidateDigest(this.cwd, this.storeDir) };
     });
   }
   async detach() {
@@ -372,7 +373,7 @@ export class ExitCode {
       if (!task || task.phase === 'PASS') fail('NOT_RESUMABLE', 'No unfinished task to resume');
       if (store.index.active && store.index.active !== task.id) { const previous = this.load(store.index.active); previous.detachedAt = timestamp(); this.save(previous); }
       if (task.phase === 'SEALED') this.sealed(task);
-      else { task.baselineDigest = candidate(this.cwd); task.phase = 'DISCOVERY'; delete task.prepared; }
+      else { task.baselineDigest = candidateDigest(this.cwd, this.storeDir); task.phase = 'DISCOVERY'; delete task.prepared; }
       delete task.detachedAt; task.waitingFor = null; task.resumedAt = timestamp(); this.save(task);
       store.index.active = task.id; store.index.latest = task.id; writeJson(store.file, store.index);
       return { ok: true, task: task.id, phase: task.phase, next: task.phase === 'SEALED' ? 'Continue on the current workspace; previous PASS observations are not completion.' : 'Inspect the current workspace and prepare fresh acceptance.' };
@@ -380,13 +381,13 @@ export class ExitCode {
   }
   freshPass(id) {
     const task = this.load(id);
-    return task?.phase === 'PASS' && this.sealed(task) && task.lastRun?.candidateDigest === candidate(this.cwd);
+    return task?.phase === 'PASS' && this.sealed(task) && task.lastRun?.candidateDigest === candidateDigest(this.cwd, this.storeDir);
   }
   status(id, detail = false) {
     try {
       const store = this.store(), task = this.load(id);
-      if (!task) return { ok: true, active: false, next: '/exitcode <problem>' };
-      return { ok: true, task: task.id, active: store.index.active === task.id, phase: task.phase, problem: task.problem, runCount: task.runCount,
+      if (!task) return { ok: true, active: false, storeDir: this.storeDir, storePath: store.base, next: '/exitcode <problem>' };
+      return { ok: true, task: task.id, active: store.index.active === task.id, storeDir: this.storeDir, storePath: store.base, phase: task.phase, problem: task.problem, runCount: task.runCount,
         lastIssue: task.lastIssue, lastRun: detail ? task.lastRun : task.lastRun && { id: task.lastRun.id, status: task.lastRun.status },
         lastNote: task.lastNote, waitingFor: task.waitingFor, ...(detail ? { contract: task.contract, prepared: task.prepared, sealedDigest: task.sealedDigest } : {}) };
     } catch (error) { return errorResult(error); }
@@ -411,6 +412,7 @@ export function review(task) {
 
 export function promptStatus(status) {
   return [status.ok ? `Task ${status.task ?? 'none'}: ${status.phase ?? 'OFF'}` : `${status.code}: ${short(status.message)}`,
+    status.storePath && `Storage: ${status.storePath}`,
     status.problem && `Problem: ${short(status.problem, 600)}`, status.lastRun && `Last acceptance: ${status.lastRun.status} (${status.lastRun.id})`,
     status.lastIssue && `Issue: ${status.lastIssue.code}: ${short(status.lastIssue.message)}`,
     status.lastNote && `Working hypothesis: ${short(status.lastNote.hypothesis)}\nNext experiment: ${short(status.lastNote.next)}`,

@@ -1,4 +1,8 @@
 node_modules/
 .exitcode/state/
 
-.agents/
+# Keep agent artifacts local. Allow reusable ExitCode project definitions.
+.agents/*
+!.agents/.exitcode/
+.agents/.exitcode/*
+!.agents/.exitcode/project/

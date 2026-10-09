@@ -4,13 +4,34 @@ This package implements the problem-first replacement discussed against the atta
 
 ## What was built
 
-Bootstrap is performed by the existing agent with its normal tools. It publishes infrastructure and driver definitions under `.exitcode/project/`. A generic stdin/stdout protocol supports provisioning, scenario reset and exercise, observation, and cleanup. The command can call arbitrary project software, provision dependencies, use an SDK agent, or wrap another isolation mechanism.
+Bootstrap is performed by the existing agent with its normal tools. It publishes infrastructure and driver definitions under `.agents/.exitcode/project/`. A generic stdin/stdout protocol supports provisioning, scenario reset and exercise, observation, and cleanup. The command can call arbitrary project software, provision dependencies, use an SDK agent, or wrap another isolation mechanism.
 
 Prepared environments are reused across tasks and stored by content identity. Refresh creates a new environment instance while preserving earlier instances needed by existing seals. The environment is checked before use and after every scenario. Assertions and captured driver files are fixed at approval; product files and product dependencies remain editable during implementation.
 
 Acceptance is a problem, happy path, constraints, and scenarios. Preparation must reproduce declared baseline observations and reject an empty target. It does not construct a passing reference implementation. After user approval, fresh results from all scheduled trials must pass on the current candidate. FAIL and ERROR are distinct. Stale candidates, missing observations, altered sealed definitions, changed evaluator environments, cancellation, and failed cleanup cannot complete the task.
 
 The adapter exposes four tools and a small prompt summary. It retains native project instructions and tools. Work notes link candidate identities and known run records to hypotheses, retained or reverted approaches, regressions, and next experiments. Read-only inspection through the existing evaluate tool restores acceptance and previous evidence after compaction. Pi continues to own session persistence and compaction.
+
+## Configuration and lightweight UX
+
+`exitcode-config.mjs` loads exactly three flat settings: `storeDir`, `maxNudges`, and `showStatus`.
+User defaults come from the Pi agent directory.
+Trusted project values override user values by key.
+Invalid settings report their source and block task creation or approval until reload.
+No dependencies, settings editor, custom renderer, or configuration framework were added.
+
+All core operations, locks, identities, snapshots, and adapter guards use the selected store.
+The default is `.agents/.exitcode`.
+Path validation rejects traversal, absolute and home paths, `.git`, and symlink components.
+Candidate identity excludes the exact selected store, not its parent or siblings.
+Read-only configuration and status do not create storage.
+Mode entries retain the active task's store across reloads.
+No state-format or driver-protocol changes were made.
+
+Native Pi completion exposes commands and `status evidence`.
+An optional terminal footer reports phase, progress, waits, and the last result.
+It clears on completion, explicit exit, or shutdown.
+Nudges remain bounded and never bypass approval, external waits, auditing, or fresh acceptance.
 
 ## What was cut
 
@@ -36,7 +57,7 @@ The adapter exposes four tools and a small prompt summary. It retains native pro
 
 Workspace and bubblewrap execution are explicit choices in the one driver protocol, not old and new compatibility modes. Bubblewrap fails closed; automatic host fallback is removed.
 
-The remaining continuation mechanism is deliberately small: two unchanged nudges, no forced decomposition, and no custom session scheduler. There is no generalized project-discovery service, agent memory engine, job queue, worker pool, testing framework, package manager, or container controller inside the extension.
+The remaining continuation mechanism is deliberately small: two unchanged nudges by default (`maxNudges` can change or disable them), no forced decomposition, and no custom session scheduler. There is no generalized project-discovery service, agent memory engine, job queue, worker pool, testing framework, package manager, or container controller inside the extension.
 
 ## Replace the source as one release
 
@@ -59,11 +80,19 @@ Remove the old runtime modules completely:
 
 Remove all old root-level `exitcode-*.test.mjs` files. Remove the five old test helpers and benchmark document: `test/adapter-review-cases.mjs`, `test/optimize-sealed-benchmark.md`, `test/prepared-fixture.mjs`, `test/structural-review.mjs`, and `test/suite.mjs`. Remove the old `scripts/` directory, including the evaluator and sealed benchmarks, old test runner, worker smoke script, and both verification scripts. The attached bundle contains only those six scripts in that directory; preserve unrelated files if your actual repository has additional contents not supplied here.
 
-Add the new files from this package: `exitcode-files.mjs`, `exitcode-runner.mjs`, `exitcode-spec.mjs`, `scripts-check.mjs`, the new `test/` contents, the two example projects, and this removal guide. There are no legacy re-exports or compatibility branches. The old and new test suites are not both run: the old suite asserts responsibilities intentionally removed by this release.
+Add the new files from this package: `exitcode-config.mjs`, `exitcode-files.mjs`, `exitcode-runner.mjs`, `exitcode-spec.mjs`, `scripts-check.mjs`, the new `test/` contents, the two example projects, and this removal guide. There are no legacy re-exports or compatibility branches. The old and new test suites are not both run: the old suite asserts responsibilities intentionally removed by this release.
 
-Stop the old extension before installing the replacement. If a target project has an existing `.exitcode/` store, explicitly move it to a backup outside the new `.exitcode/` directory before starting. The replacement refuses the old top-level index and never modifies it. Keep that backup for reference; it is not resumable by this implementation. Rebootstrap project definitions for the new protocol and start a new acceptance contract. Update any project rule that ignores all of `.exitcode/` to ignore only `.exitcode/state/` when reusable definitions should be committed.
+Stop the old extension before installing the replacement.
+The default store is `.agents/.exitcode/`; configuration can select a safe project-relative directory.
+An existing store is not moved, deleted, or adopted automatically.
+A current-format store at `.exitcode/` remains usable when `storeDir` is explicitly `".exitcode"`.
+A legacy top-level index at a selected store is refused and left untouched.
+Back up unsupported stores explicitly and rebootstrap for the new protocol.
+Keep that backup for reference; it is not resumable by this implementation.
+Ignore the selected store's `state/` directory while keeping reusable project definitions visible.
+The README includes patterns for projects with broad `.agents/` ignore rules.
 
-Only `exitcode-scenarios-1`, contract version 1, and driver protocol 1 are supported. Unknown legacy fields such as `execution`, `sequence`, and `controls` are rejected. There are no alternate legacy commands, state migration routines, dual paths, or version selection switches.
+Only `exitcode-scenarios-1`, contract version 1, and driver protocol 1 are supported. Unknown legacy fields such as `execution`, `sequence`, and `controls` are rejected. There are no alternate legacy commands, state migration routines, compatibility readers, or version selection switches. `storeDir` selects a location, not a state format.
 
 ## Invariants retained
 
@@ -74,7 +103,7 @@ Only `exitcode-scenarios-1`, contract version 1, and driver protocol 1 are suppo
 5. Current candidate and evaluator environment identities must match the evidence being certified.
 6. An infrastructure error or cancelled operation is inconclusive and preserves useful work.
 7. Historical results, preparation success, and agent claims cannot complete a task.
-8. Task ownership and one supervisor operation per workspace are enforced.
+8. Task ownership and one supervisor operation per selected project store are enforced. Active adapter sessions pin their selected store until exit or completion.
 9. Refreshing reusable infrastructure preserves the environment of an existing sealed task.
 10. Completion requires all scheduled fresh acceptance trials to pass.
 
@@ -86,4 +115,4 @@ Structured output makes comparison mechanical. It does not prove that a semantic
 
 The live Pi example is included as a project-level integration driver. It requires a pinned installed SDK and a selected model with credentials. Its observer boundary is tested with an SDK fixture; no live-provider latency result is claimed by this package.
 
-The original eight runtime files contained 5,396 extracted lines and 322,230 bytes. The replacement's five runtime files were approximately 930 lines and 68 KiB during verification, excluding examples, tests, and documentation. This reduction follows removal of the responsibilities above; it is not a claim that every future project driver will be small.
+The original eight runtime files contained 5,396 extracted lines and 322,230 bytes. The scenario replacement removed the responsibilities above. The small configuration loader adds a sixth runtime file. This is not a claim that every future project driver will be small.

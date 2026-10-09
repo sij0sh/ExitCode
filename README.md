@@ -20,7 +20,9 @@ Node 22.18 or newer is required. Pi supplies its extension API and TypeBox. Ther
 | --- | --- |
 | `/exitcode <problem>` | Start a fresh task and detach an unfinished owner without deleting work |
 | `/exitcode approve` | Approve the exact prepared acceptance and seal it |
-| `/exitcode status` | Show the current phase, latest result, issue, and working hypothesis |
+| `/exitcode status` | Show the current phase, result, issue, hypothesis, and resolved storage path |
+| `/exitcode config` | Inspect effective settings, source files, and configured and active storage paths |
+| `/exitcode help` | Show command usage and configuration defaults |
 | `/exitcode status evidence` | Show the stored contract, preparation, and latest run |
 | `/exitcode resume [taskId]` | Adopt an unfinished task against the current workspace |
 | `/exitcode exit` | Cancel validation, detach the task, and preserve work without claiming completion |
@@ -29,20 +31,80 @@ Approval is a user command. There is no model-callable sealing tool and no inter
 
 The lifecycle is `DISCOVERY -> READY -> SEALED -> PASS`. A failed acceptance or infrastructure error leaves the task sealed and unfinished. A detached task retains its phase. Resuming an unsealed task adopts the current candidate and drops preparation; resuming a sealed task preserves its exact acceptance and starts from current product files. There is no automatic rewind.
 
+## Configuration
+
+ExitCode reads a small flat JSON file on session start and `/reload`.
+User defaults live at `<Pi agent directory>/exitcode.json`, normally `~/.pi/agent/exitcode.json`.
+Pi's `getAgentDir()` supplies this location and honors `PI_CODING_AGENT_DIR`.
+Trusted project overrides live at `.pi/exitcode.json` in the working directory.
+Project values override user values by key.
+Missing values use these defaults:
+
+```json
+{
+  "storeDir": ".agents/.exitcode",
+  "maxNudges": 2,
+  "showStatus": true
+}
+```
+
+| Setting | Allowed values | Behavior |
+| --- | --- | --- |
+| `storeDir` | A dedicated project-relative directory | Keep all project definitions and private state under this path |
+| `maxNudges` | An integer from 0 through 10 | Limit automatic continuation on unchanged progress; 0 disables nudges |
+| `showStatus` | `true` or `false` | Show a compact phase, progress, or result in Pi's terminal footer |
+
+Use `/exitcode config` to see the effective values and source files.
+Use `/exitcode status` to see the task's resolved store.
+Both are read-only and do not initialize a store or start a task.
+Command completion exposes the supported subcommands and `status evidence`.
+The footer is optional and does not affect non-interactive execution or acceptance guards.
+
+Storage paths are relative to the project working directory, even in user defaults.
+Absolute paths, home expansion, the project root, `.git`, traversal, and symlink components are rejected.
+Choose a dedicated directory, not an existing product directory.
+Only the selected store and Git metadata are excluded from candidate snapshots.
+Siblings under `.agents/` or another store parent remain product files.
+Malformed JSON, unknown keys, and invalid values report the source file and prevent starting or approving a task.
+Fix the file and run `/reload`.
+Untrusted project configuration is not read.
+
+An active task keeps its original store across reloads and session restoration.
+Changed settings affect new tasks after `/exitcode exit` or fresh completion.
+A reload does not move files or silently adopt a task in another store.
+Stores are never migrated, deleted, or cleaned up automatically.
+To retain an existing current-format store at the previous location, set `storeDir` to `".exitcode"` before starting or resuming.
+Unsupported legacy formats remain unsupported.
+To move a store, exit the mode and move it explicitly before changing `storeDir`.
+An unsealed task needs fresh preparation after a move.
+
 ## Reusable project definitions
 
 On initial use, the agent inspects project instructions, entry points, dependencies, and existing tests. It creates the smallest useful execution boundary for the reported issue. It can wrap a library, command, API, browser, installation, container, or isolated remote service. It can use an SDK agent for scenario actions. ExitCode does not prescribe a testing framework or package manager.
 
-The agent submits a manifest and UTF-8 driver files through `exitcode_project`. The same files remain readable and editable before sealing under `.exitcode/project/`. Future tasks reuse them when sufficient. More coverage can be added as actual problems require it; bootstrap is not an exhaustive model of the codebase.
+The agent submits a manifest and UTF-8 driver files through `exitcode_project`. The same files remain readable and editable before sealing under `.agents/.exitcode/project/`. Future tasks reuse them when sufficient. More coverage can be added as actual problems require it; bootstrap is not an exhaustive model of the codebase.
 
 | Location | Purpose |
 | --- | --- |
-| `.exitcode/project/manifest.json` | Versioned driver command, watchdog, explicit environment-variable names, and isolation choice |
-| `.exitcode/project/files/` | Versioned setup scripts, drivers, fixtures, lockfiles, and project notes |
-| `.exitcode/state/environments/` | Prepared environment instances identified by content |
-| `.exitcode/state/tasks/` | Private task state, sealed bundles, evidence, and work journals |
+| `.agents/.exitcode/project/manifest.json` | Versioned driver command, watchdog, explicit environment-variable names, and isolation choice |
+| `.agents/.exitcode/project/files/` | Versioned setup scripts, drivers, fixtures, lockfiles, and project notes |
+| `.agents/.exitcode/state/environments/` | Prepared environment instances identified by content |
+| `.agents/.exitcode/state/tasks/` | Private task state, sealed bundles, evidence, and work journals |
 
-Commit the project definitions if they should be shared. Ignore `.exitcode/state/`. If a project still ignores the whole `.exitcode/` directory, replace that broad rule with the state-directory rule before committing its definitions.
+Commit the project definitions if they should be shared.
+Ignore `.agents/.exitcode/state/`, not the whole store.
+If `.agents/` is broadly ignored, replace that rule with patterns that leave project definitions visible:
+
+```gitignore
+.agents/*
+!.agents/.exitcode/
+.agents/.exitcode/*
+!.agents/.exitcode/project/
+```
+
+These patterns keep private state and unrelated agent artifacts local.
+For a custom `storeDir`, ignore its `state/` directory and any temporary `project-*` staging directories.
+Update broad parent-directory ignore rules before committing reusable definitions.
 
 Preparation creates an environment once per project definition and reuses it across tasks. Its files and runner identity are checked. `exitcode_project` with `refresh: true` rebuilds the latest environment pointer while retaining earlier immutable instances required by sealed tasks. An existing seal continues to use its original driver and environment even when live project definitions change.
 
@@ -143,7 +205,7 @@ The four model-facing tools are:
 
 An inspection does not execute validation or certify completion. `inspect: "contract"`, `inspect: "run"`, and `inspect: "notes"` are read-only views; a `runId` selects older evidence and an `offset` continues a long result. This lets the agent recover exact acceptance and earlier experiments after compaction without another state-management tool.
 
-Notes reference real evidence but retain agent interpretations separately. A `revert` disposition records a decision and never rolls files back. `waitingFor` records needed user or external input and ends automatic continuation. The next user input releases that wait. Only the latest working hypothesis and next experiment appear in the small per-turn summary. Two unchanged continuation nudges are allowed; native session control then takes over without a forced strategy loop.
+Notes reference real evidence but retain agent interpretations separately. A `revert` disposition records a decision and never rolls files back. `waitingFor` records needed user or external input and ends automatic continuation. The next user input releases that wait. Only the latest working hypothesis and next experiment appear in the small per-turn summary. By default, two unchanged continuation nudges are allowed; `maxNudges` changes that limit, and 0 disables nudges. Native session control remains authoritative without a forced strategy loop.
 
 Before approval, direct product writes through standard edit tools are blocked. Other or external mutations are detected at supervisor boundaries and invalidate preparation. Files are preserved; explicit resume adopts the changed candidate. These guards supplement the normal trusted-agent workflow rather than provide an adversarial capability boundary.
 
@@ -157,7 +219,7 @@ node examples/file-project/demo.mjs
 
 It demonstrates prepared baseline failure, approval, fresh implementation failure, a normal product edit, and fresh PASS using the same warm environment. It uses a temporary workspace and cleans it up.
 
-`examples/pi-extension/` supplies a live Pi scenario driver. It copies a self-contained npm SDK installation with a matching pinned lockfile into the frozen runtime, selects a fixed model from scenario input, loads the candidate extension into a separate fixture session, preserves `AGENTS.md`, supplies one immediate simulated approval, and independently reads expected output files. Its clock covers the task through verified completion, including discovery and acceptance preparation. This example targets this replacement's single state format.
+`examples/pi-extension/` supplies a live Pi scenario driver. It copies a self-contained npm SDK installation with a matching pinned lockfile into the frozen runtime, selects a fixed model from scenario input, loads the candidate extension into a separate fixture session, preserves `AGENTS.md`, supplies one immediate simulated approval, and independently reads expected output files. Its clock covers the task through verified completion, including discovery and acceptance preparation. This example targets this replacement's single state format and its default `.agents/.exitcode` storage.
 
 Before using that live example, provide `EXITCODE_PI_INSTALLATION`, the declared provider credential, and concrete `input.model.provider` and `input.model.id` values. The installation must contain its package-lock and installed SDK dependencies, with no credentials or unrelated project files. Set the baseline to the behavior actually reproduced; if the replacement already satisfies the time limit, a baseline FAIL is correctly rejected. The twenty-minute example can itself require twenty minutes to reproduce a timeout and is not the default bootstrap for ordinary tasks.
 
@@ -166,4 +228,4 @@ npm test
 npm run check
 ```
 
-The tests execute real local drivers and the Pi adapter against a host fixture. The SDK observer test uses an explicitly labeled SDK fixture, not a live provider. Live Pi/provider behavior and the twenty-minute latency target require a separately configured integration run. A successful local test suite is not evidence of that latency claim.
+The tests execute real local drivers and the Pi adapter against a host fixture. They cover default and nested stores, path safety, candidate drift, configuration trust and precedence, reload retention, and optional native UX. The SDK observer test uses an explicitly labeled SDK fixture, not a live provider. Live Pi/provider behavior and the twenty-minute latency target require a separately configured integration run. A successful local test suite is not evidence of that latency claim.

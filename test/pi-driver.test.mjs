@@ -28,16 +28,16 @@ test('Pi scenario observer reads the outcome independently of an SDK session cla
         if(tools!==undefined)throw Error('Explicit tool allowlists block dynamic ExitCode tools');
         if(!fs.existsSync(resourceLoader.options.additionalExtensionPaths[0]))throw Error('Candidate not selected');
         if(!fs.existsSync(path.join(cwd,'AGENTS.md')))throw Error('Project context missing');
-        const taskDir=path.join(cwd,'.exitcode','state','tasks','Tfixture');
+        const taskDir=path.join(cwd,'.agents','.exitcode','state','tasks','Tfixture');
         const session={isStreaming:false,subscribe:()=>()=>{},bindExtensions:async()=>{},abort:async()=>{},dispose(){},async prompt(text){
           fs.mkdirSync(taskDir,{recursive:true});
           if(text==='/exitcode approve'){
             ${correct ? "fs.writeFileSync(path.join(cwd,'result.txt'),'done\\n');" : ''}
             fs.writeFileSync(path.join(taskDir,'task.json'),JSON.stringify({phase:'PASS'}));
-            fs.writeFileSync(path.join(cwd,'.exitcode','state','index.json'),JSON.stringify({active:null,latest:'Tfixture'}));
+            fs.writeFileSync(path.join(cwd,'.agents','.exitcode','state','index.json'),JSON.stringify({active:null,latest:'Tfixture'}));
           }else{
             fs.writeFileSync(path.join(taskDir,'task.json'),JSON.stringify({phase:'READY'}));
-            fs.writeFileSync(path.join(cwd,'.exitcode','state','index.json'),JSON.stringify({active:'Tfixture',latest:'Tfixture'}));
+            fs.writeFileSync(path.join(cwd,'.agents','.exitcode','state','index.json'),JSON.stringify({active:'Tfixture',latest:'Tfixture'}));
           }
         }};
         return {session,extensionsResult:{errors:[]}};

@@ -57,13 +57,13 @@ async function run() {
     await session.prompt('/exitcode ' + input.goal);
     while (!timedOut) {
       if (failure) throw new Error(failure);
-      const indexFile = path.join(cwd, '.exitcode', 'state', 'index.json');
+      const indexFile = path.join(cwd, '.agents', '.exitcode', 'state', 'index.json');
       let task;
       if (fs.existsSync(indexFile)) {
         const index = JSON.parse(fs.readFileSync(indexFile, 'utf8'));
         const id = index.active ?? index.latest;
         if (typeof id === 'string' && /^T[A-Za-z0-9_-]+$/.test(id)) {
-          const file = path.join(cwd, '.exitcode', 'state', 'tasks', id, 'task.json');
+          const file = path.join(cwd, '.agents', '.exitcode', 'state', 'tasks', id, 'task.json');
           if (fs.existsSync(file)) task = JSON.parse(fs.readFileSync(file, 'utf8'));
         }
       }

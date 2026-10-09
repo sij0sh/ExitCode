@@ -3,6 +3,7 @@ import * as path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 
 export const FORMAT = 'exitcode-scenarios-1';
+export const DEFAULT_STORE_DIR = '.agents/.exitcode';
 export const MAX_TREE_BYTES = 512 * 1024 * 1024;
 export const fail = (code, message) => { throw Object.assign(new Error(message), { code }); };
 export const sha = value => createHash('sha256').update(value).digest('hex');
@@ -29,11 +30,25 @@ export function relative(name) {
 export function confined(root, name) {
   const target = path.join(root, relative(name));
   let current = root;
-  for (const part of name.split('/')) {
+  for (const part of ['', ...name.split('/')]) {
     current = path.join(current, part);
-    if (fs.existsSync(current) && fs.lstatSync(current).isSymbolicLink()) fail('UNSAFE_PATH', `Symlink in path: ${name}`);
+    if (fs.lstatSync(current, { throwIfNoEntry: false })?.isSymbolicLink()) fail('UNSAFE_PATH', `Symlink in path: ${name}`);
   }
   return target;
+}
+
+// Store paths are dedicated, project-relative directories. No expansion or aliases.
+export function resolveStoreDir(cwd, storeDir = DEFAULT_STORE_DIR) {
+  relative(storeDir);
+  if (storeDir.startsWith('~') || storeDir.split('/').includes('.git') || /[\x00-\x1f\x7f]/.test(storeDir) || !storeDir.trim())
+    fail('UNSAFE_PATH', 'storeDir must be a project-relative directory outside .git, without home expansion or control characters');
+  let current = cwd;
+  for (const part of storeDir.split('/')) {
+    current = path.join(current, part);
+    const stat = fs.lstatSync(current, { throwIfNoEntry: false });
+    if (stat && (!stat.isDirectory() || stat.isSymbolicLink())) fail('UNSAFE_PATH', `Store path is not a regular directory: ${current}`);
+  }
+  return current;
 }
 
 export function readJson(file) {
@@ -49,19 +64,22 @@ export function writeJson(file, value) {
 }
 
 // No Git index, ignore rules, or live-file aliases. Modes and link targets participate.
-export function inventory(root, { candidate = false, signal, maxBytes = MAX_TREE_BYTES } = {}) {
+export function inventory(root, { candidate = false, storeDir = DEFAULT_STORE_DIR, signal, maxBytes = MAX_TREE_BYTES } = {}) {
+  if (candidate) resolveStoreDir(root, storeDir);
+  const excluded = candidate ? ['.git', storeDir] : [];
+  const excludes = name => excluded.some(directory => name === directory || name.startsWith(directory + '/'));
   const entries = [];
   let bytes = 0;
   const walk = (directory, prefix = '') => {
     if (signal?.aborted) fail('CANCELLED', 'Operation cancelled');
     for (const name of fs.readdirSync(directory).sort()) {
-      if (candidate && !prefix && ['.git', '.exitcode'].includes(name)) continue;
-      const rel = prefix ? `${prefix}/${name}` : name, full = path.join(directory, name), stat = fs.lstatSync(full);
+      const rel = prefix ? `${prefix}/${name}` : name;
+      if (excludes(rel)) continue;
+      const full = path.join(directory, name), stat = fs.lstatSync(full);
       if (stat.isDirectory()) { entries.push({ path: rel, kind: 'directory', mode: stat.mode & 0o777 }); walk(full, rel); }
       else if (stat.isSymbolicLink()) {
-        const resolved = fs.realpathSync(full), target = path.relative(root, resolved);
-        if (target === '..' || target.startsWith(`..${path.sep}`) || path.isAbsolute(target)
-          || candidate && ['.git', '.exitcode'].includes(target.split(path.sep)[0])) fail('UNSAFE_PATH', `Link escapes candidate: ${rel}`);
+        const resolved = fs.realpathSync(full), target = path.relative(root, resolved).split(path.sep).join('/');
+        if (target === '..' || target.startsWith('../') || path.isAbsolute(target) || excludes(target)) fail('UNSAFE_PATH', `Link escapes candidate: ${rel}`);
         entries.push({ path: rel, kind: 'link', target: path.relative(path.dirname(full), resolved).split(path.sep).join('/') });
       } else if (stat.isFile()) {
         bytes += stat.size;
@@ -100,22 +118,26 @@ export function writeFiles(root, files) {
   }
 }
 
-export function ensureStore(cwd) {
-  const base = path.join(cwd, '.exitcode');
-  if (fs.existsSync(path.join(base, 'index.json'))) fail('UNSUPPORTED_FORMAT', 'Legacy .exitcode store detected. Move it aside explicitly before using this replacement. No migration is provided.');
-  const state = path.join(base, 'state');
-  // Supervisor paths must not alias a product or another workspace.
-  for (const directory of [base, state]) if (fs.existsSync(directory) && fs.lstatSync(directory).isSymbolicLink()) fail('UNSAFE_PATH', 'Supervisor directory is a symlink');
-  fs.mkdirSync(state, { recursive: true, mode: 0o700 });
-  const file = path.join(state, 'index.json');
-  if (!fs.existsSync(file)) writeJson(file, { format: FORMAT, active: null, latest: null });
-  const index = readJson(file);
+export function ensureStore(cwd, storeDir = DEFAULT_STORE_DIR, { create = true } = {}) {
+  const base = resolveStoreDir(cwd, storeDir);
+  if (fs.existsSync(path.join(base, 'index.json'))) fail('UNSUPPORTED_FORMAT', `Legacy ExitCode store at ${base}. Move it aside explicitly. No migration is provided.`);
+  if (fs.existsSync(base) && fs.readdirSync(base).some(name => !['project', 'state'].includes(name) && !/^project-[a-f0-9-]{36}$/.test(name)))
+    fail('UNSAFE_PATH', `Use a dedicated store directory, not a product directory: ${base}`);
+  const state = confined(base, 'state');
+  if (fs.existsSync(state) && !fs.lstatSync(state).isDirectory()) fail('UNSAFE_PATH', 'Supervisor state path is not a directory');
+  const file = confined(base, 'state/index.json');
+  const empty = { format: FORMAT, active: null, latest: null };
+  if (create) {
+    fs.mkdirSync(state, { recursive: true, mode: 0o700 });
+    if (!fs.existsSync(file)) writeJson(file, empty);
+  }
+  const index = fs.existsSync(file) ? readJson(file) : empty;
   if (index.format !== FORMAT) fail('UNSUPPORTED_FORMAT', 'Unsupported ExitCode store; no compatibility reader or migration is provided');
   return { base, state, file, index };
 }
 
-export async function locked(cwd, operation, work) {
-  const store = ensureStore(cwd), file = path.join(store.state, 'operation.lock'), token = randomUUID();
+export async function locked(cwd, operation, work, storeDir = DEFAULT_STORE_DIR) {
+  const store = ensureStore(cwd, storeDir), file = path.join(store.state, 'operation.lock'), token = randomUUID();
   if (fs.existsSync(file)) {
     const owner = readJson(file);
     try { process.kill(owner.pid, 0); fail('OPERATION_BUSY', `ExitCode is running ${owner.operation}`); }

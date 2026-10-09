@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { ExitCode } from '../exitcode-core.mjs';
-import { readJson, locked, treeDigest } from '../exitcode-files.mjs';
+import { readJson, locked, treeDigest, DEFAULT_STORE_DIR } from '../exitcode-files.mjs';
 import { ready, workspace, driver, manifest, contract, ok } from './helpers.mjs';
 
 test('problem-first lifecycle reproduces failure, freezes acceptance, and requires fresh real success', async t => {
@@ -21,14 +21,14 @@ test('problem-first lifecycle reproduces failure, freezes acceptance, and requir
   assert.equal(supervisor.status().phase, 'SEALED');
   fs.writeFileSync(path.join(cwd, 'feature.txt'), 'done\n');
   // A live project change does not replace the sealed observer.
-  fs.writeFileSync(path.join(cwd, '.exitcode', 'project', 'files', 'driver.mjs'), 'throw Error("changed live driver");');
+  fs.writeFileSync(path.join(cwd, DEFAULT_STORE_DIR, 'project', 'files', 'driver.mjs'), 'throw Error("changed live driver");');
   const passing = ok(await supervisor.evaluate());
   assert.equal(passing.status, 'PASS');
   assert.equal(passing.run.warmEnvironment, true);
   assert.notEqual(passing.run.id, failing.run.id);
   assert.ok(supervisor.freshPass(id));
   assert.equal(supervisor.status(id).active, false);
-  const runRoot = path.join(cwd, '.exitcode', 'state', 'tasks', id, 'runs', passing.run.id, 'feature-1');
+  const runRoot = path.join(cwd, DEFAULT_STORE_DIR, 'state', 'tasks', id, 'runs', passing.run.id, 'feature-1');
   assert.equal(fs.readFileSync(path.join(runRoot, passing.run.results[0].artifacts[0].path), 'utf8'), 'done\n');
   assert.ok(!fs.existsSync(path.join(runRoot, 'candidate')));
   fs.writeFileSync(path.join(cwd, 'feature.txt'), 'a later edit');
@@ -49,7 +49,7 @@ test('pre-approval edits are preserved, invalidate review, and require explicit 
 
 test('project drift during review requires new preparation', async t => {
   const { cwd, supervisor } = await ready(t);
-  fs.appendFileSync(path.join(cwd, '.exitcode', 'project', 'files', 'driver.mjs'), '\n// newer observer\n');
+  fs.appendFileSync(path.join(cwd, DEFAULT_STORE_DIR, 'project', 'files', 'driver.mjs'), '\n// newer observer\n');
   assert.equal((await supervisor.approve()).code, 'STALE_PREPARATION');
   ok(await supervisor.draft(contract()));
   ok(await supervisor.approve());
@@ -58,13 +58,13 @@ test('project drift during review requires new preparation', async t => {
 test('sealed-byte and evaluator-runtime tampering never produce passing evidence', async t => {
   const { cwd, supervisor, id } = await ready(t);
   ok(await supervisor.approve());
-  const sealed = path.join(cwd, '.exitcode', 'state', 'tasks', id, 'sealed.json');
+  const sealed = path.join(cwd, DEFAULT_STORE_DIR, 'state', 'tasks', id, 'sealed.json');
   const original = fs.readFileSync(sealed, 'utf8'), modified = JSON.parse(original);
   modified.contract.scenarios[0].assertions[0].value = 'pending\n';
   fs.chmodSync(sealed, 0o600); fs.writeFileSync(sealed, JSON.stringify(modified));
   assert.equal((await supervisor.evaluate()).code, 'SEALED_CHANGED');
   fs.writeFileSync(sealed, original);
-  const environments = path.join(cwd, '.exitcode', 'state', 'environments');
+  const environments = path.join(cwd, DEFAULT_STORE_DIR, 'state', 'environments');
   const environment = fs.readdirSync(environments)[0];
   const identity = readJson(path.join(environments, environment, 'identity.json'));
   fs.writeFileSync(path.join(environments, environment, 'versions', identity.digest, 'tampered'), 'x');
@@ -197,10 +197,10 @@ test('cancellation during cleanup cannot certify an otherwise passing candidate'
 
 test('single format rejects legacy stores and schemas; confined snapshots reject aliases', async t => {
   const cwd = workspace(t);
-  fs.mkdirSync(path.join(cwd, '.exitcode')); fs.writeFileSync(path.join(cwd, '.exitcode', 'index.json'), '{"formatVersion":2}');
-  assert.equal((await new ExitCode(cwd).start('Problem')).code, 'UNSUPPORTED_FORMAT');
-  assert.equal(readJson(path.join(cwd, '.exitcode', 'index.json')).formatVersion, 2);
-  fs.rmSync(path.join(cwd, '.exitcode'), { recursive: true });
+  fs.mkdirSync(path.join(cwd, DEFAULT_STORE_DIR), { recursive: true }); fs.writeFileSync(path.join(cwd, DEFAULT_STORE_DIR, 'index.json'), '{"formatVersion":2}');
+  assert.equal((await new ExitCode(cwd, { storeDir: DEFAULT_STORE_DIR }).start('Problem')).code, 'UNSUPPORTED_FORMAT');
+  assert.equal(readJson(path.join(cwd, DEFAULT_STORE_DIR, 'index.json')).formatVersion, 2);
+  fs.rmSync(path.join(cwd, DEFAULT_STORE_DIR), { recursive: true });
   const supervisor = new ExitCode(cwd); ok(await supervisor.start('Problem')); ok(await supervisor.configure({ manifest, files: { 'driver.mjs': driver } }));
   assert.equal((await supervisor.draft({ ...contract(), execution: [] })).code, 'INVALID_SPEC');
   assert.equal((await supervisor.draft({ ...contract(), version: 2 })).code, 'UNSUPPORTED_FORMAT');
