@@ -5,11 +5,12 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { test } from 'node:test';
+import { test, baseline, variants, fullSuite } from './test/suite.mjs';
 import * as core from './exitcode-core.mjs';
 import { releasePreparation } from './exitcode-preparation.mjs';
 import { sandboxCommand } from './exitcode-evaluator.mjs';
 import { structuralReview } from './test/structural-review.mjs';
+import { preparedFixture } from './test/prepared-fixture.mjs';
 
 const read = (cwd, file) => fs.existsSync(path.join(cwd, file)) ? fs.readFileSync(path.join(cwd, file), 'utf8') : null;
 const run = (exit, extra = {}) => ({ exit, stdout: '', stderr: '', timedOut: false, ...extra });
@@ -43,8 +44,10 @@ function project(t, { done = false, commands = false, files = {}, policy = {}, d
   return { cwd, parent, io, args, exec, setNow: value => { now = value; } };
 }
 async function seal(f) {
-  const prepared = await core.prepareNode(f.io);
-  assert.equal(prepared.ok, true, JSON.stringify(prepared.errors));
+  if (fullSuite) {
+    const prepared = await core.prepareNode(f.io);
+    assert.equal(prepared.ok, true, JSON.stringify(prepared.errors));
+  } else preparedFixture(f.io, { passing: read(f.cwd, 'feature') === 'done' ? ['C1'] : [] });
   assert.equal(core.approveRoot(f.io).ok, true);
   assert.equal((await core.sealNode(f.io, 'G1')).ok, true);
   return core.loadRoot(f.io, 'G1');
@@ -63,16 +66,16 @@ async function waitFor(predicate) {
 }
 const done = f => fs.writeFileSync(path.join(f.cwd, 'feature'), 'done');
 
-test('recovery: infrastructure faults during root preparation remain editable without spending evaluator quality budget', async t => {
+baseline('recovery: infrastructure faults during root preparation remain editable without spending evaluator quality budget', async t => {
   // Best-effort critic failures never block deterministic evidence.
-  for (const [label, review] of [
+  for (const [label, review] of variants([
     ['transport retry', async input => { throw Object.assign(Error('provider returned 429'), { status: 429 }); }],
     ['incompatible request', async () => { throw Object.assign(Error('400 incompatible request'), { status: 400 }); }],
     ['provider authority', async () => { throw Object.assign(Error('401 invalid credentials'), { status: 401 }); }],
     ['malformed review', async () => ({ concerns: [{ code: 'BOGUS', evidence: '' }] })],
     ['length exhausted', async () => { throw Object.assign(Error('review exceeds bounded response'), { code: 'REVIEW_TOO_LARGE' }); }],
     ['missing specification', null],
-  ]) await t.test(label, async t => {
+  ], [])) await t.test(label, async t => {
     const f = project(t, { commands: true });
     if (review) f.io.review = review;
     if (label === 'missing specification')
@@ -86,7 +89,7 @@ test('recovery: infrastructure faults during root preparation remain editable wi
       assert.match(ok.review, /Semantic critic: unavailable/);
     }
   });
-  for (const [label, setup, code] of [
+  for (const [label, setup, code] of variants([
     ['runner', f => { f.io.exec = async (command, options) => command === 'observe:feature' && read(options.cwd, 'feature') === 'pending'
       ? run(null, { error: 'temporary runner failure', errorCode: 'RUNNER_ERROR' }) : f.exec(command, options); }, 'RUNNER_ERROR'],
     ['runtime IO', f => { fs.writeFileSync(path.join(f.cwd, 'node_modules'), 'not a directory'); core.releaseBaseline(f.cwd); }, 'ENOTDIR'],
@@ -94,7 +97,8 @@ test('recovery: infrastructure faults during root preparation remain editable wi
       fs.writeFileSync(path.join(core.storePaths(f.cwd).baselineDir,'manifest.json'),'{');
       return structuralReview(input);
     }; }, 'IO_ERROR'],
-  ]) {
+  ], [['runner', f => { f.io.exec = async (command, options) => command === 'observe:feature' && read(options.cwd, 'feature') === 'pending'
+    ? run(null, { error: 'temporary runner failure', errorCode: 'RUNNER_ERROR' }) : f.exec(command, options); }, 'RUNNER_ERROR']])) {
     const f = project(t, { commands: true });
     setup(f);
     const failed = await core.prepareNode(f.io);
@@ -156,7 +160,7 @@ test('recovery: legacy unsealed pauses unlock every editing boundary without res
   });
   // Sealed execution cannot use draft repair to clear its pause.
   const sealed=project(t);await seal(sealed);
-  core.pauseNode(sealed.io,{code:'RUNNER_ERROR',reason:'runner unavailable'});
+  core.failNode(sealed.io,{code:'EXTERNAL_BLOCKED',reason:'external service unavailable'});
   const before=core.loadRoot(sealed.io,'G1');
   assert.equal(core.draftNode(sealed.io,{...sealed.args,revise:'G1'}).ok,false);
   assert.equal((await core.prepareNode(sealed.io)).ok,false);
@@ -195,7 +199,7 @@ test('recovery: live operations and transcript root ownership cannot be cleared 
   assert.deepEqual(core.loadRoot(f.io, 'G1'), before);
 });
 
-test('recovery: cancellation stops isolated descendants before fixtures or ownership are released', async t => {
+baseline('recovery: cancellation stops isolated descendants before fixtures or ownership are released', async t => {
   const f = project(t, { commands: true });
   const command = 'printf ready > started; sleep 10; test "$(cat feature)" = done';
   f.args.criteria[0].check.recipe.command = command;
@@ -220,7 +224,8 @@ test('recovery: cancellation stops isolated descendants before fixtures or owner
   await waitFor(() => fs.readdirSync(f.parent).some(name => name.startsWith('exitcode-fresh-') && fs.existsSync(path.join(f.parent, name, 'started'))));
   assert.equal(core.resumePreparation(core.makeIo(f.cwd)).code, 'OPERATION_BUSY');
   controller.abort();
-  assert.equal((await pending).status, 'PAUSED');
+  const cancelledResult = await pending;
+  assert.deepEqual([cancelledResult.status, cancelledResult.fault.code, cancelledResult.fault.disposition], ['ACTIVE', 'CANCELLED', 'retry']);
   assert.deepEqual(fs.readdirSync(f.parent), ['project']);
   assert.equal(fs.existsSync(core.storePaths(f.cwd).operation), false);
   assert.equal(read(f.cwd, 'feature'), 'done');
@@ -239,37 +244,41 @@ test('recovery: cancellation stops isolated descendants before fixtures or owner
   assert.equal(recipe.errorCode, 'DEADLINE_EXCEEDED', 'shared deadline outranks the clamped watchdog');
 });
 
-test('recovery: inconclusive evaluation preserves work, approval, stack, and a single attempt charge', async t => {
+baseline('recovery: inconclusive evaluation preserves work, approval, stack, and a single attempt charge', async t => {
   const f = project(t, { commands: true });
   await seal(f);
   const bytes = fs.readFileSync(core.sealedFile(f.cwd, 'G1'), 'utf8'), approval = core.loadRoot(f.io, 'G1').approval;
   done(f);
   f.io.exec = async (command, options) => command === 'preserve' ? run(null, { error: 'isolated runner unavailable' }) : f.exec(command, options);
-  assert.equal((await core.evaluateNode(f.io)).status, 'PAUSED');
-  const paused = core.loadRoot(f.io, 'G1');
-  assert.deepEqual([paused.stack, paused.approval, paused.consumedAttempts], [['G1'], approval, 1]);
-  assert.equal(paused.candidateReservation.candidateDigest, core.digestTree(f.cwd));
+  // Infrastructure faults stay ACTIVE: the fault is the next action, not a user pause.
+  const faulted = await core.evaluateNode(f.io);
+  assert.deepEqual([faulted.status, faulted.fault.code, faulted.fault.disposition], ['ACTIVE', 'RUNNER_ERROR', 'retry']);
+  assert.match(faulted.next, /exitcode_evaluate/);
+  const kept = core.loadRoot(f.io, 'G1');
+  assert.deepEqual([kept.stack, kept.approval, kept.consumedAttempts, kept.pause], [['G1'], approval, 1, undefined]);
+  assert.equal(kept.candidateReservation.candidateDigest, core.digestTree(f.cwd));
+  assert.match(core.statusSnapshot(f.io).next, /last issue RUNNER_ERROR \(retry\)/);
   core.ensureBaseline(f.io);
-  assert.equal(read(f.cwd, 'feature'), 'done', 'a sealed pause never restores an old preparation candidate');
+  assert.equal(read(f.cwd, 'feature'), 'done', 'a fault never restores an old preparation candidate');
   // Partial node persistence cannot double charge the reserved candidate.
   const node = core.loadNodeState(f.io, 'G1');
   node.attempts = 0; delete node.reservedCandidateDigest;
   core.saveNodeState(f.io, node);
   f.io.exec = f.exec;
-  assert.equal(core.resumeRoot(f.io).operation, 'evaluate');
   assert.equal((await core.evaluateNode(f.io)).status, 'PASS');
+  assert.equal(core.loadRoot(f.io, 'G1').fault, undefined, 'success clears the recorded fault');
   assert.equal(core.loadRoot(f.io, 'G1').consumedAttempts, 1);
   assert.equal(fs.readFileSync(core.sealedFile(f.cwd, 'G1'), 'utf8'), bytes);
+  if (!fullSuite) return;
   // Interrupted identity IO cannot regain an attempt either.
   const g = project(t, { commands: true });
   await seal(g);
   done(g);
   let first = true;
   g.io.exec = async (command, options) => { const result = await g.exec(command, options); if (first) { first = false; execFileSync('mkfifo', [path.join(g.cwd, 'pipe')]); } return result; };
-  assert.equal((await core.evaluateNode(g.io)).status, 'PAUSED');
+  assert.equal((await core.evaluateNode(g.io)).status, 'ACTIVE');
   fs.rmSync(path.join(g.cwd, 'pipe'));
   g.io.exec = g.exec;
-  assert.equal(core.resumeRoot(g.io).ok, true);
   assert.equal((await core.evaluateNode(g.io)).status, 'PASS');
   assert.equal(core.loadRoot(g.io, 'G1').consumedAttempts, 1);
   // A candidate changed after copying is never certified.
@@ -279,7 +288,7 @@ test('recovery: inconclusive evaluation preserves work, approval, stack, and a s
   let once = true;
   h.io.exec = async (command, options) => { const result = await h.exec(command, options); if (once) { once = false; fs.writeFileSync(path.join(h.cwd, 'feature'), 'pending'); } return result; };
   const mutated = await core.evaluateNode(h.io);
-  assert.equal(mutated.pause.code, 'CANDIDATE_MUTATED');
+  assert.deepEqual([mutated.status, mutated.fault.code], ['ACTIVE', 'CANDIDATE_MUTATED']);
   assert.equal(core.loadRoot(h.io, 'G1').outcome, undefined);
 });
 
@@ -289,11 +298,10 @@ test('recovery: an inconclusive ancestor or a missing pre-child checkpoint keeps
   const id = await child(f);
   done(f); fs.writeFileSync(path.join(f.cwd, 'helper'), 'done');
   f.io.exec = async (command, options) => command === 'observe:feature' ? run(null, { error: 'parent runtime unavailable' }) : f.exec(command, options);
-  assert.equal((await core.evaluateNode(f.io, id)).status, 'PAUSED');
+  assert.equal((await core.evaluateNode(f.io, id)).fault.code, 'RUNNER_ERROR');
   assert.deepEqual(core.loadRoot(f.io, 'G1').stack, ['G1', id]);
   assert.equal(core.loadNodeState(f.io, id).status, 'ACTIVE');
   f.io.exec = f.exec;
-  assert.equal(core.resumeRoot(f.io).ok, true);
   const result = await core.evaluateNode(f.io, id);
   assert.equal(result.cascade.terminal.status, 'PASS');
   assert.equal(result.cascade.terminal.outcome.candidateDigest, core.digestTree(f.cwd));
@@ -310,7 +318,7 @@ test('recovery: an inconclusive ancestor or a missing pre-child checkpoint keeps
   assert.equal(read(g.cwd, 'feature'), 'done', 'no fallback to an unrelated restore');
 });
 
-test('recovery: checkpoint metadata and restoration validate before deleting anything', t => {
+baseline('recovery: checkpoint metadata and restoration validate before deleting anything', t => {
   const f = project(t, { files: { 'manifest.json': '{"candidate":true}\n', '.pi/settings.json': '{"candidate":true}\n' } });
   const directory = path.join(f.cwd, '.exitcode/tmp/snapshot');
   const snap = core.snapshotTree(f.cwd, directory);
@@ -326,7 +334,7 @@ test('recovery: checkpoint metadata and restoration validate before deleting any
   assert.equal(read(f.cwd, 'later'), 'keep until validation succeeds');
 });
 
-test('recovery: deadline crossings never yield PASS, and only explicit user grants add authority', async t => {
+baseline('recovery: deadline crossings never yield PASS, and only explicit user grants add authority', async t => {
   // Unchanged verification cannot dispatch after the deadline.
   const expired = project(t, { done: true, commands: true, policy: { deadlineMinutes: 1 } });
   const sealed = await seal(expired);
@@ -393,15 +401,14 @@ test('recovery: reload recovers an interrupted provisional verdict and requires 
   core.saveRoot(f.io, root); core.saveNodeState(f.io, node); core.saveIndex(f.cwd, index);
   assert.equal(core.terminalStale(f.io, 'G1').stale, true);
   const recovered = core.resumePreparation(core.makeIo(f.cwd, { expectedRootId: 'G1' }));
-  assert.equal(recovered.pause.code, 'INTERRUPTED');
+  assert.deepEqual([recovered.status, recovered.fault.code], ['ACTIVE', 'INTERRUPTED']);
   assert.deepEqual(core.loadRoot(f.io, 'G1').stack, ['G1']);
   assert.equal(core.loadRoot(f.io, 'G1').outcome, undefined);
-  assert.equal(core.resumeRoot(f.io).ok, true);
   done(f);
   assert.equal((await core.evaluateNode(f.io)).status, 'PASS');
 });
 
-test('recovery: other store generations are archived untouched, and forged bundles fail closed', async t => {
+baseline('recovery: other store generations are archived untouched, and forged bundles fail closed', async t => {
   // A store from another generation is never interpreted: it is archived whole and a fresh root starts.
   const old = project(t, { commands: true });
   await seal(old);
@@ -411,7 +418,7 @@ test('recovery: other store generations are archived untouched, and forged bundl
   delete index.formatVersion; index.version = 1;
   core.saveIndex(old.cwd, index);
   const sealedBytes = fs.readFileSync(core.sealedFile(old.cwd, 'G1'), 'utf8');
-  assert.deepEqual(core.statusSnapshot(old.io), { active: false, roots: [] });
+  assert.deepEqual(core.statusSnapshot(old.io), { active: false, roots: [], resumable: [] });
   const [archive] = fs.readdirSync(store.archiveDir);
   assert.equal(fs.readFileSync(path.join(store.archiveDir, archive, 'contracts/G1.sealed.json'), 'utf8'), sealedBytes);
   assert.equal(core.digestTree(old.cwd), candidate, 'the candidate is untouched');
@@ -426,7 +433,7 @@ test('recovery: other store generations are archived untouched, and forged bundl
   bundle.contract.criteria[0].check.recipe.value = 'pending';
   bundle.digest = core.sha256Hex(core.stableStringify(bundle.contract)); delete bundle.integrityDigest;
   core.writeJsonAtomic(core.sealedFile(forged.cwd, 'G1'), bundle);
-  assert.equal((await core.evaluateNode(forged.io)).pause.code, 'EVALUATOR_DRIFT');
+  assert.equal((await core.evaluateNode(forged.io)).pause.code, 'EVIDENCE_CORRUPT');
   // Blocked-child duplicate suppression is runtime aware.
   const args = { root: { policy: core.DEFAULT_POLICY, consumedAttempts: 0, deadlineAt: 1000 }, parentState: { status: 'ACTIVE', lastCandidateDigest: 'candidate' },
     parentResult: { outcomes: [{ criterionId: 'C1', status: 'FAIL' }] }, target: 'C1', goal: 'Create helper', nowMs: 0, environmentIdentity: 'old',

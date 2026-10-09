@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { test } from "node:test";
+import { test, baseline, variants, fullSuite } from './test/suite.mjs';
 import * as core from "./exitcode-core.mjs";
 import {
   DEFAULT_POLICY, MAX_DISCARDED_CHANGES, MODE_ENTRY_TYPE, NodeState, PROTOCOL_PROMPT,
@@ -15,6 +15,7 @@ import {
 } from "./exitcode-core.mjs";
 import { candidateIdentity, scanCapabilities } from "./exitcode-evaluator.mjs";
 import { structuralReview } from "./test/structural-review.mjs";
+import { preparedFixture } from './test/prepared-fixture.mjs';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -92,13 +93,14 @@ const CHILD_OUTCOMES = [{ id: "O1", requirement: "The child outcome is done" }];
 const childArgs = (extra = {}) => ({ parentId: "G1", target: "C1", goal: "sub", outcomes: CHILD_OUTCOMES, criteria: childCriteria(), reason: "r",
   prerequisite: true, prerequisiteArtifact: "a", ...extra });
 
-async function sealedRoot(t, { files, policy, sequence, nowRef = { now: Date.now() } } = {}) {
+async function sealedRoot(t, { files, policy, sequence, pipeline = false, nowRef = { now: Date.now() } } = {}) {
   const dir = tempProject(t, files);
   const exec = fileExec(dir, { checks: standardChecks });
   const { io } = testIo(dir, exec, nowRef);
   const draft = draftNode(io, { goal: "Add the thing", outcomes: sequence ? ORDERED_OUTCOMES : ROOT_OUTCOMES, criteria: sequence ? ORDERED_CRITERIA : ROOT_CRITERIA, ...(sequence ? { sequence } : {}), ...(policy ? { policy } : {}) });
   assert.equal(draft.ok, true, JSON.stringify(draft.errors));
-  assert.equal((await prepareNode(io)).ok, true);
+  if (fullSuite || pipeline) assert.equal((await prepareNode(io)).ok, true);
+  else preparedFixture(io);
   assert.equal(approveRoot(io).ok, true);
   assert.equal((await sealNode(io, draft.id)).ok, true);
   return { dir, io, exec, nowRef };
@@ -111,7 +113,7 @@ const write = (dir, rel, content) => fs.writeFileSync(path.join(dir, rel), conte
 // Contract structure
 // ---------------------------------------------------------------------------
 
-test("structure: drafts are validated before any probe, and controls are optional witnesses", async (t) => {
+baseline("structure: drafts are validated before any probe, and controls are optional witnesses", async (t) => {
   assert.deepEqual(validateStructure(rootDraft(), { policy: DEFAULT_POLICY }), { ok: true, errors: [] });
   // Thin contracts: a behavior criterion may omit controls, and a root needs no regression criterion.
   assert.equal(validateStructure(rootDraft({ criteria: [{ id: "C1", check: custom("c") }] })).ok, true);
@@ -197,7 +199,7 @@ test("verdict: runner errors, timeouts, and truncated output never PASS; only PA
 // Draft -> prepare -> approve -> seal -> fresh PASS
 // ---------------------------------------------------------------------------
 
-test("lifecycle: an approved, validated draft seals exactly and only a fresh evaluation can PASS", async (t) => {
+baseline("lifecycle: an approved, validated draft seals exactly and only a fresh evaluation can PASS", async (t) => {
   const dir = tempProject(t);
   const nowRef = { now: Date.now() };
   const { io } = testIo(dir, fileExec(dir, { checks: standardChecks }), nowRef);
@@ -270,7 +272,7 @@ test("approval: a conversational reply is recorded against the exact root draft"
   assert.deepEqual(loadRoot(makeIo(dir), "G1").approval, approval);
 });
 
-test("approval: every revision or on-disk edit invalidates approval", async (t) => {
+baseline("approval: every revision or on-disk edit invalidates approval", async (t) => {
   const dir = tempProject(t);
   const exec = fileExec(dir, { checks: standardChecks });
   const { io } = testIo(dir, exec);
@@ -287,7 +289,7 @@ test("approval: every revision or on-disk edit invalidates approval", async (t) 
   assert.match(rootReviewText(revised.draft, loadRoot(io, "G1")), /No redesign/);
   assert.equal((await sealNode(io, "G1")).ok, false);
   assert.equal(exec.calls.length, 0);
-  for (const mutate of [
+  for (const mutate of variants([
     (draft) => { draft.criteria.pop(); },
     (draft) => { draft.outcomes[0].requirement = "Weakened requirement"; },
     (draft) => { draft.criteria[0].check.recipe.command = "true"; },
@@ -295,7 +297,10 @@ test("approval: every revision or on-disk edit invalidates approval", async (t) 
     (draft) => { draft.assumptions = ["Changed policy"]; },
     (draft) => { draft.sequence[0].objective = "Weakened implementation objective"; },
     (draft) => { draft.sequence[0].verify = []; },
-  ]) {
+  ], [
+    (draft) => { draft.outcomes[0].requirement = "Weakened requirement"; },
+    (draft) => { draft.criteria[0].check.recipe.command = "true"; },
+  ])) {
     assert.equal((await prepareNode(io)).ok, true);
     assert.equal(approveRoot(io).ok, true);
     exec.calls.length = 0;
@@ -323,9 +328,9 @@ test("approval: every revision or on-disk edit invalidates approval", async (t) 
   assert.equal(loadNodeState(io, "G1").sealAttempts, 1);
 });
 
-test("approval: review and approval bind every limit and the shared clock", async (t) => {
-  for (const [key, value] of [...Object.entries({ localRepairs: 4, maxDepth: 1, maxTotalAttempts: 24,
-    deadlineMinutes: 480, evalTimeoutSeconds: 1200 }), ["createdAt", Date.now() - 1000], ["deadlineAt", Date.now() + 480 * 60000]]) {
+baseline("approval: review and approval bind every limit and the shared clock", async (t) => {
+  for (const [key, value] of variants([...Object.entries({ localRepairs: 4, maxDepth: 1, maxTotalAttempts: 24,
+    deadlineMinutes: 480, evalTimeoutSeconds: 1200 }), ["createdAt", Date.now() - 1000], ["deadlineAt", Date.now() + 480 * 60000]], [["maxTotalAttempts", 24]])) {
     const dir = tempProject(t);
     const exec = fileExec(dir, { checks: standardChecks });
     const io = makeIo(dir, { exec });
@@ -348,6 +353,44 @@ test("approval: review and approval bind every limit and the shared clock", asyn
     assert.equal((await sealNode(io, "G1", { userApproval: "Reuse approval" })).ok, false);
     assert.equal(exec.calls.length, 0);
   }
+});
+
+baseline('approval: the digest binds contract fields, every policy limit, evidence, and the pre-seal clock', () => {
+  const draft = rootDraft({ sequence: ROOT_SEQUENCE, assumptions: ['Existing policy'], exclusions: ['No redesign'],
+    specificationPaths: ['plan.md'], assets: { 'acceptance.test.mjs': '// proof' }, mutableDependencies: true,
+    execution: [{ id: 'S1', objective: 'Implement', verify: ['C1'], after: [] }] });
+  const root = { policy: { ...DEFAULT_POLICY }, explicitLimits: ['maxTotalAttempts'], createdAt: '2026-10-09T00:00:00Z',
+    executionStartedAt: null, deadlineAt: null, validatedBundleDigest: 'validated' };
+  const original = core.rootReviewDigest(root, draft);
+  const changes = [
+    ['criterion removed', d => { d.criteria.pop(); }],
+    ['outcome', d => { d.outcomes[0].requirement += ' changed'; }],
+    ['check', d => { d.criteria[0].check.recipe.command = 'true'; }],
+    ['reject witness', d => { d.criteria[0].controls.reject[0].mutations[0].content = 'done'; }],
+    ['assumption', d => { d.assumptions.push('Changed'); }],
+    ['exclusion', d => { d.exclusions.push('Changed'); }],
+    ['objective', d => { d.sequence[0].objective += ' changed'; }],
+    ['verify list', d => { d.sequence[0].verify = []; }],
+    ['goal', d => { d.goal += ' changed'; }],
+    ['request', d => { d.originalRequest += ' changed'; }],
+    ['specification', d => { d.specificationPaths.push('other.md'); }],
+    ['asset', d => { d.assets['acceptance.test.mjs'] += ' changed'; }],
+    ['dependency policy', d => { d.mutableDependencies = false; }],
+    ['execution graph', d => { d.execution[0].after.push('C9'); }],
+  ];
+  for (const [label, mutate] of changes) {
+    const changed = structuredClone(draft); mutate(changed);
+    assert.notEqual(core.rootReviewDigest(root, changed), original, label);
+  }
+  for (const key of Object.keys(DEFAULT_POLICY)) {
+    const changed = structuredClone(root); changed.policy[key]++;
+    assert.notEqual(core.rootReviewDigest(changed, draft), original, key);
+  }
+  for (const [key, value] of [['explicitLimits', []], ['createdAt', 'changed'], ['deadlineAt', 1000], ['validatedBundleDigest', 'changed']])
+    assert.notEqual(core.rootReviewDigest({ ...root, [key]: value }, draft), original, key);
+  const started = { ...root, executionStartedAt: 100, deadlineAt: 1000 };
+  assert.equal(core.rootReviewDigest({ ...started, deadlineAt: 2000 }, draft), core.rootReviewDigest(started, draft), 'execution grants do not rewrite approval');
+  assert.equal(core.rootReviewDigest(root, Object.fromEntries(Object.entries(draft).reverse())), original, 'object key order is irrelevant');
 });
 
 // ---------------------------------------------------------------------------
@@ -550,7 +593,7 @@ test("prepare: candidate, policy, or concurrent changes during E0 invalidate the
 const baselineDir = (dir) => path.join(dir, ".exitcode/baseline");
 const discardedSets = (dir) => fs.existsSync(path.join(dir, ".exitcode/discarded")) ? fs.readdirSync(path.join(dir, ".exitcode/discarded")).sort() : [];
 
-test("baseline: pre-seal changes from any source are saved, restored, reported, and capped", async (t) => {
+baseline("baseline: pre-seal changes from any source are saved, restored, reported, and capped", async (t) => {
   const dir = tempProject(t, { "feature.txt": "todo\n", "docs/guide.md": "guide\n", "keep/.gitkeep": "" });
   fs.mkdirSync(path.join(dir, "empty"));
   const { io } = testIo(dir, fileExec(dir, { checks: standardChecks }));
@@ -637,7 +680,7 @@ test("baseline: changes that cannot be saved or restored are never silently dest
 // Execution budgets and integrity
 // ---------------------------------------------------------------------------
 
-test("evaluate: only changed trees spend attempts; exhausted attempts and deadlines pause the same root", async (t) => {
+baseline("evaluate: only changed trees spend attempts; exhausted attempts and deadlines pause the same root", async (t) => {
   const { dir, io } = await sealedRoot(t, { policy: { maxTotalAttempts: 1 } });
   const free = await evaluateNode(io, null);
   assert.equal(free.consumedAttempt, false);
@@ -661,7 +704,54 @@ test("evaluate: only changed trees spend attempts; exhausted attempts and deadli
   assert.equal(loadRoot(timed.io, "G1").deadlineAt, before.deadlineAt);
 });
 
-test("evaluate: an own-vector regression restores the last accepted candidate; tampered bundles pause", async (t) => {
+test("budget: default budgets are soft strategy thresholds; only explicit limits or the safety ceiling stop work", async (t) => {
+  const { dir, io } = await sealedRoot(t);
+  const root = loadRoot(io, "G1"), factor = core.SAFETY_CEILING_FACTOR;
+  assert.deepEqual([root.attemptLimit, root.deadlineAt - root.executionStartedAt, root.softDeadlineAt - root.executionStartedAt],
+    [DEFAULT_POLICY.maxTotalAttempts * factor, DEFAULT_POLICY.deadlineMinutes * factor * 60000, DEFAULT_POLICY.deadlineMinutes * 60000]);
+  root.consumedAttempts = DEFAULT_POLICY.maxTotalAttempts; core.saveRoot(io, root);
+  write(dir, "feature.txt", "v2\n");
+  const soft = await evaluateNode(io, null);
+  assert.equal(soft.status, NodeState.ACTIVE);
+  assert.match(soft.next, /strategy check: this approach has consumed 13 changed candidates \(soft threshold 12\)/);
+  const ceiling = loadRoot(io, "G1"); ceiling.consumedAttempts = ceiling.attemptLimit; core.saveRoot(io, ceiling);
+  write(dir, "feature.txt", "v3\n");
+  assert.equal((await evaluateNode(io, null)).pause.code, "BUDGET_EXHAUSTED");
+  // Explicit values are hard limits, bound by approval and shown in review.
+  const dir2 = tempProject(t);
+  const { io: explicit } = testIo(dir2, fileExec(dir2, { checks: standardChecks }));
+  draftNode(explicit, { goal: "g", outcomes: ROOT_OUTCOMES, criteria: ROOT_CRITERIA, policy: { maxTotalAttempts: 5 } });
+  const prepared = await prepareNode(explicit);
+  assert.match(prepared.review, /Hard limits \(work pauses for your grant when reached\)\n- maxTotalAttempts: 5/);
+  assert.deepEqual(loadRoot(explicit, "G1").explicitLimits, ["maxTotalAttempts"]);
+});
+
+test("fault: only user or external intervention pauses; the agent cannot block on supervisor-owned conditions; stale locks self-heal", async (t) => {
+  const { io } = await sealedRoot(t);
+  for (const code of ["EVALUATOR_UNBUILDABLE", "BUDGET_EXHAUSTED"])
+    assert.match((await blockNode(io, "G1", { code, reason: "the runner is awkward" })).errors[0], /code must be one of/);
+  assert.match((await blockNode(io, "G1", { code: "NO_PATH", reason: "stuck" })).errors[0], /NO_PATH only withdraws a focused child/);
+  assert.equal(loadRoot(io, "G1").status, NodeState.ACTIVE);
+  for (const [code, disposition] of [["RUNNER_ERROR", "retry"], ["WORKER_FAILED", "retry"], ["GIT_FAILED", "retry"], ["ISOLATION_UNAVAILABLE", "retry"],
+    ["CANDIDATE_MUTATED", "retry"], ["NO_PROGRESS", "repair"], ["EVALUATOR_DRIFT", "repair"], ["CREDENTIAL_MISSING", "intervention"],
+    ["BUDGET_EXHAUSTED", "intervention"], ["EVIDENCE_CORRUPT", "intervention"], ["RESTORATION_FAILED", "intervention"]])
+    assert.equal(core.faultDisposition(code), disposition, code);
+  // The operation mutex is not authoritative: locks that cannot belong to a live operation are removed.
+  const lock = core.storePaths(io.cwd).operation, old = new Date(Date.now() - 60000);
+  const dead = (await import("node:child_process")).spawnSync(process.execPath, ["-e", ""]).pid;
+  for (const [label, content, aged, busy] of [["previous process", { pid: process.pid, processNonce: "earlier", token: "t" }, false, false],
+    ["dead pid", { pid: dead, token: "t" }, false, false], ["malformed", "{", true, false],
+    ["being written", "", false, true], ["live process", { pid: process.ppid, token: "t" }, false, true]]) {
+    fs.writeFileSync(lock, typeof content === "string" ? content : JSON.stringify(content));
+    if (aged) fs.utimesSync(lock, old, old);
+    const result = ensureBaseline(io);
+    assert.equal(result?.code === "OPERATION_BUSY", busy, label);
+    assert.equal(fs.existsSync(lock), busy, label);
+    fs.rmSync(lock, { force: true });
+  }
+});
+
+baseline("evaluate: an own-vector regression restores the last accepted candidate; tampered bundles pause", async (t) => {
   const { dir, io } = await sealedRoot(t);
   write(dir, "feature.txt", "done BROKE\n");
   const result = await evaluateNode(io, null);
@@ -673,7 +763,7 @@ test("evaluate: an own-vector regression restores the last accepted candidate; t
   bundle.contract.goal = "tampered";
   fs.writeFileSync(sealedFile, JSON.stringify(bundle));
   assert.equal((await evaluateNode(io, null)).status, NodeState.PAUSED);
-  assert.equal(loadRoot(io, "G1").pause.code, "EVALUATOR_DRIFT");
+  assert.equal(loadRoot(io, "G1").pause.code, "EVIDENCE_CORRUPT");
   assert.match(loadRoot(io, "G1").pause.reason, /supervisor identity/);
 });
 
@@ -681,7 +771,7 @@ test("evaluate: an own-vector regression restores the last accepted candidate; t
 // Focused recursion
 // ---------------------------------------------------------------------------
 
-test("child: gates require a failing target, a prerequisite before local repairs, one active child, novelty, and depth", async (t) => {
+baseline("child: gates require a failing target, a prerequisite before local repairs, one active child, novelty, and depth", async (t) => {
   const { dir, io } = await sealedRoot(t, { policy: { maxDepth: 1 } });
   assert.ok(draftNode(io, { ...childArgs(), prerequisite: undefined }).errors.some((e) => e.includes("prerequisite:true")));
   assert.ok(draftNode(io, childArgs({ target: "C2" })).errors.some((e) => e.includes("currently passes")));
@@ -694,11 +784,13 @@ test("child: gates require a failing target, a prerequisite before local repairs
   assert.equal(draftNode(io, childArgs({ goal: "same subgoal" })).ok, true, "changed evidence reopens the path");
   assert.equal((await sealNode(io, "G1.2")).ok, true);
   assert.ok(draftNode(io, { ...childArgs({ parentId: "G1.2", target: "D1", criteria: [behavior("E1", "check:e1")] }) }).errors.some((e) => e.includes("maxDepth")));
+  const ordered = await sealedRoot(t, { sequence: ROOT_SEQUENCE });
+  assert.equal(draftNode(ordered.io, childArgs({ target: 'C3' })).ok, false, 'a future slice is never an eligible child target');
 });
 
-test("child: PASS reruns the parent and only a passing parent cascades to root PASS", async (t) => {
-  for (const ordered of [false, true]) await t.test(ordered ? "ordered parent" : "unordered parent", async (t) => {
-    const options = ordered ? { sequence: ROOT_SEQUENCE } : {};
+baseline("child: PASS reruns the parent and only a passing parent cascades to root PASS", async (t) => {
+  for (const ordered of variants([false, true], [false])) await t.test(ordered ? "ordered parent" : "unordered parent", async (t) => {
+    const options = { pipeline: true, ...(ordered ? { sequence: ROOT_SEQUENCE } : {}) };
     const { dir, io } = await sealedRoot(t, options);
     if (ordered) {
       assert.equal(draftNode(io, childArgs({ target: "C3" })).ok, false, "future proof is not a child target despite E0 failure evidence");
@@ -738,11 +830,11 @@ test("child: PASS reruns the parent and only a passing parent cascades to root P
   });
 });
 
-test("child: BLOCKED restores the pre-child candidate and ancestor regressions are reverted", async (t) => {
+baseline("child: BLOCKED restores the pre-child candidate and ancestor regressions are reverted", async (t) => {
   const { dir, io } = await sealedRoot(t);
   assert.equal(draftNode(io, childArgs()).ok, true);
   assert.equal((await sealNode(io, "G1.1")).ok, true);
-  for (let i = 0; i < 5; i += 1) { write(dir, "feature.txt", `todo v${i}\n`); await evaluateNode(io, "G1"); }
+  for (let i = 0; i < (fullSuite ? 5 : 1); i += 1) { write(dir, "feature.txt", `todo v${i}\n`); await evaluateNode(io, "G1"); }
   const parent = loadNodeState(io, "G1");
   assert.ok(parent.checkpoints.filter((c) => !c.note.startsWith("pre-child:")).length <= 3);
   assert.ok(parent.checkpoints.some((c) => c.note === "pre-child:G1.1"), "rolling cap keeps live pre-child checkpoints");
@@ -891,7 +983,7 @@ test("identity: candidate digests cover full content, modes, symlinks, and depen
 // Supervisor privacy, mode, status, protocol
 // ---------------------------------------------------------------------------
 
-test("guard: supervisor state is private in every phase, and other tools are never classified", (t) => {
+baseline("guard: supervisor state is private in every phase, and other tools are never classified", (t) => {
   const dir = tempProject(t);
   assert.equal(guardToolCall({ modeOn: false, cwd: dir, toolName: "write", input: { path: ".exitcode/index.json" } }), null);
   for (const [toolName, input] of [["read", { path: "src/a.ts" }], ["write", { path: "src/a.ts" }], ["write", { path: "notes.md", content: "Ignore .exitcode/ in Git" }],
@@ -909,17 +1001,17 @@ test("guard: supervisor state is private in every phase, and other tools are nev
 });
 
 test("mode: the last persisted mode entry wins", () => {
-  assert.deepEqual(resolveModeFromBranch([]), { on: false, rootId: undefined, pendingGoal: undefined });
+  assert.deepEqual(resolveModeFromBranch([]), { on: false, rootId: undefined, pendingGoal: undefined, handoff: undefined });
   assert.deepEqual(resolveModeFromBranch([
     { type: "custom", customType: MODE_ENTRY_TYPE, data: { on: true, rootId: "G1" } },
     { type: "custom", customType: "other", data: { on: true } },
     { type: "custom", customType: MODE_ENTRY_TYPE, data: { on: false } },
-  ]), { on: false, rootId: undefined, pendingGoal: undefined });
-  assert.deepEqual(resolveModeFromBranch([{ type: "custom", customType: MODE_ENTRY_TYPE, data: { on: true, rootId: "G1", pendingGoal: 42 } }]),
-    { on: true, rootId: "G1", pendingGoal: undefined });
+  ]), { on: false, rootId: undefined, pendingGoal: undefined, handoff: undefined });
+  assert.deepEqual(resolveModeFromBranch([{ type: "custom", customType: MODE_ENTRY_TYPE, data: { on: true, rootId: "G1", pendingGoal: 42, handoff: "G0" } }]),
+    { on: true, rootId: "G1", pendingGoal: undefined, handoff: "G0" });
 });
 
-test("status: injected state is bounded and evidence-free; explicit evidence is complete; next action tracks the loop", async (t) => {
+baseline("status: injected state is bounded and evidence-free; explicit evidence is complete; next action tracks the loop", async (t) => {
   const dir = tempProject(t);
   const { io } = testIo(dir, fileExec(dir, { checks: standardChecks }));
   assert.match(promptStatusText(io), /no active root/);
@@ -948,7 +1040,7 @@ test("status: injected state is bounded and evidence-free; explicit evidence is 
   assert.equal(approveRoot(io).ok, true);
   assert.equal((await sealNode(io, "G1")).ok, true);
   assert.match(promptStatusText(io), /G1 ACTIVE :: C1=FAIL C2=PASS/);
-  assert.match(statusText(io), /0\/12 attempts/);
+  assert.match(statusText(io), /0\/12 soft, ceiling 48 attempts/, "default budgets are soft thresholds below a safety ceiling");
   assert.match(statusSnapshot(io).next, /repair G1 to achieve its goal; use failures \[C1\] as feedback/);
   write(dir, "feature.txt", "v2\n"); await evaluateNode(io, null);
   write(dir, "feature.txt", "v3\n"); await evaluateNode(io, null);

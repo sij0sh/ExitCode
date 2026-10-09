@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import {test} from 'node:test';
+import { test, baseline } from './test/suite.mjs';
 import {stripTypeScriptTypes} from 'node:module';
 import * as core from './exitcode-core.mjs';
 import {captureEvaluatorAssets, compileRecipe, installEvaluatorAssets, restoreEvaluatorAssets,
@@ -79,7 +79,7 @@ test('assets: existing_test and test_suite evaluate sealed tests while product t
   });
 });
 
-test('assets: authored files are confined, bounded, and restored only into disposable copies', async t=>{
+baseline('assets: authored files are confined, bounded, and restored only into disposable copies', async t=>{
   const cwd=workspace(t), directory=path.join(cwd,'.exitcode/assets/bundle');
   for(const [assets,check] of [
     [null,recipe], [['bad'],recipe], [{'../escape':'bad'},recipe], [{'/escape':'bad'},recipe],
@@ -115,7 +115,7 @@ test('assets: authored files are confined, bounded, and restored only into dispo
   assert.ok(reprepared.diagnostics.some(d=>d.code==='ACCEPT_NOT_DISCRIMINATED'));
 });
 
-test('assets: the exact approved tests run fresh with the host runtime while the live repository stays clean', async t=>{
+baseline('assets: the exact approved tests run fresh with the host runtime while the live repository stays clean', async t=>{
   const source="export const value='pending';", witness="export const value='done';";
   const cwd=workspace(t,{'src/value.mjs':source,profile:'existing',
     'profile.test.mjs':"import{test}from'node:test';import assert from'node:assert/strict';import{readFileSync}from'node:fs';test('profile remains',()=>assert.equal(readFileSync('profile','utf8'),'existing'));"});
@@ -149,7 +149,8 @@ test('assets: the exact approved tests run fresh with the host runtime while the
   assert.match(failing.vector,/C1=FAIL/);
   const sealedTest=path.join(bundle.assetsDirectory,'.exitcode-evaluator/C1.test.mjs'), sealedBytes=fs.readFileSync(sealedTest,'utf8');
   fs.writeFileSync(sealedTest,'process.exit(0)');
-  assert.equal((await core.evaluateNode(io)).pause.code,'EVALUATOR_DRIFT');
+  // A damaged sealed copy is supervisor evidence corruption: only the user can restore it.
+  assert.equal((await core.evaluateNode(io)).pause.code,'EVIDENCE_CORRUPT');
   fs.writeFileSync(sealedTest,sealedBytes);
   assert.equal(core.resumeRoot(io).ok,true);
   fs.writeFileSync(path.join(cwd,'src/value.mjs'),witness);

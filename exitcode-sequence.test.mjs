@@ -3,10 +3,11 @@ import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { test } from 'node:test';
+import { test, baseline, variants, fullSuite } from './test/suite.mjs';
 import * as core from './exitcode-core.mjs';
 import { releasePreparation } from './exitcode-preparation.mjs';
 import { structuralReview } from './test/structural-review.mjs';
+import { preparedFixture } from './test/prepared-fixture.mjs';
 
 const sequence = [
   { objective: 'Establish the first artifact', verify: ['C1'] },
@@ -59,7 +60,7 @@ const firstProof = ['observe:first', 'preserve'];
 const secondProof = ['observe:first', 'observe:second', 'preserve'];
 const completeProof = ['observe:first', 'observe:second', 'observe:last', 'preserve'];
 
-test('sequence: declared prerequisites are validated deterministically; order alone needs no model judgment', async t => {
+baseline('sequence: declared prerequisites are validated deterministically; order alone needs no model judgment', async t => {
   for (const backwards of [false, true]) await t.test(backwards ? 'backwards' : 'valid', async t => {
     const order = backwards
       ? [{ objective: 'Establish the second artifact', verify: ['C2'], after: ['C1'] }, { objective: 'Establish the first artifact', verify: ['C1'] }, sequence[2]]
@@ -79,14 +80,22 @@ test('sequence: declared prerequisites are validated deterministically; order al
   {
     // Without declared prerequisites, array order is accepted without model judgment.
     const f = project(t, { order: [sequence[1], sequence[0], sequence[2]] });
-    const result = await core.prepareNode(f.io);
-    assert.equal(result.ok, true, JSON.stringify(result.diagnostics));
-    assert.equal(result.stages.find(s => s.stage === 'critic').status, 'pass');
+    assert.equal(f.calls.length, 0, 'declaring order executes no probes');
+    if (fullSuite) {
+      const result = await core.prepareNode(f.io);
+      assert.equal(result.ok, true, JSON.stringify(result.diagnostics));
+      assert.equal(result.stages.find(s => s.stage === 'critic').status, 'pass');
+    }
   }
+  const passing = project(t, { allDone: true });
+  preparedFixture(passing.io, { passing: ['C1', 'C2', 'C3'] });
+  assert.equal((await core.sealNode(passing.io, 'G1', { userApproval: 'Approve' })).ok, true);
+  assert.equal(cursor(passing), 0, 'even an all-PASS baseline leaves execution at the first slice');
+  assert.equal(core.loadRoot(passing.io, 'G1').status, 'ACTIVE');
 });
 
-test('sequence: root proof advances cumulatively and completes only at the final slice', async t => {
-  for (const allDone of [false, true]) await t.test(allDone ? 'passing baseline' : 'incremental work', async t => {
+baseline('sequence: root proof advances cumulatively and completes only at the final slice', async t => {
+  for (const allDone of variants([false, true], [false])) await t.test(allDone ? 'passing baseline' : 'incremental work', async t => {
     const f = project(t, { allDone });
     const approved = await seal(f), bytes = fs.readFileSync(core.sealedFile(f.cwd, 'G1'), 'utf8');
     assert.equal(cursor(f), 0);
@@ -127,9 +136,16 @@ test('sequence: root proof advances cumulatively and completes only at the final
   });
 });
 
-test('sequence: recovery preserves the cursor and requires conclusive current proof', async t => {
-  for (const mode of ['reload-pause', 'earlier-regression', 'regression-check', 'runner-error', 'ancestor-error', 'commit-deadline']) await t.test(mode, async t => {
-    const f = project(t), approved = await seal(f);
+baseline('sequence: recovery preserves the cursor and requires conclusive current proof', async t => {
+  for (const mode of variants(['reload-pause', 'earlier-regression', 'regression-check', 'runner-error', 'ancestor-error', 'commit-deadline'], ['runner-error'])) await t.test(mode, async t => {
+    const f = project(t);
+    let approved;
+    if (fullSuite) approved = await seal(f);
+    else {
+      preparedFixture(f.io, { passing: ['C3'] });
+      assert.equal((await core.sealNode(f.io, 'G1', { userApproval: 'Approve the ordered proof' })).ok, true);
+      approved = core.loadRoot(f.io, 'G1');
+    }
     if (mode === 'ancestor-error') {
       const proposal = core.draftNode(f.io, { parentId: 'G1', target: 'C1', goal: 'Establish the helper artifact',
         outcomes: [{ id: 'O1', requirement: 'Helper done' }], criteria: [criterion('D1', 'helper')],
@@ -139,12 +155,11 @@ test('sequence: recovery preserves the cursor and requires conclusive current pr
       write(f, 'helper', 'done'); write(f, 'first', 'done');
       f.io.exec = async (command, options) => command === 'preserve'
         ? { exit: null, stdout: '', stderr: '', timedOut: false, error: 'parent runtime unavailable', errorCode: 'RUNNER_ERROR' } : f.exec(command, options);
-      assert.equal((await core.evaluateNode(f.io, proposal.id)).pause.code, 'RUNNER_ERROR');
+      assert.equal((await core.evaluateNode(f.io, proposal.id)).fault.code, 'RUNNER_ERROR');
       assert.equal(cursor(f), 0);
       assert.deepEqual(core.loadRoot(f.io, 'G1').stack, ['G1', proposal.id]);
       assert.equal(core.loadNodeState(f.io, proposal.id).status, 'ACTIVE');
       f.io.exec = f.exec;
-      assert.equal(core.resumeRoot(f.io).ok, true);
       const fresh = await core.evaluateNode(f.io, proposal.id);
       assert.equal(fresh.status, 'PASS', 'the child can close after conclusive parent refresh');
       assert.equal(fresh.cascade.terminal, null, 'a parent prefix is not complete root proof');
@@ -175,7 +190,7 @@ test('sequence: recovery preserves the cursor and requires conclusive current pr
       assert.equal(core.resumePreparation(fresh).ok, true);
       f.io = fresh;
       assert.equal(cursor(f), 1);
-      assert.equal(core.pauseNode(f.io, { code: 'EXTERNAL_BLOCKED', reason: 'Restore the external prerequisite' }).status, 'PAUSED');
+      assert.equal(core.failNode(f.io, { code: 'EXTERNAL_BLOCKED', reason: 'Restore the external prerequisite' }).status, 'PAUSED');
       assert.equal(cursor(f), 1);
       assert.equal(core.resumeRoot(f.io).ok, true);
       assert.equal((await evaluate(f, secondProof)).status, 'ACTIVE');
@@ -184,11 +199,11 @@ test('sequence: recovery preserves the cursor and requires conclusive current pr
       write(f, 'second', 'done');
       f.io.exec = async (command, options) => command === 'preserve'
         ? { exit: null, stdout: '', stderr: '', timedOut: false, error: 'runtime unavailable', errorCode: 'RUNNER_ERROR' } : f.exec(command, options);
-      assert.equal((await core.evaluateNode(f.io, 'G1')).pause.code, 'RUNNER_ERROR');
+      const faulted = await core.evaluateNode(f.io, 'G1');
+      assert.deepEqual([faulted.status, faulted.fault.code], ['ACTIVE', 'RUNNER_ERROR'], 'a runner fault never pauses the root');
       assert.equal(cursor(f), 1);
       assert.equal(core.loadRoot(f.io, 'G1').outcome, undefined);
       f.io.exec = f.exec;
-      assert.equal(core.resumeRoot(f.io).ok, true);
       assert.equal((await evaluate(f, secondProof)).status, 'ACTIVE');
       assert.equal(cursor(f), 2, 'a conclusive retry advances once, not to root PASS');
       assert.equal(core.loadRoot(f.io, 'G1').consumedAttempts, 2);

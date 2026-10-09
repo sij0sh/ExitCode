@@ -1,9 +1,9 @@
 /** SDK session ownership, feedback, resource isolation, and cancellation. */
 import assert from 'node:assert/strict';
-import { test } from 'node:test';
+import { test, baseline } from './test/suite.mjs';
 import { createPiWorkerBackend } from './exitcode-workers.mjs';
 
-test('workers: sessions isolate cwd and context, retain selected model settings, repair in place, and dispose on cancellation', async () => {
+baseline('workers: sessions isolate cwd and context, retain selected model settings, repair in place, and dispose on cancellation', async () => {
   const created = [], loaded = [], prompts = [], listeners = new Map(), aborted = [], disposed = [], providerCalls = [];
   const sdk = {
     getAgentDir: () => '/agent-config',
@@ -64,7 +64,7 @@ test('workers: model errors never become a settled successful candidate', async 
   await backend.dispose(handle);
 });
 
-test('workers: preflight rejects missing SDK capabilities or an unavailable selected model without launching sessions', async t => {
+baseline('workers: preflight rejects missing SDK capabilities or an unavailable selected model without launching sessions', async t => {
   for (const mode of ['no-model','missing-sdk','missing-api','unavailable-model']) await t.test(mode,async()=>{
     let sessions=0,loads=0;
     const sdk={getAgentDir:()=>'/config',SettingsManager:{inMemory:()=>({})},SessionManager:{inMemory:()=>({})},

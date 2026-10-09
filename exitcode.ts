@@ -140,6 +140,7 @@ type Runtime = {
   modeOn: boolean;
   rootId: string | undefined;
   pendingGoal: string | undefined;
+  handoff: string | undefined;
   nudges: number;
   progress: string | undefined;
   operations: Map<AbortController, Promise<void>>;
@@ -209,23 +210,13 @@ function reviewIo(ctx: ExtensionContext, signal?: AbortSignal, onProgress?: (pro
         usage[k]+=result.usage?.[k] ?? 0;
       for(const k of ["input","output","cacheRead","cacheWrite","total"] as const)
         usage.cost[k]+=result.usage?.cost?.[k] ?? 0;
-      if(result.stopReason!=="stop"&&result.stopReason!=="toolUse")throw Object.assign(new Error(result.errorMessage ?? `review stopped: ${result.stopReason}`),result.stopReason==="aborted"?{code:"CANCELLED"}:result.stopReason==="length"?{code:"REVIEW_TOO_LARGE"}:{});
-      const call=(result.content??[]).find((b:any)=>b?.type==="toolCall"&&b?.name===tool.name);
-      if(call) {
-        const args=typeof call.arguments==="string"?core.parseReviewText(call.arguments):call.arguments;
-        const sized=JSON.stringify(args??null);
-        if(!sized||sized.length>8*1024)throw Object.assign(new Error("review output exceeds bounded response"),{code:"REVIEW_RESPONSE_INVALID"});
-        return args;
-      }
-      const text=(result.content??[]).filter((b:any)=>b.type==="text").map((b:any)=>b.text).join("");
-      if(text.length>8*1024)throw Object.assign(new Error("review output exceeds bounded response"),{code:"REVIEW_RESPONSE_INVALID"});
-      return core.parseReviewText(text);
+      return core.parseReviewResponse(result);
     },
   });
 }
 
 export default function (pi: ExtensionAPI) {
-  const rt: Runtime = { pi, modeOn: false, rootId: undefined, pendingGoal: undefined, nudges: 0, progress:undefined, operations:new Map() };
+  const rt: Runtime = { pi, modeOn: false, rootId: undefined, pendingGoal: undefined, handoff: undefined, nudges: 0, progress:undefined, operations:new Map() };
   const TOOL_NAMES = core.EXITCODE_TOOL_NAMES;
 
   const assertMode = () => {
@@ -245,7 +236,7 @@ export default function (pi: ExtensionAPI) {
   };
 
   const persistMode = () => {
-    pi.appendEntry(core.MODE_ENTRY_TYPE, { on: rt.modeOn, rootId: rt.rootId, pendingGoal: rt.pendingGoal });
+    pi.appendEntry(core.MODE_ENTRY_TYPE, { on: rt.modeOn, rootId: rt.rootId, pendingGoal: rt.pendingGoal, handoff: rt.handoff });
   };
 
   // Each unsealed phase keeps its own pre-seal baseline; sealed execution keeps none.
@@ -260,22 +251,24 @@ export default function (pi: ExtensionAPI) {
     if (rt.rootId) {
       const root = core.loadRoot(io, rt.rootId);
       return [
-        `exitcode root ${rt.rootId} [${root?.status ?? "MISSING"}]`,
+        `exitcode root ${rt.rootId} [${root?.status ?? "MISSING"}]${root?.detachedAt != null ? " (detached; /exitcode resume re-attaches it)" : ""}`,
         "Enforcement remains on. Only a fresh root PASS exits automatically.",
-        "Use /exitcode exit to cancel without completing the goal.",
+        "Use /exitcode exit to stop without completing the goal; /exitcode <goal> starts fresh.",
       ].join("\n");
     }
     return [
       "exitcode: DISCOVERY (enforcement on)",
       ...(rt.pendingGoal ? [`Root goal: ${rt.pendingGoal}`] : []),
+      ...(rt.handoff ? ["", rt.handoff, ""] : []),
       "Inspect with any available tools without changing the candidate. Clarify the goal, then propose its acceptance contract with exitcode_draft.",
     ].join("\n");
   };
 
-  const enterMode = (ctx: ExtensionContext, pendingGoal?: string) => {
+  const enterMode = (ctx: ExtensionContext, pendingGoal?: string, handoff?: string) => {
     rt.modeOn = true;
     rt.nudges = 0;rt.progress=undefined;
     if (pendingGoal !== undefined) rt.pendingGoal = pendingGoal;
+    rt.handoff = handoff;
     persistMode();
     applyExposure();
     // Entry fixes the current tree as the candidate, including edits made while mode was off.
@@ -288,6 +281,7 @@ export default function (pi: ExtensionAPI) {
     rt.modeOn = false;
     rt.rootId = undefined;
     rt.pendingGoal = undefined;
+    rt.handoff = undefined;
     rt.nudges = 0;rt.progress=undefined;
     if(!rt.operations.size)core.releaseBaseline(ctx.cwd);
     persistMode();
@@ -379,8 +373,8 @@ export default function (pi: ExtensionAPI) {
       }),
       execute: async (_id, params, _signal, _onUpdate, ctx) => withOperation(ctx,_signal,_onUpdate,async io => {
         assertMode();
-        if (rt.rootId && !core.statusSnapshot(io).active) {
-          return textResult("draft rejected:\n- the previous root is terminal or missing; the user must cancel with /exitcode exit before starting a new goal", { ok: false }, true);
+        if (rt.rootId && core.statusSnapshot(io).root !== rt.rootId) {
+          return textResult(`draft rejected:\n- this session's root ${rt.rootId} no longer owns the workspace; the user re-attaches it with /exitcode resume ${rt.rootId} or starts fresh with /exitcode <goal>`, { ok: false, code: "ROOT_MISMATCH" }, true);
         }
         const result = core.draftNode(io, {
           goal: params.goal,
@@ -400,6 +394,7 @@ export default function (pi: ExtensionAPI) {
         if (!result.ok) return textResult(`draft rejected:\n${errLines(result)}`, result, true);
         rt.rootId = result.rootId;
         rt.pendingGoal = undefined;
+        rt.handoff = undefined;
         persistMode();
         syncBaseline(ctx);
         io.expectedRootId=result.rootId;
@@ -497,8 +492,8 @@ export default function (pi: ExtensionAPI) {
     {
       name: "exitcode_block",
       label: "Exitcode Block",
-      description: "Pause for a concrete external authority, infrastructure, budget, or viable-path blocker. Ask the user directly about ambiguity. Contract-specific tests use draft assets; repository tests can change after sealing. Agent-repairable evaluator diagnostics need evaluator repair. Only a child NO_PATH withdraws that path and reruns its parent.",
-      promptSnippet: "exitcode_block: pause with the concrete missing requirement",
+      description: "Request input only the user or the external world can provide: a missing requirement decision, credential, authorization, or external action. ExitCode itself handles runner, Git, worker, configuration, and budget problems; repair or retry those instead. Ask the user directly about ambiguity. NO_PATH only withdraws a focused child and reruns its parent.",
+      promptSnippet: "exitcode_block: request a user/external prerequisite, or withdraw a child (NO_PATH)",
       parameters: Type.Object({
         node: Type.Optional(Type.String({ description: "Node id (defaults to the active leaf)" })),
         reason: Type.String({ description: "Specific missing requirement, credential, authorization, or cause" }),
@@ -536,6 +531,7 @@ export default function (pi: ExtensionAPI) {
     rt.rootId = mode.rootId;
     rt.nudges = 0;rt.progress=undefined;
     rt.pendingGoal = mode.pendingGoal;
+    rt.handoff = mode.handoff;
     if(rt.modeOn)core.resumePreparation(core.makeIo(ctx.cwd,{expectedRootId:rt.rootId}));
     applyExposure();
     syncBaseline(ctx);
@@ -580,14 +576,17 @@ export default function (pi: ExtensionAPI) {
     if(['OPERATION_BUSY','CANCELLED'].includes(baseline.code))return undefined;
     const snap=core.statusSnapshot(io);
     if(snap.active && snap.root!==rt.rootId) {
-      return {entries:[{type:'custom_message' as const,customType:'exitcode-pause',content:'exitcode: session root differs from workspace root. Use /exitcode resume to adopt it explicitly.',display:true}]};
+      const hint=rt.rootId?`/exitcode resume ${rt.rootId} switches back`:`/exitcode resume ${snap.root} adopts it`;
+      return {entries:[{type:'custom_message' as const,customType:'exitcode-pause',content:`exitcode: ${snap.root} owns the workspace, not this session. ${hint}, or /exitcode <goal> starts fresh.`,display:true}]};
     }
     if(!baseline.ok) {
       if(ctx.hasUI)ctx.ui.notify(`exitcode: ${baseline.message??errLines(baseline)}`,'warning');
       if(rt.nudges>=core.MAX_SETTLE_NUDGES) {
-        const paused=snap.active?core.pauseNode(io,{reason:'Repeated pre-seal changes made no progress. Inspect the discarded files and resume without modifying the candidate.',code:'NO_PROGRESS',operation:snap.phase==='EXECUTION'?'evaluate':'prepare'}):null;
+        // No progress is reported once as a fault, never a user pause; the next user message continues.
+        if(rt.nudges++>core.MAX_SETTLE_NUDGES)return undefined;
+        const fault=snap.active?core.failNode(io,{reason:'Repeated pre-seal changes made no progress. Inspect the discarded files and continue without modifying the candidate.',code:'NO_PROGRESS',operation:snap.phase==='EXECUTION'?'evaluate':'prepare'}):null;
         syncBaseline(ctx);
-        return {entries:[{type:'custom_message' as const,customType:'exitcode-pause',content:paused?errLines(paused):'exitcode: repeated pre-seal changes were restored. Discovery is paused; continue inspection without modifying the candidate.',display:true}]};
+        return {entries:[{type:'custom_message' as const,customType:'exitcode-pause',content:fault?errLines(fault):'exitcode: repeated pre-seal changes were restored. Continue inspection without modifying the candidate.',display:true}]};
       }
       rt.nudges++;
       return {entries:[{type:'custom_message' as const,customType:'exitcode-nudge',content:baseline.message??errLines(baseline),display:true}],continue:true};
@@ -601,19 +600,21 @@ export default function (pi: ExtensionAPI) {
     const leafId=snap.stack?.at(-1),leaf=leafId?(snap.nodes as any)?.[leafId]:null;
     if(!leaf || !['ACTIVE','DRAFT'].includes(leaf.status))return undefined;
     if(snap.expired) {
-      const paused=core.pauseNode(io,{reason:'shared execution deadline exceeded',code:'BUDGET_EXHAUSTED',operation:leaf.status==='DRAFT'?'prepare':'evaluate'});
+      const paused=core.failNode(io,{reason:'shared execution deadline exceeded',code:'BUDGET_EXHAUSTED',operation:leaf.status==='DRAFT'?'prepare':'evaluate'});
       syncBaseline(ctx);
       return {entries:[{type:'custom_message' as const,customType:'exitcode-pause',content:errLines(paused),display:true}]};
     }
     let candidate;
-    try{candidate=core.digestTree(ctx.cwd);}catch(e){core.pauseNode(io,{reason:e.message,code:e.code??"IO_ERROR",operation:leaf.status==='DRAFT'?'prepare':'evaluate'});return undefined;}
+    try{candidate=core.digestTree(ctx.cwd);}catch(e){core.failNode(io,{reason:e.message,code:e.code??"IO_ERROR",operation:leaf.status==='DRAFT'?'prepare':'evaluate'});return undefined;}
     const progress=JSON.stringify({candidate,phase:snap.phase,stack:snap.stack,attempts:snap.consumedAttempts,vector:leaf.vector,
       intent:snap.intentDigest,evaluator:snap.evaluatorDigest,diagnostics:snap.diagnostics,restored:baseline.restored===true});
     if(progress!==rt.progress){rt.progress=progress;rt.nudges=0;}
     if(rt.nudges>=core.MAX_SETTLE_NUDGES) {
-      const paused=core.pauseNode(io,{reason:'No observable progress after repeated continuation requests. Inspect the saved diagnostics, then resume the same root.',code:'NO_PROGRESS',operation:leaf.status==='DRAFT'?'prepare':'evaluate'});
+      // Stop nudging and let the turn end; the root stays ACTIVE and the next user message continues it.
+      if(rt.nudges++>core.MAX_SETTLE_NUDGES)return undefined;
+      const fault=core.failNode(io,{reason:'No observable progress after repeated continuation requests. Inspect the saved diagnostics and change strategy.',code:'NO_PROGRESS',operation:leaf.status==='DRAFT'?'prepare':'evaluate'});
       syncBaseline(ctx);
-      return {entries:[{type:'custom_message' as const,customType:'exitcode-pause',content:errLines(paused),display:true}]};
+      return {entries:[{type:'custom_message' as const,customType:'exitcode-pause',content:errLines(fault),display:true}]};
     }
     rt.nudges++;
     const content=baseline.ok ? `exitcode: ${leafId} remains ${leaf.status} :: ${leaf.vector}. next: ${snap.next}` : baseline.message??errLines(baseline);
@@ -625,11 +626,11 @@ export default function (pi: ExtensionAPI) {
   const usage = () =>
     [
       "exitcode: contract-first recursive execution.",
-      "/exitcode <goal>  enter exitcode mode rooted at your goal (root only; children come from exitcode_child)",
+      "/exitcode <goal>  start a fresh root for this goal; an unfinished root is detached, not deleted",
       "/exitcode approve optional shortcut to approve the root draft and start autonomous work",
-      "/exitcode status [evidence]  show the active contract, vectors, and budgets (evidence adds full E0 evidence)",
-      "/exitcode resume [Gid] [minutes=N] [attempts=N] [evaluators=N]  retry the same paused operation; optional positive grants require this user command",
-      "/exitcode exit    user cancellation only; not successful completion (work on disk is preserved)",
+      "/exitcode status [evidence]  show the active contract, vectors, and budgets, or resumable roots (evidence adds full E0 evidence)",
+      "/exitcode resume [Gid] [minutes=N] [attempts=N] [evaluators=N]  continue a detached or paused root (default: the owner, else the latest detached); grants require this user command",
+      "/exitcode exit    stop and detach the current root; not successful completion (all work and contracts are preserved)",
     ].join("\n");
 
   pi.registerCommand("exitcode", {
@@ -687,9 +688,12 @@ export default function (pi: ExtensionAPI) {
           ctx.ui.notify("exitcode mode is already off.", "info");
           return;
         }
+        const rootId=rt.rootId;
         exitMode(ctx);
         await Promise.all(rt.operations.values());
-        ctx.ui.notify("Cancelled exitcode mode without completing the goal. Contracts on disk are preserved; /exitcode resume re-enters an active root.", "info");
+        // Only this session's own root is detached; another session's root keeps its ownership.
+        const detached=core.detachRoot(core.makeIo(ctx.cwd,{expectedRootId:rootId??null}),{reason:"user exit"});
+        ctx.ui.notify(`Exited exitcode mode without completing the goal.${detached.detached?` Root ${detached.detached} is detached with all its work preserved; /exitcode resume ${detached.detached} continues it.`:""}`, "info");
         return;
       }
       if (sub === "resume") {
@@ -702,13 +706,15 @@ export default function (pi: ExtensionAPI) {
           if(!key || options[key]!==undefined){ctx.ui.notify('Usage: /exitcode resume [Gid] [minutes=N] [attempts=N] [evaluators=N]','warning');return;}
           options[key]=Number(match[2]);
         }
-        if(!options.rootId)options.rootId=core.loadIndex(ctx.cwd).activeRootId??rt.rootId;
+        // Owner first, then this session's own unfinished root, then the core's latest detached root.
+        if(!options.rootId)options.rootId=core.loadIndex(ctx.cwd).activeRootId??(core.resumableRoots(io).some((r:any)=>r.id===rt.rootId)?rt.rootId:undefined);
         const resumed=core.resumeRoot(io,options);
         if(!resumed.ok){ctx.ui.notify(`resume rejected:\n${errLines(resumed)}`,'warning');return;}
-        rt.rootId=resumed.id;
+        rt.rootId=resumed.id;rt.pendingGoal=undefined;rt.handoff=undefined;
         if(!rt.modeOn)enterMode(ctx);else {rt.nudges=0;rt.progress=undefined;persistMode();syncBaseline(ctx);}
         const snap=core.statusSnapshot(io);
-        ctx.ui.notify(`${resumed.warnings?.length?resumed.warnings.join("\n")+"\n":""}Resumed root ${resumed.id}. ${snap.next}${snap.review?`\n\n${snap.review}`:''}`,'info');
+        const notes=[...(resumed.warnings??[]),...(resumed.switchedFrom?[`Detached ${resumed.switchedFrom}; its work is preserved.`]:[]),...(resumed.reconciled??[]).map((r:string)=>`Reconciled with the current workspace: ${r}`)];
+        ctx.ui.notify(`${notes.length?notes.join("\n")+"\n":""}Resumed root ${resumed.id}. ${snap.next}${snap.review?`\n\n${snap.review}`:''}`,'info');
         if(resumed.retry) {
           await withOperation(ctx,undefined,undefined,async operation=>{
             let result;
@@ -724,16 +730,20 @@ export default function (pi: ExtensionAPI) {
         }
         return;
       }
+      // /exitcode <goal> always starts a fresh root. The explicit request is the
+      // authority to detach an unfinished owner; only a live operation prevents it.
       if (rt.modeOn) {
-        ctx.ui.notify(`Already in exitcode mode for root ${rt.rootId ?? "unknown"}. /exitcode exit first.`, "warning");
+        for(const operation of rt.operations.keys())operation.abort();
+        await Promise.all(rt.operations.values());
+      }
+      const detached = core.detachRoot(io, { reason: `new goal: ${text.slice(0, 200)}` });
+      if (!detached.ok) {
+        ctx.ui.notify(`Cannot start a new goal yet:\n${errLines(detached)}`, "warning");
         return;
       }
-      const snap = core.statusSnapshot(io);
-      if (snap.active) {
-        ctx.ui.notify(`Root ${snap.root} is still ${snap.status} on disk. /exitcode resume to re-enter it.`, "warning");
-        return;
-      }
-      enterMode(ctx, text);
+      if (rt.modeOn) exitMode(ctx);
+      enterMode(ctx, text, detached.summary ? core.handoffText(detached.summary) : undefined);
+      if (detached.detached) ctx.ui.notify(`Detached unfinished root ${detached.detached}; /exitcode resume ${detached.detached} continues it later.`, "info");
       ctx.ui.notify(`Entered exitcode mode. Read-only discovery and contract review for: ${text}`, "info");
       if (ctx.isIdle()) {
         pi.sendUserMessage(text);

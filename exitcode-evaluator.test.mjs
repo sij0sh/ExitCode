@@ -3,11 +3,11 @@ import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { test } from 'node:test';
+import { test, baseline, variants, fullSuite } from './test/suite.mjs';
 import * as core from './exitcode-core.mjs';
 import { releasePreparation } from './exitcode-preparation.mjs';
 import { REVIEW_MAX_TOKENS, callReview, parseReviewText, reviewPrompt, validateCritic, criticInput } from './exitcode-quality.mjs';
-import { applyMutations, captureEvaluatorAssets, compileRecipe, lintEvaluators, restoreEvaluatorAssets, runRecipe, sandboxCommand, scanCapabilities, verifyEvaluatorAssets } from './exitcode-evaluator.mjs';
+import { applyMutations, captureEvaluatorAssets, compileRecipe, lintEvaluators, restoreEvaluatorAssets, runRecipe, sandboxCommand, evaluatorCommand, scanCapabilities, verifyEvaluatorAssets } from './exitcode-evaluator.mjs';
 import { structuralReview } from './test/structural-review.mjs';
 
 const read = (cwd, file) => fs.existsSync(path.join(cwd, file)) ? fs.readFileSync(path.join(cwd, file), 'utf8') : null;
@@ -84,8 +84,8 @@ function scenario(t, mode = 'strong') {
   return { cwd, io, calls };
 }
 
-test('semantic: adequate behavioral, structural, and new-feature evaluators reach approval with the candidate unchanged', async t => {
-  for (const mode of ['strong', 'structural', 'new-feature']) await t.test(mode, async t => {
+baseline('semantic: adequate behavioral, structural, and new-feature evaluators reach approval with the candidate unchanged', async t => {
+  for (const mode of variants(['strong', 'structural', 'new-feature'], ['strong'])) await t.test(mode, async t => {
     const { cwd, io, calls } = scenario(t, mode), before = core.digestTree(cwd), r = await core.prepareNode(io);
     assert.equal(r.ok, true, JSON.stringify(r.diagnostics));
     assert.equal(core.digestTree(cwd), before);
@@ -123,11 +123,11 @@ test('semantic: critic concerns are visible warnings and never veto mechanical e
   });
 });
 
-test('semantic: uncovered, unchallenged, or contradictory evaluators never reach approval', async t => {
+baseline('semantic: uncovered, unchallenged, or contradictory evaluators never reach approval', async t => {
   const expected = { 'missing-outcome': 'OUTCOME_MISSING', 'unknown-outcome': 'OUTCOME_UNKNOWN', 'uncovered-outcome': 'OUTCOME_UNCOVERED',
     thin: 'NEGATIVE_EVIDENCE_MISSING', 'thin-new-feature': 'POSITIVE_WITNESS_REQUIRED', 'setup-error': 'CONTROL_SETUP_FAILED',
     'witness-regression': 'REGRESSION_ON_WITNESS', 'runner-error': 'RUNNER_ERROR' };
-  for (const mode of Object.keys(expected)) await t.test(mode, async t => {
+  for (const mode of variants(Object.keys(expected), ['uncovered-outcome', 'thin', 'thin-new-feature'])) await t.test(mode, async t => {
     const { cwd, io } = scenario(t, mode), before = core.digestTree(cwd), r = await core.prepareNode(io);
     assert.equal(r.ok, false, JSON.stringify(r));
     assert.ok(r.diagnostics.length);
@@ -185,7 +185,7 @@ test('witnesses: built-in recipes need no controls; other checks need a passing 
   assert.ok(codes(unchallenged).includes('NEGATIVE_EVIDENCE_MISSING'));
 });
 
-test('witnesses: controls that resemble a reference implementation are rejected before review', async t => {
+baseline('witnesses: controls that resemble a reference implementation are rejected before review', async t => {
   const big = 'x'.repeat(70 * 1024), shared = 'y'.repeat(10 * 1024);
   const control = content => ({ accept: { mutations: [{ kind: 'write_file', path: 'feature', content }] } });
   for (const [label, criteria, outcomes] of [
@@ -272,7 +272,7 @@ test('review: cancellation aborts reviewers, default watchdog bounds slow critic
 // Mechanical discrimination
 // ---------------------------------------------------------------------------
 
-test('discrimination: overfitted rejects, duplicates, false positives, and inconclusive probes never reach review', async t => {
+baseline('discrimination: overfitted rejects, duplicates, false positives, and inconclusive probes never reach review', async t => {
   const overfitted = literal({ controls: { reject: [{ mutations: [{ kind: 'write_file', path: 'feature', content: 'done' }] }] } });
   const cwd = workspace(t);
   const { io, result } = await prepare(cwd, overfitted);
@@ -281,16 +281,18 @@ test('discrimination: overfitted rejects, duplicates, false positives, and incon
   assert.equal(core.draftNode(io, { goal: 'Complete feature', criteria: literal(), revise: 'G1' }).ok, true);
   assert.equal((await core.prepareNode(io)).ok, true, 'repair precedes review without spending execution');
   assert.equal(core.statusSnapshot(io).consumedAttempts, 0);
-  const duplicate = literal(); duplicate[1].requirement = OUTCOMES[0].requirement;
-  assert.ok(codes((await prepare(workspace(t), duplicate)).result).includes('DUPLICATE_CRITERION'));
+  if (fullSuite) {
+    const duplicate = literal(); duplicate[1].requirement = OUTCOMES[0].requirement;
+    assert.ok(codes((await prepare(workspace(t), duplicate)).result).includes('DUPLICATE_CRITERION'));
+  }
   // Empty-target wiring: a check that passes against nothing proves nothing.
   const always = async () => ({ exit: 0, stdout: '', stderr: '', timedOut: false });
   assert.ok(codes((await prepare(workspace(t), [literal()[0], { ...literal()[1], check: custom('always') }], { exec: always })).result).includes('EMPTY_TARGET_PASS'));
   // Inconclusive reject probes and unappliable witnesses are never rejection evidence.
   const observed = async (_cmd, { cwd }) => ({ exit: read(cwd, 'feature') === 'done' ? 0 : 1, stdout: '', stderr: '', timedOut: false });
   const broken = { mutations: [{ kind: 'write_file', path: 'feature', content: 'broken' }] };
-  for (const [label, reject, failure, code] of [['timeout', broken, { timedOut: true }, 'RUNNER_ERROR'], ['error', broken, { error: 'unavailable' }, 'RUNNER_ERROR'],
-    ['unappliable', { mutations: [{ kind: 'replace_text', path: 'feature', from: 'absent', to: 'x' }] }, null, 'CONTROL_SETUP_FAILED']]) {
+  for (const [label, reject, failure, code] of variants([['timeout', broken, { timedOut: true }, 'RUNNER_ERROR'], ['error', broken, { error: 'unavailable' }, 'RUNNER_ERROR'],
+    ['unappliable', { mutations: [{ kind: 'replace_text', path: 'feature', from: 'absent', to: 'x' }] }, null, 'CONTROL_SETUP_FAILED']], [])) {
     const exec = async (cmd, options) => failure && read(options.cwd, 'feature') === 'broken' ? { exit: null, stdout: '', stderr: '', timedOut: false, ...failure } : observed(cmd, options);
     const criteria = [{ id: 'C1', outcome: 'O1', check: custom('observe'), controls: { accept: { mutations: [{ kind: 'write_file', path: 'feature', content: 'done' }] }, reject: [reject] } }, literal()[1]];
     const r = (await prepare(workspace(t), criteria, { exec })).result;
@@ -298,11 +300,13 @@ test('discrimination: overfitted rejects, duplicates, false positives, and incon
     assert.ok(!codes(r).includes('REJECT_NOT_DISCRIMINATED'), `${label}: ${codes(r)}`);
     if (code === 'CONTROL_SETUP_FAILED') assert.ok(codes(r).includes(code), `${label}: ${codes(r)}`);
   }
-  const external = (await prepare(workspace(t), [{ ...literal()[0], check: custom('curl https://example.com') }, literal()[1]])).result;
-  assert.ok(codes(external).includes('EXTERNAL_DEPENDENCY'));
+  if (fullSuite) {
+    const external = (await prepare(workspace(t), [{ ...literal()[0], check: custom('curl https://example.com') }, literal()[1]])).result;
+    assert.ok(codes(external).includes('EXTERNAL_DEPENDENCY'));
+  }
 });
 
-test('discrimination: inconsistent outcomes fail determinism, but harmless stdout variation does not', async t => {
+baseline('discrimination: inconsistent outcomes fail determinism, but harmless stdout variation does not', async t => {
   let n = 0;
   const flaky = async (_cmd, { cwd }) => ({ exit: read(cwd, 'feature') === 'done' && ++n % 2 === 1 ? 0 : 1, stdout: '', stderr: '', timedOut: false });
   const criteria = [{ id: 'C1', outcome: 'O1', check: custom('observe'), controls: { accept: { mutations: [{ kind: 'write_file', path: 'feature', content: 'done' }] }, reject: [{ mutations: [{ kind: 'write_file', path: 'feature', content: 'pending' }] }] } }, literal()[1]];
@@ -312,7 +316,7 @@ test('discrimination: inconsistent outcomes fail determinism, but harmless stdou
   assert.equal((await prepare(workspace(t), criteria, { exec: timing })).result.ok, true);
 });
 
-test('recipes: selectors must be literal and discovered, discovery never executes code, and paths stay confined', async t => {
+baseline('recipes: selectors must be literal and discovered, discovery never executes code, and paths stay confined', async t => {
   const cwd = workspace(t, { 'test/a.test.mjs': "import {test} from 'node:test';test('works',()=>{});",
     'package.json': JSON.stringify({ scripts: { test: 'touch leaked' } }), 'value.json': '{}' });
   const cap = scanCapabilities(cwd);
@@ -348,14 +352,18 @@ test('recipes: selectors must be literal and discovered, discovery never execute
 // Isolation and identity
 // ---------------------------------------------------------------------------
 
-test('isolation: checks cannot see host paths, env, or processes and may write only their own fixture', async t => {
+baseline('isolation: checks cannot see host paths, env, or processes and may write only their own fixture', async t => {
   const cwd = workspace(t);
   process.env.EXITCODE_TEST_SECRET = 'hidden';
   try {
     const js = `const fs=require('node:fs');if(fs.existsSync(${JSON.stringify(cwd)})||process.env.EXITCODE_TEST_SECRET||fs.existsSync('/proc/${process.pid}/root'))process.exit(9);console.log('isolated');`;
     const result = await sandboxCommand('node -e ' + JSON.stringify(js), { cwd, timeoutMs: 5000 });
     assert.equal(result.exit, 0, JSON.stringify(result));
-    assert.equal((await sandboxCommand('echo unsafe', { cwd, timeoutMs: 1000, bwrapPath: '/nonexistent/bwrap' })).exit, null);
+    assert.equal((await sandboxCommand('echo unsafe', { cwd, timeoutMs: 1000, bwrapPath: '/nonexistent/bwrap' })).exit, null, 'strict isolation fails closed');
+    // The default executor degrades to a sanitized disposable host process, with a warning, instead of blocking.
+    const reduced = await evaluatorCommand('test -z "$EXITCODE_TEST_SECRET" && test "$HOME" != ' + JSON.stringify(os.homedir()) + ' && echo reduced', { cwd, timeoutMs: 5000, bwrapPath: '/nonexistent/bwrap' });
+    assert.deepEqual([reduced.exit, reduced.stdout.trim(), reduced.isolation], [0, 'reduced', 'host'], JSON.stringify(reduced));
+    assert.match(reduced.isolationWarning, /reduced isolation: bubblewrap unavailable/);
     assert.notEqual((await sandboxCommand('echo mutation > feature', { cwd, timeoutMs: 1000 })).exit, 0);
     assert.equal(read(cwd, 'feature'), 'pending');
     const huge = await sandboxCommand("node -e \"process.stdout.write('x'.repeat(1000000))\"", { cwd, timeoutMs: 5000 });
@@ -368,7 +376,7 @@ test('isolation: checks cannot see host paths, env, or processes and may write o
   assert.equal((await runRecipe({ kind: 'existing_test', path: 'writes.test.mjs', selector: 'writes output' }, { cwd })).exit, 0);
 });
 
-test('identity: stale candidates, environments, or evidence invalidate approval; fresh evaluation bypasses the cache', async t => {
+baseline('identity: stale candidates, environments, or evidence invalidate approval; fresh evaluation bypasses the cache', async t => {
   const cwd = workspace(t);
   const { io, result } = await prepare(cwd, literal());
   assert.equal(result.ok, true);
@@ -429,7 +437,7 @@ test('assets: live repository tests and helpers change while sealed copies remai
   assert.equal(read(cwd,'checks/accept.mjs'),'process.exit(0);','evaluation leaves product tests alone');
 });
 
-test('assets: the evaluator package closure stays frozen while approved product dependencies change', async t => {
+baseline('assets: the evaluator package closure stays frozen while approved product dependencies change', async t => {
   const { cwd, io } = await sealed(t, {
     'package.json': JSON.stringify({ dependencies: { product: '1' }, devDependencies: { verifier: '1' } }),
     'node_modules/product/package.json': '{"name":"product","version":"1"}', 'node_modules/product/value.mjs': 'export const value=1;',
@@ -442,16 +450,16 @@ test('assets: the evaluator package closure stays frozen while approved product 
   fs.writeFileSync(path.join(cwd, 'node_modules/product/value.mjs'), 'export const value=2;');
   fs.writeFileSync(path.join(cwd, 'package.json'), JSON.stringify({ dependencies: { product: '2' }, devDependencies: { verifier: '1' } }));
   verifyEvaluatorAssets(cwd, bundle.assetsDirectory, bundle.assets);
+  // Live evaluator drift is re-overlaid from the sealed copy and reproved, never a pause.
   fs.writeFileSync(path.join(cwd, 'node_modules/shared/assert.mjs'), 'export const assertion=0;');
-  assert.equal((await core.evaluateNode(io)).pause.code, 'EVALUATOR_DRIFT');
-  fs.writeFileSync(path.join(cwd, 'node_modules/shared/assert.mjs'), 'export const assertion=1;');
-  assert.equal(core.resumeRoot(io).ok, true);
-  // An optional dependency becoming available changes evaluator resolution.
+  assert.equal((await core.evaluateNode(io)).status, 'ACTIVE');
+  assert.equal(fs.readFileSync(path.join(cwd, 'node_modules/shared/assert.mjs'), 'utf8'), 'export const assertion=1;');
+  assert.equal(core.loadRoot(io, 'G1').acceptanceRestorations.length, 1);
+  // An optional dependency becoming available changes evaluator resolution; it is removed the same way.
   fs.mkdirSync(path.join(cwd, 'node_modules/optional'));
   fs.writeFileSync(path.join(cwd, 'node_modules/optional/package.json'), '{"name":"optional"}');
-  assert.equal((await core.evaluateNode(io)).pause.code, 'EVALUATOR_DRIFT');
-  fs.rmSync(path.join(cwd, 'node_modules/optional'), { recursive: true });
-  assert.equal(core.resumeRoot(io).ok, true);
+  assert.equal((await core.evaluateNode(io)).status, 'ACTIVE');
+  assert.equal(fs.existsSync(path.join(cwd, 'node_modules/optional')), false);
   fs.writeFileSync(path.join(cwd, 'feature'), 'done');
   assert.equal((await core.evaluateNode(io)).status, 'PASS');
 });

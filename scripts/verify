@@ -1,8 +1,13 @@
 #!/bin/sh
 set -eu
 cd "$(dirname "$0")/.."
+suite=${1:-baseline}
+case "$suite" in
+  baseline|full) ;;
+  *) echo "Usage: scripts/verify [baseline|full]" >&2; exit 2 ;;
+esac
 for file in exitcode-operation.mjs exitcode-core.mjs exitcode-evaluator.mjs exitcode-preparation.mjs exitcode-quality.mjs exitcode-parallel.mjs exitcode-workers.mjs \
-  exitcode.ts scripts/benchmark-evaluator.mjs scripts/smoke-workers.mjs ./*.test.mjs test/*.mjs; do
+  exitcode.ts scripts/*.mjs ./*.test.mjs test/*.mjs; do
   node --check "$file"
 done
-npm test
+if [ "$suite" = full ]; then npm run test:full; else npm test; fi

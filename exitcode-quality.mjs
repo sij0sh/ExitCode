@@ -48,6 +48,23 @@ export function parseReviewText(value) {
   throw invalid(`invalid reviewer JSON: ${str.slice(0, 120) || 'empty response'}`);
 }
 
+/** Decode the isolated model response; validateCritic judges its advisory schema. */
+export function parseReviewResponse(result) {
+  if (result.stopReason !== 'stop' && result.stopReason !== 'toolUse')
+    throw Object.assign(new Error(result.errorMessage ?? `review stopped: ${result.stopReason}`),
+      result.stopReason === 'aborted' ? { code: 'CANCELLED' } : result.stopReason === 'length' ? { code: 'REVIEW_TOO_LARGE' } : {});
+  const call = (result.content ?? []).find(b => b?.type === 'toolCall' && b?.name === REVIEW_TOOL_NAME);
+  if (call) {
+    const args = typeof call.arguments === 'string' ? parseReviewText(call.arguments) : call.arguments;
+    const sized = JSON.stringify(args ?? null);
+    if (!sized || sized.length > RESPONSE_BYTES) throw invalid('review output exceeds bounded response');
+    return args;
+  }
+  const text = (result.content ?? []).filter(b => b.type === 'text').map(b => b.text).join('');
+  if (text.length > RESPONSE_BYTES) throw invalid('review output exceeds bounded response');
+  return parseReviewText(text);
+}
+
 /**
  * Validate and normalize advisory concerns. They are shown in the plan
  * and never veto deterministic preparation. Empty concerns means PASS.

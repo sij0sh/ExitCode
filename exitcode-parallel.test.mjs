@@ -4,7 +4,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { test } from 'node:test';
+import { test, baseline } from './test/suite.mjs';
 import * as core from './exitcode-core.mjs';
 import { executionHorizon, captureCandidate, materialize, preflightExecution } from './exitcode-parallel.mjs';
 import { releasePreparation } from './exitcode-preparation.mjs';
@@ -75,7 +75,7 @@ const implement = async handle => {
   write(handle.cwd,file,'done');
 };
 
-test('parallel: execution capability failures prevent approval and preflight starts no workers or Git candidates', async t=>{
+baseline('parallel: execution capability failures prevent approval and preflight starts no workers or Git candidates', async t=>{
   const f=fixture(t),before=core.digestTree(f.cwd);
   delete f.io.workerBackend;
   const failed=await core.prepareNode(f.io);
@@ -119,7 +119,7 @@ test('parallel: Git preflight accepts supported option forms and rejects missing
   await ready;elapsed=10_000;t.mock.timers.tick(10_000);await rejected;
 });
 
-test('parallel: DAG ownership and cycles are structural; horizons include transitive prerequisites and regressions', t => {
+baseline('parallel: DAG ownership and cycles are structural; horizons include transitive prerequisites and regressions', t => {
   for (const [name, execution, error] of [
     ['forward references',graph,null],
     ['cycle',graph.map(s => s.id === 'S1' ? {...s,after:['C3']} : s),/cycle/],
@@ -139,7 +139,7 @@ test('parallel: DAG ownership and cycles are structural; horizons include transi
   const f=fixture(t,{policy:{maxParallelWorkers:1.5}}); assert.equal(f.drafted.ok,false);
 });
 
-test('parallel: independent workers overlap; only integrated fresh evidence unlocks dependents and canonical PASS', async t => {
+baseline('parallel: independent workers overlap; only integrated fresh evidence unlocks dependents and canonical PASS', async t => {
   const f=fixture(t); await seal(f);
   const approved=core.loadRoot(f.io,'G1'), sealed=fs.readFileSync(core.sealedFile(f.cwd,'G1'),'utf8');
   let release, entered=0;
@@ -163,7 +163,7 @@ test('parallel: independent workers overlap; only integrated fresh evidence unlo
   for(const dir of metadata){assert.ok(fs.lstatSync(dir).isDirectory());assert.equal(fs.existsSync(path.join(dir,'objects','info','alternates')),false);}
 });
 
-test('parallel: semantic reconciliation is evaluated and charged; canonical edits and the user index survive', async t => {
+baseline('parallel: semantic reconciliation is evaluated and charged; canonical edits and the user index survive', async t => {
   const f=fixture(t,{semantic:true});
   execFileSync('git',['init','--quiet',f.cwd]);
   execFileSync('git',['-C',f.cwd,'add','first']);
@@ -196,13 +196,13 @@ test('parallel: textual conflicts use an isolated reconciler and reject unresolv
     if(h.id!=='S3')write(h.cwd,'shared',h.id);
   });
   const result=await core.evaluateNode(f.io);
-  if(leaveMarkers){assert.equal(result.pause?.code,'NO_PROGRESS',JSON.stringify(result));assert.equal(core.loadRoot(f.io,'G1').outcome,undefined);assert.equal(read(f.cwd,'shared'),'initial');return;}
+  if(leaveMarkers){assert.deepEqual([result.status,result.fault?.code],['ACTIVE','NO_PROGRESS'],JSON.stringify(result));assert.equal(core.loadRoot(f.io,'G1').outcome,undefined);assert.equal(read(f.cwd,'shared'),'initial');return;}
   assert.equal(result.status,'PASS',JSON.stringify(result));
   assert.equal(read(f.cwd,'shared'),'combined'); assert.equal(core.loadRoot(f.io,'G1').consumedAttempts,4);
   });
 });
 
-test('parallel: interruption, budget exhaustion, and worker failure cannot grant PASS or reset charged work', async t => {
+baseline('parallel: interruption, budget exhaustion, and worker failure cannot grant PASS or reset charged work', async t => {
   for(const mode of ['runner-error','worker-error','budget'])await t.test(mode,async t=>{
     const f=fixture(t,{policy:mode==='budget'?{maxTotalAttempts:1}:undefined}); await seal(f);
     let fail=true;
@@ -213,11 +213,12 @@ test('parallel: interruption, budget exhaustion, and worker failure cannot grant
       if(mode==='worker-error'&&fail){fail=false;throw Object.assign(new Error('worker unavailable'),{code:'WORKER_FAILED'});}
     });
     const result=await core.evaluateNode(f.io);
-    assert.equal(result.status,'PAUSED',JSON.stringify(result));
+    // Only an explicit budget needs the user; runner and worker faults stay ACTIVE for a plain retry.
+    assert.equal(result.status,mode==='budget'?'PAUSED':'ACTIVE',JSON.stringify(result));
     const paused=core.loadRoot(f.io,'G1'); assert.equal(paused.outcome,undefined);
     assert.equal(read(f.cwd,'first'),'pending','canonical candidate remains unchanged during speculative work');
     f.io.exec=ordinary; f.fault.run=false;
-    assert.equal(core.resumeRoot(f.io,mode==='budget'?{maxTotalAttempts:3}:{}).ok,true);
+    if(mode==='budget')assert.equal(core.resumeRoot(f.io,{maxTotalAttempts:3}).ok,true);
     const resumed=await core.evaluateNode(f.io);
     assert.equal(resumed.status,'PASS',JSON.stringify(resumed));
     const root=core.loadRoot(f.io,'G1'); assert.equal(root.consumedAttempts,3);
@@ -238,9 +239,8 @@ test('parallel: interrupted canonical reconciliation merges subsequent edits aga
     if(h.id==='S3') {write(f.cwd,'first','user-first');write(f.cwd,'earlier-note','preserve this too');}
   });
   const result=await core.evaluateNode(f.io);
-  assert.equal(result.pause?.code,'CANDIDATE_MUTATED',JSON.stringify(result));
+  assert.deepEqual([result.status,result.fault?.code],['ACTIVE','CANDIDATE_MUTATED'],JSON.stringify(result));
   assert.equal(core.loadRoot(f.io,'G1').outcome,undefined);
-  assert.equal(core.resumeRoot(f.io).ok,true);
   const final=await core.evaluateNode(f.io);
   assert.equal(final.status,'PASS',JSON.stringify(final));
   assert.equal(read(f.cwd,'earlier-note'),'preserve this too');
@@ -265,10 +265,9 @@ test('parallel: the last charged candidate can retry inconclusive proof without 
   const execution=[{id:'S1',objective:'Finish all three artifacts',verify:['C1','C2','C3']}];
   const f=fixture(t,{execution,policy:{maxTotalAttempts:1}}); await seal(f);
   backend(f,async h=>{for(const file of ['first','second','last'])write(h.cwd,file,'done');f.fault.run=true;});
-  assert.equal((await core.evaluateNode(f.io)).pause?.code,'RUNNER_ERROR');
+  assert.equal((await core.evaluateNode(f.io)).fault?.code,'RUNNER_ERROR');
   assert.equal(core.loadRoot(f.io,'G1').consumedAttempts,1);
   f.fault.run=false;
-  assert.equal(core.resumeRoot(f.io).ok,true);
   const result=await core.evaluateNode(f.io);
   assert.equal(result.status,'PASS',JSON.stringify(result));
   assert.equal(core.loadRoot(f.io,'G1').consumedAttempts,1);

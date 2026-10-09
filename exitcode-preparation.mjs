@@ -1,7 +1,7 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { callReview, validateCritic, criticInput } from './exitcode-quality.mjs';
-import { BUILTIN_RECIPES, candidateIdentity, digest, diagnostic, inventory, applyMutations, auditCriteria, positiveWitness, lintEvaluators, scanCapabilities, fixtureDirectory, sandboxCommand, installEvaluatorAssets, verifyEvaluatorAssets } from './exitcode-evaluator.mjs';
+import { BUILTIN_RECIPES, candidateIdentity, digest, diagnostic, inventory, applyMutations, auditCriteria, positiveWitness, lintEvaluators, scanCapabilities, fixtureDirectory, sandboxCommand, evaluatorCommand, installEvaluatorAssets, verifyEvaluatorAssets } from './exitcode-evaluator.mjs';
 import { ensureRunning, operationError } from './exitcode-operation.mjs';
 
 export function emptyMetrics() {
@@ -87,9 +87,10 @@ export async function prepareGate(draft, {cwd,exec,runCheck,defaultTimeoutMs,env
     }
     session=sessionFor(cwd,identity,maxBytes,metrics,signal,options);
     if(candidateIdentity(session.base,options)!==candidateDigest)throw operationError('CANDIDATE_MUTATED','Candidate changed while copying preparation base');
-    if(exec===sandboxCommand && draft.criteria.some(c=>!BUILTIN_RECIPES.includes(c.check.recipe.kind))) {
+    if((exec===sandboxCommand || exec===evaluatorCommand) && draft.criteria.some(c=>!BUILTIN_RECIPES.includes(c.check.recipe.kind))) {
       const runtime=await execute('true',{cwd:session.base,timeoutMs:defaultTimeoutMs,signal});
       if(runtime.error || runtime.timedOut || runtime.exit!==0)throw operationError(runtime.errorCode ?? 'ISOLATION_UNAVAILABLE',runtime.error ?? runtime.stderr ?? 'isolated runtime unavailable');
+      if(runtime.isolationWarning)warnings.push(runtime.isolationWarning);
     }
   } catch(e) {releasePreparation(cwd);diagnostics.push(boundaryDiagnostic(e,'preflight'));return finish();}
   const behaviors=draft.criteria.filter(c=>(c.type??'behavior')==='behavior');

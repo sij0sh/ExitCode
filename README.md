@@ -49,11 +49,11 @@ No production npm dependency is added.
 A compatible Pi installation and Node runtime are required.
 Parallel execution also requires Git with `merge-tree --write-tree --merge-base` support. E0 checks this option form and verifies that the Pi worker backend can construct its runtime and use the selected model before the plan reaches approval; it creates no workers or Git candidates.
 
-**Executable evaluation requires Linux bubblewrap and usable unprivileged namespaces.**
-Install bubblewrap with your system package manager before using executable recipes.
-ExitCode never installs it or falls back to host execution.
+**Executable evaluation prefers Linux bubblewrap with usable unprivileged namespaces.**
+Install bubblewrap with your system package manager for the full isolation boundary; ExitCode never installs it.
+Without it, checks degrade to reduced isolation: sanitized host processes in disposable copies, with a preparation warning.
+Set `EXITCODE_STRICT_ISOLATION=1` to fail closed instead; unavailable isolation is then a runner error, not evidence of a defect.
 Built-in file and JSON recipes do not need bubblewrap.
-Unavailable isolation is a runner error, not evidence of a detected defect.
 
 ```text
 /exitcode Add password reset via emailed tokens
@@ -63,8 +63,9 @@ Unavailable isolation is a runner error, not evidence of a detected defect.
 | --- | --- |
 | `/exitcode approve` | Approve and seal the exact validated plan. |
 | `/exitcode status [evidence]` | Show phase, criteria, budgets, diagnostics, and next action; `evidence` adds the full contract, E0 evidence, digests, and metrics. |
-| `/exitcode exit` | Cancel enforcement without claiming success or deleting work. |
-| `/exitcode resume [Gid]` | Resume the same root; draft repair returns control to the agent, while retry-safe sealed evaluation reruns. |
+| `/exitcode <goal>` | Always start a fresh root. An unfinished root is detached with all its state, never deleted. |
+| `/exitcode exit` | Stop and detach the current root without claiming success or deleting work. |
+| `/exitcode resume [Gid]` | Continue a detached or paused root, switching workspace ownership if needed. Without an id: the owner, then this session's root, then the most recently detached one. |
 | `/exitcode resume minutes=N attempts=N evaluators=N` | Record explicit positive execution or evaluator-construction grants and resume. |
 
 Plain-English approval also works.
@@ -81,15 +82,15 @@ Preparation infrastructure failures leave an unsealed root ACTIVE with a DRAFT a
 Stale candidate, environment, or evaluator evidence requires preparation and approval again.
 `exitcode_evaluate` runs sealed checks fresh.
 `exitcode_child` proposes one reduction of a failed parent criterion.
-`exitcode_block` preserves a concrete external authority, infrastructure, budget, or viable-path blocker as a resumable root pause.
+`exitcode_block` requests only what the user or the external world must supply: `REQUIREMENT_MISSING`, `CREDENTIAL_MISSING`, `AUTHORIZATION_MISSING`, or `EXTERNAL_BLOCKED`. Runner, Git, worker, configuration, and budget conditions are supervisor-owned; the agent cannot pause on them.
 A draft whose diagnostics are all agent-repairable (lint, witness, or discrimination findings) cannot be blocked; the supervisor rejects the call and returns the existing next action.
 Acceptance-asset edits use `exitcode_draft`; repository tests are mutable product content after sealing.
-Only a genuinely declined child path uses `NO_PATH` to withdraw child edits and rerun its ancestors.
+Only a genuinely declined child path uses `NO_PATH` to withdraw child edits and rerun its ancestors; a root cannot use it.
 `exitcode_status` shows operational state; `detail: "evidence"` adds full mechanics for debugging.
 Each agent turn receives only the five-sentence protocol and a status summary capped at 4 KiB.
 That summary never includes checks, controls, evaluator evidence, or metrics.
 Only root PASS automatically exits mode, and it is the only terminal root state.
-PAUSED roots keep enforcement on until user cancellation.
+PAUSED means only user or external intervention can continue; PAUSED roots keep enforcement on until the user resumes or exits.
 BLOCKED applies only to a withdrawn child, which suppresses repeating the same child against unchanged evidence.
 
 ## Before sealing
@@ -109,7 +110,7 @@ On any difference, it saves the changed and added files under `.exitcode/discard
 Evidence prepared from a changed candidate never reaches approval.
 The latest three discarded change sets are kept.
 This applies to every source, including your own edits during review.
-To change product files before approval, use `/exitcode exit`, edit, then `/exitcode resume` and review a fresh preparation.
+To change product files before approval, use `/exitcode exit`, edit, then `/exitcode resume`; the reattached root drops stale preparation and approval, and you review a fresh preparation.
 To author or revise contract-specific tests before sealing, submit their bytes through `exitcode_draft.assets`; the supervisor writes them under `.exitcode/`, and the candidate remains unchanged. Asset revisions invalidate preparation and approval, requiring fresh validation.
 Sealing releases the baseline, and the agent then implements normally.
 
@@ -137,7 +138,7 @@ At seal, Git plumbing captures the exact approved candidate, including uncommitt
 
 The worker horizon contains its own criteria, all transitive prerequisites, and every regression criterion. A worker's fresh PASS records `WORKER_VERIFIED`. It becomes `INTEGRATED` only after Git reconciliation and fresh evaluation of the combined candidate. Only that integrated evidence unlocks dependent slices. Clean passing merges need no agent; textual conflicts and behavioral failures use an isolated reconciliation session with the exact candidate tips and evaluator feedback.
 
-Root completion requires every slice integrated, no outstanding workers or reconciliation, a fresh full integration PASS, reconciliation with the latest canonical workspace, and a fresh full PASS there. Concurrent canonical edits enter a three-way merge; edits detected during publication cause a resumable pause. Changed worker candidates and agent reconciliation consume shared attempts; unchanged reruns and mechanical integration do not. Recovery preserves candidate artifacts, charged attempts, and the original deadline while requiring fresh proof. `/exitcode exit` aborts and disposes worker sessions and preserves their saved work.
+Root completion requires every slice integrated, no outstanding workers or reconciliation, a fresh full integration PASS, reconciliation with the latest canonical workspace, and a fresh full PASS there. Concurrent canonical edits enter a three-way merge; edits detected during publication record a retry fault on the ACTIVE root. Changed worker candidates and agent reconciliation consume shared attempts; unchanged reruns and mechanical integration do not. Recovery preserves candidate artifacts, charged attempts, and the original deadline while requiring fresh proof. `/exitcode exit` aborts and disposes worker sessions and preserves their saved work.
 
 Contracts without `execution` retain serial repair and focused recursion. Legacy `sequence` retains its cumulative ordered proof behavior and cannot be combined with `execution`.
 
@@ -185,7 +186,8 @@ No HTTP, JSON Schema, or non-Node runner integration is included.
 | Prove new behavior before implementation | A contract-owned `test_asset` with a minimal positive witness; focused `command_exit` or `custom_command` is also supported |
 | Require literal artifact content | `file_contains`; source text alone does not prove runtime behavior |
 | Preserve the discovered npm test suite | `test_suite` as a regression criterion; it runs `npm test`, not `scripts/verify` |
-| Run this repository's full verification | `{"kind":"command_exit","command":"sh","args":["scripts/verify"]}` or `{"kind":"custom_command","command":"sh scripts/verify"}` |
+| Run this repository's baseline verification | `{"kind":"command_exit","command":"sh","args":["scripts/verify"]}` or `{"kind":"custom_command","command":"sh scripts/verify"}` |
+| Run all verification and fault variants | `{"kind":"command_exit","command":"sh","args":["scripts/verify-full"]}` |
 
 `command_exit.command` must be an executable basename: `./scripts/verify` is invalid.
 Use `sh` with `scripts/verify` in `args`, or a `custom_command` shell string when shell syntax is needed. For custom commands, declare assertion runners and tests in `check.assets`; add `test_suite` when the conventional suite surface is part of the approved evaluator. Referenced scripts are not inferred from shell text.
@@ -290,7 +292,7 @@ Product source remains mutable merely because a check imports or executes it.
 Automatic discovery cannot infer arbitrary shell or import graphs; declare unconventional suite helpers and runners explicitly.
 Each executable check receives the sealed copies read-only after fixture setup.
 Live repository test edits, additions, and deletions remain in the product candidate and never replace the evaluator copies.
-Tampering with supervisor-owned sealed copies pauses evaluation. Runtime and dependency drift still invalidate evidence; user resume restores only that runtime boundary, preserving product tests.
+Tampering with supervisor-owned sealed copies pauses evaluation. Live drift of pinned evaluator runtime files is re-overlaid from the sealed copies before every evaluation and reproved, preserving product tests.
 
 Use `specificationPaths` to include small referenced Markdown plans as critic context.
 Missing specifications are omitted; they never block mechanical validation.
@@ -336,7 +338,7 @@ Mechanical validation and execution strengthen the evidence; they do not turn ap
 
 ## Isolation and preservation
 
-Every default executable probe uses a fail-closed bubblewrap runner.
+Every default executable probe uses a bubblewrap runner; without bubblewrap it degrades to reduced isolation unless strict isolation is set.
 This includes custom shell, preparation, completion, and parent reruns.
 The runner exposes system runtime trees and an independent workspace, not host home, credentials, sockets, or the real candidate path.
 It clears inherited environment variables and mounts private `/proc`, `/dev`, and `/tmp`.
@@ -361,6 +363,7 @@ Large fixtures and dependency copies can still consume substantial disk space.
 
 The extension itself is trusted code running with host permissions.
 Bubblewrap is a boundary for probes, not a claim against a compromised kernel or trusted extension.
+Reduced isolation runs `/bin/sh` in the disposable copy with only `PATH`, a private `HOME`/`TMPDIR`, and `LANG`; candidate and evaluator identities are still verified around every evaluation, but there is no OS boundary.
 This runner is not a general-purpose hostile-workload service or CPU/memory quota manager.
 Agent tools are host tools in every phase. ExitCode verifies candidate and supervisor state, not what those tools can reach.
 
@@ -372,7 +375,7 @@ Passing a child reruns the parent; it never closes the parent by inference.
 Conclusive ancestor regressions trigger restoration and fresh reevaluation.
 Runner ERROR, timeout, and cancellation are inconclusive and preserve useful edits and the active stack.
 A declined child must restore its exact verified pre-child checkpoint before ancestor reevaluation.
-A missing or damaged checkpoint pauses without an arbitrary fallback.
+A missing or damaged checkpoint pauses without an arbitrary fallback; continuing could lose work.
 Rejected implementation attempts still count.
 Fresh completion and boundary parent reruns bypass all preparation caches.
 Sealed contracts cannot be revised or weakened.
@@ -382,11 +385,14 @@ A changed sealed digest blocks execution.
 | --- | --- |
 | `localRepairs` | 2 changed-candidate attempts before ordinary decomposition |
 | `maxDepth` | 3 levels below the root |
-| `maxTotalAttempts` | 12 changed-candidate attempts across the tree |
-| `deadlineMinutes` | 60 execution minutes from successful root seal |
+| `maxTotalAttempts` | 12 changed-candidate attempts across the tree (soft) |
+| `deadlineMinutes` | 60 execution minutes from successful root seal (soft) |
 | `evalTimeoutSeconds` | 900-second initial executable preparation watchdog |
-| `evaluatorAttempts` | 6 substantive preparation proposals per node |
+| `evaluatorAttempts` | 6 substantive preparation proposals per node (soft) |
 
+Defaults for attempts, time, and evaluator proposals are soft thresholds: crossing one adds a strategy check to the next action, and work continues.
+A default stops work only at the safety ceiling of four times its threshold.
+A value set explicitly in the draft policy is a hard limit, listed in the reviewed plan and bound by approval.
 Initial operational-policy corrections are allowed before first approval.
 Changing a draft or its policy invalidates affected preparation and approval.
 Approval locks policy even if an unsealed contract is later revised.
@@ -399,14 +405,26 @@ Implementation reservations are persisted before executable or snapshot work.
 Substantive construction reservations survive interrupted operations.
 Confirmed infrastructure failures are recorded without charging a substantive evaluator proposal.
 
-### Pause and resume
+### Faults, pauses, and resume
 
+Every failure has one disposition:
+
+| Disposition | Examples | Root |
+| --- | --- | --- |
+| `retry` | runner, isolation, Git, worker, cancellation, candidate or environment changed mid-operation | stays ACTIVE; run the operation again |
+| `repair` | no progress, evaluator drift the agent must fix | stays ACTIVE; the fault leads the next action |
+| `intervention` | missing requirement, credential, authorization, or external action; hard budget; damaged supervisor evidence; failed restoration | PAUSED until `/exitcode resume` |
+
+A recorded fault appears as `last issue` in status and the next action, and the next successful operation clears it.
+That something failed is not by itself a reason to transfer control to the user.
 A pause preserves root identity, original request, phase, stack, approval, bundle, useful edits, diagnostics, and cumulative counters.
 Pauses record a recovery kind: `retry`, `repair`, `grant`, or `external`. `/exitcode resume` replays only explicitly retry-safe sealed operations, including evaluation after an explicit budget grant. An unsealed DRAFT returns control to the agent and never automatically replays preparation.
 Draft revision and explicit preparation also recover legacy preparation pauses on an unsealed root. Recovery retains pause history, diagnostics, approval records, policy, grants, and cumulative budgets, and grants no product-write authority.
 Only one supervisor operation owns a workspace at a time.
-Reload or another session cannot clear a live operation's lock.
-A transcript must explicitly adopt another active workspace root through the resume command.
+Reload or another session cannot clear a live operation's lock; a lock left by a dead or earlier process, or a malformed one, is removed automatically.
+At most one root owns the workspace. `/exitcode <goal>`, `/exitcode exit`, and `/exitcode resume Gid` detach the current owner without deleting state; a stale transcript cannot act on a detached root.
+A new goal's discovery receives a compact summary of the detached root, and the current workspace is authoritative.
+A reattached root reconciles with the current workspace instead of rewinding it: unsealed roots drop stale preparation and approval; sealed roots evaluate the current tree fresh, and verdicts recorded for an older tree never trigger regression restoration.
 Independent workers start only for approved execution graphs. Installation, credential acquisition, and authority grants remain external prerequisites.
 
 Execution exhaustion requires `/exitcode resume minutes=N` or `/exitcode resume attempts=N`.
@@ -415,7 +433,7 @@ Values are positive additions, not replacement limits.
 Time additions extend the later of the previous deadline and the grant time.
 Grants are user-command records separate from sealed policy.
 They never reset consumed attempts, execution start, acceptance, or prior evidence.
-Contradictory acceptance, missing authority, damaged trusted evidence, or unavailable isolation still require focused intervention.
+Contradictory acceptance, missing authority, or damaged trusted evidence still require focused intervention.
 Fixing an incorrect sealed evaluator requires a superseding contract and fresh user approval, not resume-time editing.
 
 ### Store generations
@@ -441,6 +459,15 @@ node scripts/benchmark-evaluator.mjs
 ```
 
 The test suite is organized around the product invariants in [INVARIANTS.md](INVARIANTS.md).
+`npm test` runs 45 baseline invariant tests, with representative nested scenarios.
+`./scripts/verify` checks syntax and runs that baseline for normal development and E0.
+`npm run test:full` runs every invariant and fault matrix; `./scripts/verify-full` adds syntax checks.
+Use the full suite for CI, release checks, and changes to recovery or isolation boundaries.
+Direct `node --test` invocations also run the full suite unless `EXITCODE_TEST_SUITE=baseline` is set.
+Baseline tests are marked with `baseline()` in each test file; extended tests use `test()`.
+`variants()` retains complete matrices in the full suite and chooses representative cases in the baseline.
+State-transition tests use [prepared fixtures](test/prepared-fixture.mjs) to avoid repeating E0;
+the lifecycle, evaluator quality, sandbox, and frozen-asset tests exercise real preparation.
 
 The benchmark reports cold, warm, selective-repair, and fresh-evaluation counts and timings as JSON.
 One content-keyed base snapshot supports independent derivatives.
@@ -457,7 +484,7 @@ The benchmark demonstrates operation-count savings, not a universal latency perc
 ## Remaining limits
 
 Long-running work still requires a live Pi session.
-The adapter sends at most three continuation nudges without observable progress, then records an explicit resumable pause.
+The adapter sends at most three continuation nudges without observable progress, then records a NO_PROGRESS fault and lets the turn end; the next user message continues the same ACTIVE root.
 There is no external scheduler, parallel worker pool, exhaustive semantic test writer, or universal repair engine.
 Useful criteria, ambiguity selection, and child decomposition remain model-dependent.
 Keep the original objective above extension housekeeping and commit reminders.

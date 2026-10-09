@@ -286,23 +286,11 @@ function sandboxArgs(cwd, {writable = false, readOnlyPaths = []} = {}) {
   return args;
 }
 
-export async function sandboxCommand(command, {cwd,timeoutMs = 900000,bwrapPath = '/usr/bin/bwrap',writable = false,signal,deadlineAt,nowMs=Date.now,readOnlyPaths = []} = {}) {
-  const started = Date.now();
-  let operation, args;
-  try {
-    ensureRunning(signal);
-    operation = operationSignal(signal, {timeoutMs,deadlineAt,nowMs});
-    fs.accessSync(bwrapPath,fs.constants.X_OK);
-    args = sandboxArgs(cwd,{writable,readOnlyPaths});
-    ensureRunning(operation.signal);
-  } catch(e) {
-    operation?.dispose();
-    return {exit:null,stdout:'',stderr:'',timedOut:false,error:e.message,errorCode:e.code ?? 'ISOLATION_UNAVAILABLE',durationMs:Date.now()-started};
-  }
-  const wrapper = 'mkdir -p /tmp/bin; printf \'#!/bin/sh\nexec /runtime/node /runtime/npm/bin/npm-cli.js "$@"\n\' > /tmp/bin/npm; chmod 700 /tmp/bin/npm; export PATH=/tmp/bin:$PATH; ';
+/** Run one process group to completion; resolve only after it has exited. */
+function collectProcess(file, args, {cwd, env, operation, started, isolationFailure}) {
   return new Promise(resolve => {
     let child;
-    try{child = spawn(bwrapPath,[...args,'/bin/sh','-c',wrapper+command],{stdio:['ignore','pipe','pipe'],env:{},detached:true});}catch(e){operation.dispose();resolve({exit:null,stdout:'',stderr:'',timedOut:false,error:e.message,errorCode:'ISOLATION_UNAVAILABLE'});return;}
+    try{child = spawn(file,args,{cwd,stdio:['ignore','pipe','pipe'],env,detached:true});}catch(e){operation.dispose();resolve({exit:null,stdout:'',stderr:'',timedOut:false,error:e.message,errorCode:'ISOLATION_UNAVAILABLE'});return;}
     let stdout=Buffer.alloc(0),stderr=Buffer.alloc(0),truncated=false,done=false,stopped,spawnError;
     const append=(buf,x)=>{const result=Buffer.concat([buf,x]);if(result.length>OUTPUT_CAP){truncated=true;return result.subarray(result.length-OUTPUT_CAP);}return result;};
     child.stdout.on('data',x=>stdout=append(stdout,x));child.stderr.on('data',x=>stderr=append(stderr,x));
@@ -318,8 +306,65 @@ export async function sandboxCommand(command, {cwd,timeoutMs = 900000,bwrapPath 
     child.on('error',e=>{spawnError=e;});
     child.on('close',(exit,termSignal)=>finish(spawnError?{exit:null,timedOut:false,error:`isolation unavailable: ${spawnError.message}`,errorCode:'ISOLATION_UNAVAILABLE'}:stopped
       ? {exit:null,timedOut:stopped.code==='CHECK_TIMEOUT',error:stopped.message,errorCode:stopped.code}
-      : {exit,timedOut:false,...(termSignal||/^bwrap:/m.test(stderr.toString())?{error:`isolation failed: ${stderr.toString()||termSignal}`,errorCode:'ISOLATION_UNAVAILABLE'}:{})}));
+      : {exit,timedOut:false,...(isolationFailure?.(termSignal,stderr.toString())??{})}));
   });
+}
+
+export async function sandboxCommand(command, {cwd,timeoutMs = 900000,bwrapPath = '/usr/bin/bwrap',writable = false,signal,deadlineAt,nowMs=Date.now,readOnlyPaths = []} = {}) {
+  const started = Date.now();
+  let operation, args;
+  try {
+    ensureRunning(signal);
+    operation = operationSignal(signal, {timeoutMs,deadlineAt,nowMs});
+    try { fs.accessSync(bwrapPath,fs.constants.X_OK); }
+    catch (e) { throw operationError('ISOLATION_UNAVAILABLE', `bubblewrap unavailable: ${e.message}`); }
+    args = sandboxArgs(cwd,{writable,readOnlyPaths});
+    ensureRunning(operation.signal);
+  } catch(e) {
+    operation?.dispose();
+    return {exit:null,stdout:'',stderr:'',timedOut:false,error:e.message,errorCode:e.code ?? 'ISOLATION_UNAVAILABLE',durationMs:Date.now()-started};
+  }
+  const wrapper = 'mkdir -p /tmp/bin; printf \'#!/bin/sh\nexec /runtime/node /runtime/npm/bin/npm-cli.js "$@"\n\' > /tmp/bin/npm; chmod 700 /tmp/bin/npm; export PATH=/tmp/bin:$PATH; ';
+  return collectProcess(bwrapPath,[...args,'/bin/sh','-c',wrapper+command],{env:{},operation,started,
+    isolationFailure:(termSignal,stderr)=>termSignal||/^bwrap:/m.test(stderr)?{error:`isolation failed: ${stderr||termSignal}`,errorCode:'ISOLATION_UNAVAILABLE'}:null});
+}
+
+/**
+ * Reduced isolation: a host process in the disposable copy with a sanitized
+ * environment and a private home. Candidate and evaluator identities are still
+ * verified around every evaluation; only the OS boundary is missing.
+ */
+export async function hostCommand(command, {cwd,timeoutMs = 900000,signal,deadlineAt,nowMs=Date.now} = {}) {
+  const started = Date.now();
+  let operation, home;
+  try {
+    ensureRunning(signal);
+    operation = operationSignal(signal, {timeoutMs,deadlineAt,nowMs});
+    home = fs.mkdtempSync(path.join(os.tmpdir(), 'exitcode-home-'));
+  } catch(e) {
+    operation?.dispose();
+    return {exit:null,stdout:'',stderr:'',timedOut:false,error:e.message,errorCode:e.code ?? 'RUNNER_ERROR',durationMs:Date.now()-started};
+  }
+  const env = {PATH:[path.dirname(process.execPath),'/usr/bin','/bin'].join(':'),HOME:home,TMPDIR:home,LANG:'C.UTF-8'};
+  try { return {...await collectProcess('/bin/sh',['-c',command],{cwd:fs.realpathSync(cwd),env,operation,started}),isolation:'host'}; }
+  finally { fs.rmSync(home,{recursive:true,force:true}); }
+}
+
+/** Bubblewrap unavailability observed in this process, by binary; later runs degrade directly. */
+const isolationUnavailable = new Map();
+
+/**
+ * Default executor: bubblewrap when available, otherwise the reduced-isolation
+ * host runner. Strict isolation uses sandboxCommand directly and fails closed.
+ */
+export async function evaluatorCommand(command, options = {}) {
+  const key = options.bwrapPath ?? '/usr/bin/bwrap';
+  if (!isolationUnavailable.has(key)) {
+    const isolated = await sandboxCommand(command, options);
+    if (isolated.errorCode !== 'ISOLATION_UNAVAILABLE') return isolated;
+    isolationUnavailable.set(key, isolated.error);
+  }
+  return {...await hostCommand(command, options), isolationWarning:`reduced isolation: bubblewrap unavailable (${isolationUnavailable.get(key)}); checks ran as host processes in disposable copies`};
 }
 
 export function evaluatorEnvironment(cwd,options) {

@@ -4,7 +4,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { stripTypeScriptTypes } from "node:module";
-import { test } from "node:test";
+import { test, baseline, variants, fullSuite } from './test/suite.mjs';
 import * as core from "./exitcode-core.mjs";
 import { reviewRegistry } from "./test/adapter-review-cases.mjs";
 import { structuralRegistry } from "./test/structural-review.mjs";
@@ -96,7 +96,7 @@ async function assertFrozen(h, expected = "todo\n") {
   assert.equal(feature(h), expected);
 }
 
-test("adapter: mode exposes ExitCode tools without ever changing the user's loadout", async (t) => {
+baseline("adapter: mode exposes ExitCode tools without ever changing the user's loadout", async (t) => {
   const original = ["bash", "read", "write", "codemode"];
   const h = harness(t, "todo\n", original);
   const loadout = () => h.getActiveTools().filter((name) => !core.EXITCODE_TOOL_NAMES.includes(name));
@@ -115,7 +115,7 @@ test("adapter: mode exposes ExitCode tools without ever changing the user's load
   assert.equal(h.tools.get("exitcode_draft").exposure, "hidden");
 });
 
-test('adapter: an approved execution DAG runs SDK workers through evaluation and exits only after canonical root PASS', async t => {
+baseline('adapter: an approved execution DAG runs SDK workers through evaluation and exits only after canonical root PASS', async t => {
   const launches=[];
   const workers={async preflight(){},async start(spec){launches.push(spec);return spec;},async send(spec){fs.writeFileSync(path.join(spec.cwd,'feature.txt'),'done\n');},async cancel(){},async dispose(){}};
   const h=harness(t,'todo\n',['read','write','bash'],{...core,createPiWorkerBackend:()=>workers});
@@ -159,7 +159,7 @@ test("adapter: each turn receives the short protocol and bounded status, never e
   assertEnforced(h);
 });
 
-test("adapter: a draft returns a compact validated plan only after E0, and repairs come first", async (t) => {
+baseline("adapter: a draft returns a compact validated plan only after E0, and repairs come first", async (t) => {
   const h = harness(t);
   await h.command("Add the feature");
   const failed = await h.tool("exitcode_draft", { goal: "g", outcomes, criteria: broken() });
@@ -233,7 +233,7 @@ test("adapter: settle restores pre-seal changes, bounds continuations, and canno
   assert.equal(fs.existsSync(path.join(h.cwd, ".cache")), false);
   for (let i = 1; i < core.MAX_SETTLE_NUDGES; i++) { fs.writeFileSync(path.join(h.cwd, "feature.txt"), `attempt ${i}\n`); assert.equal((await settle(h)).continue, true); }
   fs.writeFileSync(path.join(h.cwd, "feature.txt"), "again\n");
-  assert.match((await settle(h)).entries[0].content, /Discovery is paused/);
+  assert.match((await settle(h)).entries[0].content, /repeated pre-seal changes were restored/);
   assert.equal(feature(h), "todo\n");
   // Sealed execution: continuations report the next action and stop after bounded no-progress turns.
   const s = harness(t);
@@ -247,10 +247,11 @@ test("adapter: settle restores pre-seal changes, bounds continuations, and canno
     await s.tool("exitcode_status", {});
     s.events.get("input")({ text: "Record a commit", source: "extension" }, s.ctx);
   }
+  // No progress is a recorded fault on an ACTIVE root, reported once; the user's next message continues without /exitcode resume.
   assert.match((await settle(s)).entries[0].content, /No observable progress/);
-  assert.equal(core.loadRoot(io(s), "G1").pause.code, "NO_PROGRESS");
+  assert.deepEqual([core.loadRoot(io(s), "G1").status, core.loadRoot(io(s), "G1").fault.code], ["ACTIVE", "NO_PROGRESS"]);
   assert.equal(await settle(s), undefined);
-  await s.command("resume");
+  await s.reply("Try a different approach");
   assert.equal((await settle(s)).continue, true);
   fs.writeFileSync(path.join(s.cwd, "feature.txt"), "sealed work\n");
   await settle(s);
@@ -351,8 +352,8 @@ test("adapter: reload, restart, and resume reconnect to the right root with its 
   await h.command("exit");
   fs.writeFileSync(path.join(h.cwd, "feature.txt"), "edited while cancelled\n");
   await h.command("resume");
-  assert.match(h.notifications.at(-1).content, /C1: The feature is done/);
-  assert.equal(await settle(h), undefined);
+  assert.match(h.notifications.at(-1).content, /Reconciled with the current workspace: G1: prepare the evaluator again/);
+  assert.equal(core.loadIndex(h.cwd).activeRootId, "G1");
   await h.command("approve");
   assert.match(h.notifications.at(-1).content, /must be prepared and validated before approval/);
   assert.equal(feature(h), "edited while cancelled\n");
@@ -371,8 +372,43 @@ test("adapter: reload, restart, and resume reconnect to the right root with its 
   assert.equal(core.statusSnapshot(io(other)).awaitingApproval, true);
 });
 
-test("adapter: best-effort critic uses the selected model once; failures never block deterministic evidence", async (t) => {
-  for (const mode of ["success", "tool-call", "markdown", "prose", "length-once", "error", "invalid-json", "malformed", "tool-malformed", "wrong-tool", "length", "missing-model", "reject-constrained", "reject-all", "unauthorized"]) await t.test(mode, async (t) => {
+test("adapter: one root owns the workspace; a new goal or exit detaches, and resume switches ownership against the current tree", async (t) => {
+  const h = harness(t);
+  await draft(h);
+  await h.command("approve");
+  fs.writeFileSync(path.join(h.cwd, "feature.txt"), "partial\n");
+  // A new goal needs no cleanup: the unfinished owner is detached, preserved, and summarized for discovery.
+  await h.command("Rework the feature differently");
+  assert.equal(core.loadIndex(h.cwd).activeRootId, null);
+  const detached = core.loadRoot(io(h), "G1");
+  assert.deepEqual([detached.status, typeof detached.detachedAt], ["ACTIVE", "number"]);
+  assert.match(promptText(h), /Previous unfinished ExitCode root:\nG1 — "Finish the feature"\nstate: ACTIVE \/ sealed\nlast proof: C1=FAIL C2=PASS/);
+  assert.equal(feature(h), "partial\n", "the workspace is never rewound");
+  await h.tool("exitcode_draft", { goal: "Rework", outcomes, criteria });
+  assert.equal(core.loadIndex(h.cwd).activeRootId, "G2");
+  assert.doesNotMatch(promptText(h), /Previous unfinished/);
+  // Explicit resume switches owners; the old verdict is never a regression baseline for the current tree.
+  await h.command("resume G1");
+  assert.match(h.notifications.at(-1).content, /Detached G2; its work is preserved/);
+  assert.match(h.notifications.at(-1).content, /G1: evaluate the current workspace fresh/);
+  assert.equal(core.loadIndex(h.cwd).activeRootId, "G1");
+  assert.equal(core.loadNodeState(io(h), "G1").lastResult.stale, true);
+  fs.writeFileSync(path.join(h.cwd, "feature.txt"), "done\n");
+  assert.equal((await h.tool("exitcode_evaluate", {})).details.cascade.terminal.status, "PASS");
+  // With no owner, status lists resumable roots and resume picks the most recently detached one.
+  assert.match(core.statusText(io(h)), /Resumable:\n  G2 ACTIVE  "Rework"/);
+  await h.command("resume");
+  assert.equal(core.loadIndex(h.cwd).activeRootId, "G2");
+  assert.match(h.notifications.at(-1).content, /G2: prepare the evaluator again against the current workspace/);
+  // Exit detaches without deleting anything.
+  await h.command("exit");
+  assert.equal(core.loadIndex(h.cwd).activeRootId, null);
+  assert.equal(core.loadRoot(io(h), "G2").status, "ACTIVE");
+  assert.deepEqual(core.resumableRoots(io(h)).map((r) => r.id), ["G2"]);
+});
+
+baseline("adapter: best-effort critic uses the selected model once; failures never block deterministic evidence", async (t) => {
+  for (const mode of variants(["success", "tool-call", "markdown", "prose", "length-once", "error", "invalid-json", "malformed", "tool-malformed", "wrong-tool", "length", "missing-model", "reject-constrained", "reject-all", "unauthorized"], ["success", "error"])) await t.test(mode, async (t) => {
     const h = harness(t), registry = reviewRegistry(mode);
     h.ctx.modelRegistry = registry;
     h.ctx.tools = [{ name: "write", description: "Mutate the session candidate" }];
@@ -400,9 +436,11 @@ test("adapter: best-effort critic uses the selected model once; failures never b
     assert.match(result.content[0].text, mode.startsWith("success") || ["tool-call", "markdown", "prose"].includes(mode) ? /Semantic critic: pass/ : /Semantic critic: unavailable/);
     assert.equal(core.statusSnapshot(io(h)).awaitingApproval, true);
     if (!["missing-model"].includes(mode)) assert.equal(result.usage.input, 11, "billable critic calls report usage");
-    h.ctx.model = { id: "changed-model", provider: "changed-provider" };
-    await h.tool("exitcode_draft", { goal: "Literal artifact", outcomes, criteria, revise: "G1" });
-    assert.equal(registry.calls.length, mode === "missing-model" ? 1 : 2);
+    if (fullSuite) {
+      h.ctx.model = { id: "changed-model", provider: "changed-provider" };
+      await h.tool("exitcode_draft", { goal: "Literal artifact", outcomes, criteria, revise: "G1" });
+      assert.equal(registry.calls.length, mode === "missing-model" ? 1 : 2);
+    }
   });
   {
     const h = harness(t), registry = reviewRegistry("cancel");
@@ -416,15 +454,17 @@ test("adapter: best-effort critic uses the selected model once; failures never b
   }
 });
 
-test("adapter: /exitcode resume retries sealed evaluation, returns draft repair to the agent, and accepts only explicit positive grants", async (t) => {
-  // Infrastructure pause during evaluation: resume retries without new acceptance.
+test("adapter: infrastructure faults stay ACTIVE for agent retry; /exitcode resume returns draft repair to the agent and accepts only explicit positive grants", async (t) => {
+  // Infrastructure fault during evaluation: the root stays ACTIVE and the agent simply retries.
   const h = harness(t);
   await draft(h);
   await h.command("approve");
   const before = core.loadRoot(io(h), "G1"), bytes = fs.readFileSync(core.sealedFile(h.cwd, "G1"), "utf8");
   fs.writeFileSync(path.join(h.cwd, "feature.txt"), "done\n");
-  assert.equal((await core.evaluateNode(core.makeIo(h.cwd, { exec: async () => ({ exit: null, error: "temporary runner failure" }) }))).status, "PAUSED");
-  await h.command("resume");
+  const fault = await core.evaluateNode(core.makeIo(h.cwd, { exec: async () => ({ exit: null, error: "temporary runner failure" }) }));
+  assert.deepEqual([fault.status, fault.fault.disposition], ["ACTIVE", "retry"]);
+  assert.match(promptText(h), /last issue: RUNNER_ERROR \(retry\)/);
+  await h.tool("exitcode_evaluate", {});
   const root = core.loadRoot(io(h), "G1");
   assert.equal(root.status, "PASS");
   assert.deepEqual([root.consumedAttempts, root.deadlineAt, root.approval], [1, before.deadlineAt, before.approval]);
@@ -450,7 +490,7 @@ test("adapter: /exitcode resume retries sealed evaluation, returns draft repair 
   const granted = core.loadRoot(io(d), "G1");
   assert.equal(granted.status, "PASS");
   assert.equal(granted.deadlineAt, sealed.deadlineAt + 121000);
-  assert.equal(granted.attemptLimit, sealed.policy.maxTotalAttempts + 3);
+  assert.equal(granted.attemptLimit, sealed.attemptLimit + 3);
   assert.deepEqual(granted.policy, sealed.policy);
   t.mock.restoreAll();
   // Legacy preparation pause: resume hands control back without another reviewer call.
