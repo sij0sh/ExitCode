@@ -3,11 +3,10 @@ import * as fs from 'node:fs';
 import { diagnostic, safePath } from './exitcode-evaluator.mjs';
 import { abortable, operationSignal, operationError, ensureRunning } from './exitcode-operation.mjs';
 
-// No local wall-clock limit. An executing root still supplies its shared deadline.
-export const REVIEW_TIMEOUT_MS = null;
+// Bound the optional critic independently of the shared execution deadline.
+export const REVIEW_TIMEOUT_MS = 12_000;
 // Critic output is tiny: at most three concerns, each one sentence.
 export const REVIEW_MAX_TOKENS = 1024;
-export const REVIEW_RETRY_MAX_TOKENS = 1024;
 /** Sole response tool offered to the isolated semantic-critic call. */
 export const REVIEW_TOOL_NAME = 'submit_review';
 export const CRITIC_CODES = Object.freeze(['MISSING_OUTCOME', 'OVERREACH', 'CONTRADICTION', 'BUNDLED_OUTCOME']);
@@ -50,8 +49,8 @@ export function parseReviewText(value) {
 }
 
 /**
- * Validate and normalize the critic response. Returns diagnostics for the
- * agent to repair before approval. Empty concerns means PASS.
+ * Validate and normalize advisory concerns. They are shown in the plan
+ * and never veto deterministic preparation. Empty concerns means PASS.
  */
 export function validateCritic(response) {
   if (!record(response) || !Array.isArray(response.concerns) || response.concerns.length > 3)

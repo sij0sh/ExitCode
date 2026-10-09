@@ -20,7 +20,64 @@ function workspace(t, files = {feature:'pending'}) {
 }
 const recipe={kind:'test_asset',asset:'C1.test.mjs',command:'node',args:['--test']};
 const outcomes=[{id:'O1',requirement:'The feature reports done'}];
-const literal={id:'C1',outcome:'O1',requirement:'The feature is done',check:{recipe:{kind:'file_contains',path:'feature',value:'done'}}};
+const literal={id:'C1',outcome:'O1',check:{recipe:{kind:'file_contains',path:'feature',value:'done'}}};
+
+test('assets: inline limits count UTF-8 bytes and report overbuilt proofs before drafting', t=>{
+  const atLimit=Object.fromEntries(Array.from({length:16},(_,i)=>[`f${i}`,'']));
+  validateEvaluatorAssetDefinitions({assets:atLimit,criteria:[]});
+  validateEvaluatorAssetDefinitions({assets:{proof:'é'.repeat(64*1024)},criteria:[]});
+  for(const assets of [{...atLimit,extra:''},{proof:'é'.repeat(64*1024)+'x'}]) {
+    assert.throws(()=>validateEvaluatorAssetDefinitions({assets,criteria:[]}),e=>e.code==='EVALUATOR_ASSETS_OVERBUILT');
+    const cwd=workspace(t),io=core.makeIo(cwd);
+    const result=core.draftNode(io,{goal:'Complete feature',outcomes,criteria:[literal],assets});
+    assert.equal(result.ok,false);assert.equal(result.code,'EVALUATOR_ASSETS_OVERBUILT');
+    assert.equal(core.statusSnapshot(io).active,false,'oversized proofs create no partial contract');
+  }
+});
+
+test('assets: existing_test and test_suite evaluate sealed tests while product tests change', async t=>{
+  for(const kind of ['existing_test','test_suite'])await t.test(kind,async t=>{
+    const proof="import{test}from'node:test';import assert from'node:assert/strict';import{readFileSync}from'node:fs';test('approved behavior',()=>assert.equal(readFileSync('feature','utf8'),'done'));";
+    const stable="import{test}from'node:test';import assert from'node:assert/strict';import{readFileSync}from'node:fs';test('stable behavior',()=>assert.equal(readFileSync('stable','utf8'),'steady'));";
+    const cwd=workspace(t,{stable:'steady','proof.test.mjs':proof,'tests/stable.test.mjs':stable,
+      'package.json':JSON.stringify({scripts:{test:'sh scripts/verify'}}),'scripts/verify':'node --test ./*.test.mjs tests/*.test.mjs\n'});
+    const check=kind==='existing_test'?{kind,path:'proof.test.mjs',selector:'approved behavior'}:{kind};
+    const criteria=kind==='existing_test'?[{id:'C1',outcome:'O1',check:{recipe:check},controls:{accept:{mutations:[{kind:'write_file',path:'feature',content:'done'}]}}}]:
+      [literal,{id:'R1',type:'regression',requirement:'Approved product suite passes',check:{recipe:check}}];
+    // A regression suite starts from a passing baseline.
+    if(kind==='test_suite')fs.writeFileSync(path.join(cwd,'feature'),'done');
+    const io=core.makeIo(cwd);
+    assert.equal(core.draftNode(io,{goal:'Complete feature',outcomes,criteria}).ok,true);
+    const prepared=await core.prepareNode(io);assert.equal(prepared.ok,true,JSON.stringify(prepared));
+    assert.equal(core.approveRoot(io).ok,true);assert.equal((await core.sealNode(io,'G1')).ok,true);
+    const bundle=core.loadBundle(io,'G1');
+    assert.equal(bundle.assets.files.some(f=>f.path==='tests/stable.test.mjs'),kind==='test_suite');
+    fs.writeFileSync(path.join(cwd,'proof.test.mjs'),"import{test}from'node:test';test('weakened live assertion',()=>{});");
+    fs.writeFileSync(path.join(cwd,'tests/new-feature.test.mjs'),"throw Error('new product test is outside approved suite');");
+    fs.writeFileSync(path.join(cwd,'scripts/verify'),'exit 0\n');
+    fs.rmSync(path.join(cwd,'tests/stable.test.mjs'));
+    if(kind==='existing_test') {
+      const fail=await core.evaluateNode(io);
+      assert.equal(fail.ok,true,JSON.stringify(fail));
+      assert.equal(core.loadNodeState(io,'G1').lastResult.allPass,false,'live tests cannot weaken approved evidence');
+    } else {
+      // Evaluate a bad product against the sealed suite directly; root regression
+      // restoration otherwise replaces the intentionally broken candidate.
+      const fixture=workspace(t,{feature:'pending',stable:'steady','tests/new-feature.test.mjs':'throw Error(\"new test\");'});
+      installEvaluatorAssets(fixture,bundle.assetsDirectory,bundle.assets);
+      verifyEvaluatorAssets(fixture,bundle.assetsDirectory,bundle.assets,{installed:true});
+      assert.equal((await runRecipe(check,{cwd:fixture,readOnlyPaths:bundle.assets.readOnlyPaths})).exit,1);
+      assert.equal(fs.existsSync(path.join(fixture,'tests/new-feature.test.mjs')),false);
+      fs.writeFileSync(path.join(fixture,'generated.test.mjs'),'// unexpected runtime test');
+      assert.throws(()=>verifyEvaluatorAssets(fixture,bundle.assetsDirectory,bundle.assets,{installed:true}),e=>e.code==='EVALUATOR_DRIFT');
+    }
+    fs.writeFileSync(path.join(cwd,'feature'),'done');
+    assert.equal((await core.evaluateNode(io)).status,'PASS');
+    assert.equal(fs.existsSync(path.join(cwd,'tests/stable.test.mjs')),false,'evaluation never restores product tests');
+    assert.equal(fs.readFileSync(path.join(cwd,'scripts/verify'),'utf8'),'exit 0\n');
+    assert.ok(fs.existsSync(path.join(cwd,'tests/new-feature.test.mjs')));
+  });
+});
 
 test('assets: authored files are confined, bounded, and restored only into disposable copies', async t=>{
   const cwd=workspace(t), directory=path.join(cwd,'.exitcode/assets/bundle');
@@ -29,8 +86,8 @@ test('assets: authored files are confined, bounded, and restored only into dispo
     [{'x/../../escape':'bad'},recipe], [{'x\\escape':'bad'},recipe], [{'./C1.test.mjs':'bad'},recipe],
     [{'.exitcode/index.json':'bad'},recipe], [{'x/.git/config':'bad'},recipe],
     [{'node_modules/runner.js':'bad'},recipe], [{'x':'bad','x/y':'bad'},recipe],
-    [{'C1.test.mjs':1},recipe], [{'C1.test.mjs':'x'.repeat(1024*1024+1)},recipe],
-    [Object.fromEntries(Array.from({length:65},(_,i)=>[`f${i}`,''])),recipe], [{},recipe],
+    [{'C1.test.mjs':1},recipe], [{'C1.test.mjs':'x'.repeat(128*1024+1)},recipe],
+    [Object.fromEntries(Array.from({length:17},(_,i)=>[`f${i}`,''])),recipe], [{},recipe],
   ]) assert.throws(()=>validateEvaluatorAssetDefinitions({assets,criteria:[{check:{recipe:check}}]}));
   for(const invalid of [{...recipe,command:'/bin/sh'}, {...recipe,args:[1]}, {...recipe,asset:'../escape'}])
     assert.throws(()=>compileRecipe(invalid));
@@ -64,7 +121,7 @@ test('assets: the exact approved tests run fresh with the host runtime while the
     'profile.test.mjs':"import{test}from'node:test';import assert from'node:assert/strict';import{readFileSync}from'node:fs';test('profile remains',()=>assert.equal(readFileSync('profile','utf8'),'existing'));"});
   const content="import{test}from'node:test';import assert from'node:assert/strict';import{value}from'../src/value.mjs';import{readFileSync,writeFileSync}from'node:fs';test('done',()=>{assert.equal(value,JSON.parse(readFileSync(new URL('./fixtures/expected.json',import.meta.url))).value);writeFileSync('probe-output.txt','disposable');});";
   const authored={'C1.test.mjs':content,'fixtures/expected.json':'{"value":"done"}','fixtures/positive.mjs':witness};
-  const criteria=[{id:'C1',outcome:'O1',requirement:'The feature reports done',check:{recipe},
+  const criteria=[{id:'C1',outcome:'O1',check:{recipe},
     controls:{accept:{mutations:[{kind:'copy_fixture',path:'src/value.mjs',asset:'fixtures/positive.mjs'}]}}},
     {id:'C2',type:'regression',requirement:'The existing profile remains',check:{recipe:{kind:'existing_test',path:'profile.test.mjs',selector:'profile remains'}}}];
   const calls=[];
@@ -124,7 +181,7 @@ test('assets: empty-project probes execute owned tests and Node test assets must
   assert.match(run.stdout,/No selected test executed/);
 });
 
-test('assets: the adapter authors acceptance files without a test-staging approval', async t=>{
+test('assets: the adapter authors acceptance files without changing product tests', async t=>{
   const cwd=workspace(t), tools=new Map(), commands=new Map(), entries=[];
   const before=core.digestTree(cwd), authored={'C1.test.mjs':'// contract acceptance evidence'};
   const exec=async(command,{cwd:fixture,readOnlyPaths})=>{
@@ -150,6 +207,6 @@ test('assets: the adapter authors acceptance files without a test-staging approv
   assert.equal(drafted.isError,undefined,JSON.stringify(drafted.details));
   assert.deepEqual(core.statusSnapshot(core.makeIo(cwd)).contract.assets,authored);
   assert.equal(core.statusSnapshot(core.makeIo(cwd)).awaitingApproval,true);
-  assert.equal(core.statusSnapshot(core.makeIo(cwd)).staging,null);
+  assert.equal(tools.has("exitcode_stage_tests"),false);
   assert.equal(core.digestTree(cwd),before);
 });

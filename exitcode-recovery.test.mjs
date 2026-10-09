@@ -15,7 +15,7 @@ const read = (cwd, file) => fs.existsSync(path.join(cwd, file)) ? fs.readFileSyn
 const run = (exit, extra = {}) => ({ exit, stdout: '', stderr: '', timedOut: false, ...extra });
 const custom = command => ({ recipe: { kind: 'custom_command', command } });
 const criterion = (id, file, commands = false) => ({
-  id, requirement: `The literal ${file} artifact contains done`, outcome: 'O1',
+  id, outcome: 'O1',
   check: commands ? custom(`observe:${file}`) : { recipe: { kind: 'file_contains', path: file, value: 'done' } },
   ...(commands ? { controls: { accept: { mutations: [{ kind: 'write_file', path: file, content: 'done' }] },
     reject: [{ mutations: [{ kind: 'write_file', path: file, content: 'pending' }] }] } } : {}),
@@ -111,15 +111,10 @@ test('recovery: infrastructure faults during root preparation remain editable wi
 });
 
 test('recovery: legacy unsealed pauses unlock every editing boundary without resetting budgets or evidence', async t => {
-  for(const boundary of ['revise','request','approve','complete','prepare','budget','external','no-progress'])await t.test(boundary,async t=>{
+  for(const boundary of ['revise','prepare','budget','external','no-progress'])await t.test(boundary,async t=>{
     const f=project(t,{policy:{evaluatorAttempts:1}});
     assert.equal((await core.prepareNode(f.io)).ok,true);
     const diagnostics=[{code:'REVIEW_TOO_LARGE',stage:'quality',evidence:'length',repairability:'supervisor'}];
-    if(['approve','complete'].includes(boundary))assert.equal(core.requestTestStaging(f.io,'G1',{reason:'Write focused tests',paths:['proof.test.mjs']}).ok,true);
-    if(boundary==='complete') {
-      assert.equal(core.approveTestStaging(f.io,'G1',{userApproval:'Yes, write the tests'}).ok,true);
-      fs.writeFileSync(path.join(f.cwd,'proof.test.mjs'),"export const acceptance=true;");
-    }
     const node=core.loadNodeState(f.io,'G1');
     node.phase='EVALUATOR_PREPARATION';node.diagnostics=diagnostics;
     node.preparing=true;node.preparationReservation={at:100,attempt:1,operationToken:'interrupted-operation'};
@@ -133,9 +128,7 @@ test('recovery: legacy unsealed pauses unlock every editing boundary without res
     core.saveRoot(f.io,root);
     let result;
     if(['revise','external','no-progress'].includes(boundary))result=core.draftNode(f.io,{...f.args,revise:'G1'});
-    if(['request','budget'].includes(boundary))result=core.requestTestStaging(f.io,'G1',{reason:'Write focused tests',paths:['proof.test.mjs']});
-    if(boundary==='approve')result=core.approveTestStaging(f.io,'G1',{userApproval:'Yes, write the tests'});
-    if(boundary==='complete')result=core.completeTestStaging(f.io,'G1');
+    if(boundary==='budget')result=core.draftNode(f.io,{...f.args,revise:'G1'});
     if(boundary==='prepare') {
       // A recorded explicit grant is retained; the saved leaf limit is authoritative.
       const granted=core.loadNodeState(f.io,'G1');granted.evaluatorAttemptLimit=2;core.saveNodeState(f.io,granted);
@@ -148,28 +141,24 @@ test('recovery: legacy unsealed pauses unlock every editing boundary without res
     if(boundary!=='prepare')assert.deepEqual(state.preparationReservation,node.preparationReservation,'the interrupted reservation is not refunded');
     for(const key of ['policy','consumedAttempts','deadlineAt','executionGrants','pauseHistory','stack'])assert.deepEqual(recovered[key],root[key],key);
     assert.equal(state.evaluatorMetrics.e0Attempts,boundary==='prepare'?2:1);
-    if(['revise','request','approve','external','budget','no-progress'].includes(boundary))assert.deepEqual(state.diagnostics,diagnostics,'recovery retains diagnostics');
+    if(['revise','external','budget','no-progress'].includes(boundary))assert.deepEqual(state.diagnostics,diagnostics,'recovery retains diagnostics');
     assert.equal(recovered.approval,undefined,'recovery grants no approval');
     if(boundary!=='prepare')assert.equal(core.approveRoot(f.io).ok,false,'unprepared recovery cannot be approved');
     if(boundary==='prepare')assert.equal(state.phase,'READY_FOR_APPROVAL');
-    if(boundary==='complete')assert.deepEqual(state.testStagingHistory[0].files,['proof.test.mjs']);
     if(boundary==='budget') {
-      assert.equal(core.approveTestStaging(f.io,'G1').ok,true);
-      assert.equal(core.completeTestStaging(f.io,'G1').ok,true);
       const exhausted=await core.prepareNode(f.io);
-      assert.equal(exhausted.pause.code,'EVALUATOR_UNBUILDABLE','unlocking staging never adds evaluator attempts');
+      assert.equal(exhausted.pause.code,'EVALUATOR_UNBUILDABLE','revision never adds evaluator attempts');
       assert.equal(core.resumeRoot(f.io).ok,false,'grant still required');
       const resumed=core.resumeRoot(f.io,{evaluatorAttempts:1});
       assert.deepEqual([resumed.ok,resumed.retry,resumed.operation],[true,false,'continue']);
       assert.equal(core.loadNodeState(f.io,'G1').evaluatorAttemptLimit,2);
     }
   });
-  // Sealed execution cannot use draft repair or staging to clear its pause.
+  // Sealed execution cannot use draft repair to clear its pause.
   const sealed=project(t);await seal(sealed);
   core.pauseNode(sealed.io,{code:'RUNNER_ERROR',reason:'runner unavailable'});
   const before=core.loadRoot(sealed.io,'G1');
   assert.equal(core.draftNode(sealed.io,{...sealed.args,revise:'G1'}).ok,false);
-  assert.equal(core.requestTestStaging(sealed.io,'G1',{reason:'Change proof'}).ok,false);
   assert.equal((await core.prepareNode(sealed.io)).ok,false);
   assert.deepEqual(core.loadRoot(sealed.io,'G1'),before);
 });

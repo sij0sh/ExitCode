@@ -16,7 +16,7 @@ const sequence = [
 const read = (cwd, file) => fs.existsSync(path.join(cwd, file)) ? fs.readFileSync(path.join(cwd, file), 'utf8') : null;
 const write = (f, file, content) => fs.writeFileSync(path.join(f.cwd, file), content);
 const OUTCOMES = [{ id: 'O1', requirement: 'First artifact done' }, { id: 'O2', requirement: 'Second artifact done' }, { id: 'O3', requirement: 'Last artifact done' }];
-const criterion = (id, file) => ({ id, requirement: `The literal ${file} artifact contains done`, outcome: `O${id.slice(1)}`,
+const criterion = (id, file) => ({ id, outcome: `O${id.slice(1)}`,
   check: { recipe: { kind: 'custom_command', command: `observe:${file}` } },
   controls: { accept: { mutations: [{ kind: 'write_file', path: file, content: 'done' }] },
     reject: [{ mutations: [{ kind: 'write_file', path: file, content: 'pending' }] }] } });

@@ -28,13 +28,14 @@ const backend = createPiWorkerBackend({model:faux.getModel(),thinkingLevel:'off'
   })}}));
 let handle;
 try {
+  await backend.preflight();
   const cwd=path.join(directory,'worker');fs.mkdirSync(cwd);
   handle=await backend.start({id:'S1',cwd,kind:'slice',objective:'Create result.txt containing done'});
   await backend.send(handle,{objective:'Create result.txt containing done'});
   assert.equal(fs.readFileSync(path.join(cwd,'result.txt'),'utf8'),'done');
   await backend.send(handle,{failures:[]});
   await backend.cancel(handle);
-  console.log('PASS: independent Pi SDK session, native write tool, feedback, cancellation, disposal');
+  console.log('PASS: capability preflight, independent Pi SDK session, native write tool, feedback, cancellation, disposal');
 } finally {
   if(handle)await backend.dispose(handle);
   fs.rmSync(directory,{recursive:true,force:true});

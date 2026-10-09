@@ -3,7 +3,7 @@ import { ensureRunning, operationError } from './exitcode-operation.mjs';
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 
-const SYSTEM = 'You are an ExitCode implementation worker in a private Git workspace. Implement the assigned objective, preserve the stated prerequisites and regression behavior, and stop when your candidate is ready for supervisor evaluation. Repair evaluator failures in this same session. Do not edit acceptance tests or evaluator assets, access supervisor storage, create recursive workers, or claim the root is complete. Git commits are unnecessary; the supervisor captures your working tree.';
+const SYSTEM = 'You are an ExitCode implementation worker in a private Git workspace. Implement the assigned objective, preserve the stated prerequisites and regression behavior, and stop when your candidate is ready for supervisor evaluation. Repair evaluator failures in this same session. Repository tests are product files and may change; the supervisor evaluates sealed acceptance copies. Do not access supervisor storage or evaluator assets, create recursive workers, or claim the root is complete. Git commits are unnecessary; the supervisor captures your working tree.';
 
 function workerBoundary(cwd) {
   return pi => pi.on('tool_call', event => {
@@ -31,16 +31,35 @@ function workerBoundary(cwd) {
 }
 
 export function createPiWorkerBackend(ctx, loadSdk = () => import('@earendil-works/pi-coding-agent')) {
+  const runtimeFor = async (signal) => {
+    ensureRunning(signal);
+    if (!ctx.model) throw operationError('WORKER_UNAVAILABLE', 'select a model before approving execution workers');
+    const sdk = await loadSdk();
+    if (typeof sdk.createAgentSession !== 'function' || typeof sdk.DefaultResourceLoader !== 'function' ||
+        typeof sdk.getAgentDir !== 'function' || typeof sdk.ModelRuntime?.create !== 'function' ||
+        typeof sdk.SettingsManager?.inMemory !== 'function' || typeof sdk.SessionManager?.inMemory !== 'function')
+      throw operationError('WORKER_UNAVAILABLE', 'Pi SDK worker session capabilities unavailable');
+    const modelRuntime = await sdk.ModelRuntime.create({ signal, allowModelNetwork:false, refreshOnCreate:false });
+    const nativeProvider = ctx.modelRegistry?.getRegisteredNativeProvider?.(ctx.model.provider);
+    const providerConfig = ctx.modelRegistry?.getRegisteredProviderConfig?.(ctx.model.provider);
+    if (nativeProvider) modelRuntime.registerNativeProvider(nativeProvider);
+    if (providerConfig) modelRuntime.registerProvider(ctx.model.provider, providerConfig);
+    if (typeof modelRuntime.getAvailable !== 'function') throw operationError('WORKER_UNAVAILABLE', 'worker model availability cannot be checked');
+    const available = await modelRuntime.getAvailable(ctx.model.provider, {signal});
+    ensureRunning(signal);
+    if (!available.some(m=>m.provider===ctx.model.provider && m.id===ctx.model.id))
+      throw operationError('WORKER_UNAVAILABLE', `selected model unavailable to workers: ${ctx.model.provider}/${ctx.model.id}`);
+    return {sdk,modelRuntime};
+  };
   return {
+    async preflight({signal} = {}) {
+      try { await runtimeFor(signal); }
+      catch (error) { ensureRunning(signal); throw operationError('WORKER_UNAVAILABLE', error.message); }
+    },
     async start(spec) {
       ensureRunning(spec.signal);
-      if (!ctx.model) throw operationError('WORKER_UNAVAILABLE', 'select a model before starting execution workers');
-      const sdk = await loadSdk(), settingsManager = sdk.SettingsManager.inMemory({ retry: { enabled: false } });
-      const modelRuntime = await sdk.ModelRuntime.create({ signal: spec.signal });
-      const nativeProvider = ctx.modelRegistry?.getRegisteredNativeProvider?.(ctx.model.provider);
-      const providerConfig = ctx.modelRegistry?.getRegisteredProviderConfig?.(ctx.model.provider);
-      if (nativeProvider) modelRuntime.registerNativeProvider(nativeProvider);
-      if (providerConfig) modelRuntime.registerProvider(ctx.model.provider, providerConfig);
+      const {sdk,modelRuntime} = await runtimeFor(spec.signal);
+      const settingsManager = sdk.SettingsManager.inMemory({ retry: { enabled: false } });
       const loader = new sdk.DefaultResourceLoader({ cwd: spec.cwd, agentDir: sdk.getAgentDir(), settingsManager,
         noExtensions: true, noSkills: true, noThemes: true, noPromptTemplates: true, noContextFiles: true,
         systemPrompt: SYSTEM, disabledBuiltinExtensions: ['mcp'], extensionFactories: [workerBoundary(spec.cwd)] });

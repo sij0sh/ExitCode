@@ -31,7 +31,7 @@ const FIXTURES = {
 const witness = (id, content) => ({ mutations: [{ kind: "write_file", path: FIXTURES[id].file, content }] });
 const custom = (command) => ({ recipe: { kind: "custom_command", command } });
 const behavior = (id, cmd, outcome) => ({
-  id, requirement: `requirement ${id}`, ...(outcome === null ? {} : { outcome: outcome ?? `O${id.replace(/\D/g, "") || "1"}` }), check: custom(cmd),
+  id, ...(outcome === null ? {} : { outcome: outcome ?? `O${id.replace(/\D/g, "") || "1"}` }), check: custom(cmd),
   controls: { accept: witness(id, FIXTURES[id].valid), reject: [{ ...witness(id, FIXTURES[id].invalid), reason: `broken ${id}` }] },
 });
 const regression = (id, cmd) => ({ id, requirement: `requirement ${id}`, type: "regression", check: custom(cmd) });
@@ -85,7 +85,7 @@ const ROOT_OUTCOMES = [{ id: "O1", requirement: "The thing is added" }];
 const ROOT_CRITERIA = [behavior("C1", "check:c1", "O1"), regression("C2", "check:reg")];
 const ROOT_SEQUENCE = [{ objective: "Establish the first proof", verify: ["C1"] }, { objective: "Finish the last proof", verify: ["C3"] }];
 const ORDERED_OUTCOMES = [...ROOT_OUTCOMES, { id: "O3", requirement: "The last artifact is done" }];
-const ORDERED_CRITERIA = [...ROOT_CRITERIA, { id: "C3", requirement: "The last literal artifact contains done", outcome: "O3",
+const ORDERED_CRITERIA = [...ROOT_CRITERIA, { id: "C3", outcome: "O3",
   check: { recipe: { kind: "file_contains", path: "last.txt", value: "done" } } }];
 const childCriteria = () => [behavior("D1", "check:d1", "O1")];
 const CHILD_OUTCOMES = [{ id: "O1", requirement: "The child outcome is done" }];
@@ -114,17 +114,19 @@ const write = (dir, rel, content) => fs.writeFileSync(path.join(dir, rel), conte
 test("structure: drafts are validated before any probe, and controls are optional witnesses", async (t) => {
   assert.deepEqual(validateStructure(rootDraft(), { policy: DEFAULT_POLICY }), { ok: true, errors: [] });
   // Thin contracts: a behavior criterion may omit controls, and a root needs no regression criterion.
-  assert.equal(validateStructure(rootDraft({ criteria: [{ id: "C1", requirement: "r", check: custom("c") }] })).ok, true);
+  assert.equal(validateStructure(rootDraft({ criteria: [{ id: "C1", check: custom("c") }] })).ok, true);
   const parent = { contract: rootDraft() };
   const child = (targets, extra = {}) => ({ id: "G1.1", goal: "g", originalRequest: "r", parent: { id: "G1", targets }, criteria: [behavior("C1", "c")], ...extra });
   for (const [label, draft, opts, fragment] of [
     ["duplicate ids", rootDraft({ criteria: [behavior("C1", "a"), behavior("C1", "b"), regression("C2", "r")] }), {}, "duplicate criterion id C1"],
+    ["duplicated behavior text", rootDraft({criteria:[{...behavior("C1","c"),requirement:"A conflicting second description"}]}), {}, "remove criterion.requirement"],
+    ["missing regression text", rootDraft({criteria:[{id:"R1",type:"regression",check:custom("c")}]}), {}, "regression requirement"],
     ["empty goal", rootDraft({ goal: "  " }), {}, "goal"],
     ["no request", rootDraft({ originalRequest: "" }), {}, "originalRequest"],
     ["blank accept", rootDraft({ criteria: [{ ...behavior("C1", "c"), controls: { accept: { mutations: [] } } }, regression("C2", "r")] }), {}, "controls.accept"],
     ["empty reject", rootDraft({ criteria: [{ ...behavior("C1", "c"), controls: { reject: [] } }, regression("C2", "r")] }), {}, "controls.reject"],
     ["shell setup", rootDraft({ criteria: [{ ...behavior("C1", "c"), controls: { accept: { setup: "true" }, reject: [{ setup: "false" }] } }, regression("C2", "r")] }), {}, "controls.reject[0] needs nonempty mutations"],
-    ["bare command", rootDraft({ criteria: [{ id: "C1", requirement: "r", check: { command: "true" } }] }), {}, "check must be an object with a recipe"],
+    ["bare command", rootDraft({ criteria: [{ id: "C1", check: { command: "true" } }] }), {}, "check must be an object with a recipe"],
     ["assumptions", rootDraft({ assumptions: "bad" }), {}, "assumptions"],
     ["exclusions", rootDraft({ exclusions: [""] }), {}, "exclusions"],
     ["unknown target", child(["C9"]), { parent, parentDepth: 0 }, "C9"],
@@ -158,8 +160,8 @@ test("structure: drafts are validated before any probe, and controls are optiona
     assert.equal(exec.calls.length, 0);
     assert.equal(core.loadIndex(dir).activeRootId, null, "invalid order creates no root");
   }
-  const twelve = Array.from({ length: 12 }, (_, i) => ({ id: `B${i}`, requirement: `Outcome ${i}`, check: custom("observe") }));
-  assert.equal(validateStructure(rootDraft({ criteria: twelve, sequence: twelve.map(c => ({ objective: c.requirement, verify: [c.id] })) })).ok, true);
+  const twelve = Array.from({ length: 12 }, (_, i) => ({ id: `B${i}`, check: custom("observe") }));
+  assert.equal(validateStructure(rootDraft({ criteria: twelve, sequence: twelve.map(c => ({ objective: `Prove ${c.id}`, verify: [c.id] })) })).ok, true);
   assert.equal(validateStructure(child(["C1"], { sequence: [{ objective: "Child", verify: ["C1"] }] }), { parent, parentDepth: 0 }).ok, false, "sequences are root-only");
   const dir = tempProject(t), io = makeIo(dir);
   const assigned = draftNode(io, { goal: "g", outcomes: ORDERED_OUTCOMES, criteria: ORDERED_CRITERIA.map(({ id, ...c }) => c), sequence: ROOT_SEQUENCE });
@@ -287,7 +289,7 @@ test("approval: every revision or on-disk edit invalidates approval", async (t) 
   assert.equal(exec.calls.length, 0);
   for (const mutate of [
     (draft) => { draft.criteria.pop(); },
-    (draft) => { draft.criteria[0].requirement = "Weakened requirement"; },
+    (draft) => { draft.outcomes[0].requirement = "Weakened requirement"; },
     (draft) => { draft.criteria[0].check.recipe.command = "true"; },
     (draft) => { draft.criteria[0].controls.reject[0].mutations[0].content = "done\n"; },
     (draft) => { draft.assumptions = ["Changed policy"]; },
@@ -580,150 +582,6 @@ test("baseline: pre-seal changes from any source are saved, restored, reported, 
   assert.equal(discardedSets(dir).length, MAX_DISCARDED_CHANGES);
 });
 
-test("staging: user-authorized test windows preserve product, invalidate approval, and freeze the completed tests", async (t) => {
-  for (const boundary of ["guard", "complete"]) await t.test(boundary, async (t) => {
-    const oldTest = "import { test } from 'node:test'; test('old behavior', () => {});";
-    const newTest = "import { test } from 'node:test'; test('new behavior', () => {});";
-    const dir = tempProject(t, { "feature.txt": "todo\n", "keep.txt": "preserved", "proof.test.mjs": oldTest, "other.test.mjs": oldTest,
-      "test/old.test.mjs": oldTest, "scripts/verify": "old verify", "node_modules/pkg/index.js": "dependency" });
-    const { io } = testIo(dir, fileExec(dir, { checks: standardChecks }));
-    draftNode(io, { goal: "g", outcomes: ROOT_OUTCOMES, criteria: ROOT_CRITERIA });
-    assert.equal((await prepareNode(io)).ok, true);
-    assert.equal(approveRoot(io).ok, true);
-    const attempts = loadNodeState(io, "G1").evaluatorMetrics.e0Attempts;
-    assert.equal(core.approveTestStaging(io, "G1").ok, false, "request precedes approval");
-    for (const paths of [["feature.txt"], ["../proof.test.mjs"], ["node_modules/pkg/a.test.mjs"], ["test"], []])
-      assert.equal(core.requestTestStaging(io, "G1", { reason: "Update acceptance", paths }).ok, false);
-    assert.equal(core.requestTestStaging(io, "G1", { reason: "Update acceptance for the new behavior",
-      paths: ["./proof.test.mjs", "test/new.test.mjs", "test/old.test.mjs", "scripts/verify"] }).ok, true);
-    assert.equal(statusSnapshot(io).phase, "TEST_STAGING");
-    assert.equal(statusSnapshot(io).awaitingApproval, false);
-    assert.equal(loadNodeState(io, "G1").prepared, undefined);
-    assert.equal(loadRoot(io, "G1").approval, undefined);
-    assert.equal(core.completeTestStaging(io, "G1").ok, false);
-    assert.equal((await prepareNode(io)).ok, false);
-    assert.equal(approveRoot(io).ok, false);
-    assert.equal((await sealNode(io, "G1")).ok, false);
-    const misuse = await blockNode(io, "G1", { code: "AUTHORIZATION_MISSING", reason: "Need test edits" });
-    assert.equal(misuse.paused, undefined);
-    assert.match(misuse.errors[0], /test staging has its own approval/);
-    assert.equal(loadRoot(io, "G1").status, "ACTIVE");
-    write(dir, "proof.test.mjs", newTest);
-    assert.equal(enforceBaseline(io).restored, true, "request alone grants no writes");
-    assert.equal(readText(dir, "proof.test.mjs"), oldTest);
-    assert.equal(core.approveTestStaging(io, "G1", { userApproval: " " }).ok, false);
-    assert.equal(core.approveTestStaging(io, "G1", { userApproval: "Yes, update these tests" }).ok, true);
-    write(dir, "proof.test.mjs", newTest);
-    write(dir, "test/new.test.mjs", newTest);
-    fs.rmSync(path.join(dir, "test/old.test.mjs"));
-    write(dir, "scripts/verify", "new verify");
-    write(dir, "other.test.mjs", "outside approved paths");
-    write(dir, "feature.txt", "premature implementation");
-    fs.rmSync(path.join(dir, "keep.txt"));
-    fs.mkdirSync(path.join(dir, "generated"));
-    write(dir, "generated/added.js", "premature addition");
-    write(dir, "node_modules/pkg/index.js", "changed dependency");
-    const fresh = makeIo(dir, { exec: io.exec });
-    assert.equal(core.resumePreparation(fresh).ok, true);
-    assert.equal(statusSnapshot(fresh).staging.status, "open", "window survives reload");
-    assert.equal(draftNode(fresh, { goal: "g", outcomes: ROOT_OUTCOMES, criteria: ROOT_CRITERIA, revise: "G1" }).ok, false);
-    assert.equal((await prepareNode(fresh)).ok, false);
-    assert.equal((await sealNode(fresh, "G1")).ok, false);
-    // Supervisor calls above also enforce the guard. Add another product edit
-    // to exercise completion's restoration independently.
-    write(dir, "feature.txt", "another unauthorized edit");
-    if (boundary === "guard") assert.equal(enforceBaseline(fresh).restored, true);
-    const completed = core.completeTestStaging(fresh, "G1");
-    assert.equal(completed.ok, true, JSON.stringify(completed));
-    assert.deepEqual(completed.staged.files, ["proof.test.mjs", "scripts/verify", "test/new.test.mjs", "test/old.test.mjs"]);
-    assert.equal(readText(dir, "feature.txt"), "todo\n");
-    assert.equal(readText(dir, "keep.txt"), "preserved");
-    assert.equal(fs.existsSync(path.join(dir, "generated/added.js")), false);
-    assert.equal(readText(dir, "other.test.mjs"), oldTest);
-    assert.equal(readText(dir, "node_modules/pkg/index.js"), "dependency");
-    assert.equal(readText(dir, "proof.test.mjs"), newTest);
-    assert.deepEqual(scanCapabilities(dir).selectors["proof.test.mjs"], ["new behavior"]);
-    assert.equal(core.statusSnapshot(fresh).phase, "EVALUATOR_PREPARATION");
-    assert.equal(loadNodeState(fresh, "G1").testStagingsCompleted, 1);
-    assert.equal(loadNodeState(fresh, "G1").evaluatorMetrics.e0Attempts, attempts);
-    assert.equal(loadRoot(fresh, "G1").consumedAttempts, 0);
-    assert.equal(loadRoot(fresh, "G1").deadlineAt, null);
-    assert.equal(statusSnapshot(fresh).stagingHistory[0].approval.userReply, "Yes, update these tests");
-    assert.equal(approveRoot(fresh).ok, false, "staging never grants acceptance approval");
-    write(dir, "proof.test.mjs", "after staging");
-    assert.equal(enforceBaseline(fresh).restored, true);
-    assert.equal(readText(dir, "proof.test.mjs"), newTest);
-    assert.equal((await prepareNode(fresh)).ok, true);
-    assert.equal(approveRoot(fresh).ok, true);
-    assert.equal((await sealNode(fresh, "G1")).ok, true);
-    assert.equal(core.requestTestStaging(fresh, "G1", { reason: "Too late" }).ok, false);
-    write(dir, "proof.test.mjs", "weakened sealed acceptance");
-    const drift = await evaluateNode(fresh, "G1");
-    assert.equal(drift.pause.code, "EVALUATOR_DRIFT");
-    assert.equal(core.resumeRoot(fresh).ok, true);
-    assert.equal(readText(dir, "proof.test.mjs"), newTest, "resume restores the staged acceptance bytes");
-    assert.equal(draftNode(fresh, childArgs()).ok, true);
-    assert.match(core.requestTestStaging(fresh, "G1.1", { reason: "Change parent tests" }).errors[0], /sealed ancestor/);
-  });
-
-  for (const limit of ["draft-request", "files", "bytes", "windows", "missing-snapshot", "symlink", "no-changes", "revise-request"]) await t.test(limit, async (t) => {
-    const dir = tempProject(t, { "feature.txt": "todo\n", "proof.test.mjs": "old" });
-    const { io } = testIo(dir, fileExec(dir, { checks: standardChecks }));
-    draftNode(io, { goal: "g", outcomes: ROOT_OUTCOMES, criteria: ROOT_CRITERIA });
-    if(limit==="draft-request") {
-      const before=[fs.readFileSync(draftFile(dir,"G1"),"utf8"),loadRoot(io,"G1"),loadNodeState(io,"G1")];
-      for(const testStaging of [null,{}, {reason:""},{reason:"x".repeat(1001)}, {reason:"Tests",paths:["feature.txt"]},{reason:"Tests",paths:[]}]) {
-        assert.equal(draftNode(io,{goal:"changed",criteria:ROOT_CRITERIA,revise:"G1",testStaging}).ok,false);
-        assert.deepEqual([fs.readFileSync(draftFile(dir,"G1"),"utf8"),loadRoot(io,"G1"),loadNodeState(io,"G1")],before,"invalid staging does not partially revise the draft");
-      }
-      const submitted=draftNode(io,{goal:"g",criteria:ROOT_CRITERIA,revise:"G1",testStaging:{reason:"Write new acceptance tests",paths:["new.test.mjs"]}});
-      assert.equal(submitted.testStaging.status,"requested");
-      assert.equal(loadNodeState(io,"G1").evaluatorMetrics.e0Attempts,0);
-      assert.equal(fs.existsSync(path.join(dir,"new.test.mjs")),false,"the draft exists before the test");
-      assert.equal((await prepareNode(io)).ok,false,"pending staging prevents premature E0");
-      assert.equal(core.approveTestStaging(io,"G1").ok,true);
-      write(dir,"new.test.mjs","import {test} from 'node:test'; test('new behavior',()=>{});");
-      assert.equal(core.completeTestStaging(io,"G1").ok,true);
-      assert.equal((await prepareNode(io)).ok,true);
-      assert.equal(loadNodeState(io,"G1").phase,"READY_FOR_APPROVAL");
-      assert.equal(loadNodeState(io,"G1").evaluatorMetrics.e0Attempts,1);
-      assert.equal(loadRoot(io,"G1").consumedAttempts,0);
-      return;
-    }
-    if (limit === "windows") {
-      const node = loadNodeState(io, "G1"); node.testStagingsCompleted = core.MAX_TEST_STAGINGS_PER_NODE; core.saveNodeState(io, node);
-      assert.equal(core.requestTestStaging(io, "G1", { reason: "Again" }).ok, false); return;
-    }
-    core.requestTestStaging(io, "G1", { reason: "Update acceptance" });
-    if (limit === "revise-request") {
-      assert.equal(draftNode(io, { goal: "g", outcomes: ROOT_OUTCOMES, criteria: ROOT_CRITERIA, revise: "G1" }).ok, true);
-      assert.equal(statusSnapshot(io).staging, null); return;
-    }
-    if (limit === "missing-snapshot") {
-      fs.rmSync(path.join(baselineDir(dir), "manifest.json"));
-      assert.equal(core.approveTestStaging(io, "G1").ok, false);
-      assert.equal(statusSnapshot(io).staging.status, "requested"); return;
-    }
-    assert.equal(core.approveTestStaging(io, "G1").ok, true);
-    if (limit === "symlink") {
-      fs.symlinkSync("feature.txt", path.join(dir, "linked.test.mjs"));
-      assert.equal(enforceBaseline(io).restored, true);
-      assert.equal(fs.existsSync(path.join(dir, "linked.test.mjs")), false);
-      assert.equal(core.completeTestStaging(io, "G1").ok, true); return;
-    }
-    if (limit === "files") for (let i = 0; i <= core.MAX_STAGED_FILES; i++) write(dir, `added-${i}.test.mjs`, "test");
-    if (limit === "bytes") write(dir, "proof.test.mjs", "x".repeat(core.MAX_STAGED_BYTES + 1));
-    const completed = core.completeTestStaging(io, "G1");
-    if (limit === "no-changes") {
-      assert.equal(completed.ok, true);
-      assert.equal(loadNodeState(io, "G1").testStagingsCompleted, 0); return;
-    }
-    assert.equal(completed.ok, false);
-    assert.match(completed.errors[0], /exceed the bounded window/);
-    assert.equal(statusSnapshot(io).staging.status, "open");
-    assert.equal(readText(dir, ".exitcode/baseline/tree/proof.test.mjs"), "old");
-  });
-});
 
 test("baseline: review-time changes are discarded, sealing releases, and children and pauses freeze their own work", async (t) => {
   const dir = tempProject(t);
@@ -1067,9 +925,9 @@ test("status: injected state is bounded and evidence-free; explicit evidence is 
   assert.match(promptStatusText(io), /no active root/);
   // A large evaluator must never inflate the per-turn context.
   const huge = structuredClone(ROOT_CRITERIA);
-  huge[0].requirement = "r".repeat(5000);
+  const hugeOutcomes = [{id:"O1",requirement:"r".repeat(5000)}];
   for (let i = 3; i < 40; i++) huge.push(regression(`C${i}`, "check:reg"));
-  draftNode(io, { goal: "g".repeat(5000), outcomes: ROOT_OUTCOMES, criteria: huge });
+  draftNode(io, { goal: "g".repeat(5000), outcomes: hugeOutcomes, criteria: huge });
   const node = loadNodeState(io, "G1");
   node.diagnostics = Array.from({ length: 50 }, (_, i) => ({ code: "REJECT_NOT_DISCRIMINATED", criterionId: "C1", evidence: "x".repeat(10000), recommendedRepair: "fix" }));
   core.saveNodeState(io, node);

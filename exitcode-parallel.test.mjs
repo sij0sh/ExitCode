@@ -6,7 +6,7 @@ import * as path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { test } from 'node:test';
 import * as core from './exitcode-core.mjs';
-import { executionHorizon, captureCandidate, materialize } from './exitcode-parallel.mjs';
+import { executionHorizon, captureCandidate, materialize, preflightExecution } from './exitcode-parallel.mjs';
 import { releasePreparation } from './exitcode-preparation.mjs';
 import { structuralReview } from './test/structural-review.mjs';
 
@@ -17,7 +17,7 @@ const graph = [
 ];
 const read = (cwd, file) => fs.existsSync(path.join(cwd, file)) ? fs.readFileSync(path.join(cwd, file), 'utf8') : null;
 const write = (cwd, file, value) => fs.writeFileSync(path.join(cwd, file), value);
-const criterion = (id, file) => ({ id, requirement: `${file} contains the requested done artifact`, outcome: `O${id.slice(1)}`,
+const criterion = (id, file) => ({ id, outcome: `O${id.slice(1)}`,
   check: { recipe: { kind: 'custom_command', command: `observe:${file}` } },
   controls: { accept: { mutations: [{ kind: 'write_file', path: file, content: 'done' }] } } });
 
@@ -39,10 +39,12 @@ function fixture(t, { execution = graph, policy, semantic = false, files = {}, f
   const io = core.makeIo(cwd, { exec, review: structuralReview });
   const criteria = [criterion('C1', 'first'), criterion('C2', 'second'), criterion('C3', 'last'),
     { id: 'R1', requirement: 'Existing artifacts remain compatible', type: 'regression', check: { recipe: { kind: 'custom_command', command: 'preserve' } } }];
-  const args = { goal: 'Complete the three artifacts', outcomes: criteria.slice(0,3).map(c => ({ id:c.outcome,requirement:c.requirement })), criteria, execution, policy };
+  const args = { goal: 'Complete the three artifacts', outcomes: criteria.slice(0,3).map(c => ({ id:c.outcome,requirement:`${c.id} contains the requested done artifact` })), criteria, execution, policy };
   const drafted = core.draftNode(io, args);
   t.after(() => { releasePreparation(cwd); fs.rmSync(cwd, { recursive: true, force: true }); });
-  return { cwd, io, calls, lifecycle, fault, drafted, args };
+  const f = { cwd, io, calls, lifecycle, fault, drafted, args };
+  backend(f,implement);
+  return f;
 }
 async function seal(f) {
   assert.equal(f.drafted.ok, true, JSON.stringify(f.drafted));
@@ -55,6 +57,7 @@ async function seal(f) {
 function backend(f, run) {
   let active = 0, peak = 0;
   const api = {
+    async preflight(){ f.lifecycle.push(["preflight"]); },
     async start(spec) { f.lifecycle.push(['start',spec.id,spec.cwd]); active++; peak = Math.max(peak,active); return { ...spec, turns:0 }; },
     async send(handle, feedback) { handle.turns++; await run(handle, feedback); },
     async cancel(handle) { f.lifecycle.push(['cancel',handle.id]); },
@@ -71,6 +74,50 @@ const implement = async handle => {
   }
   write(handle.cwd,file,'done');
 };
+
+test('parallel: execution capability failures prevent approval and preflight starts no workers or Git candidates', async t=>{
+  const f=fixture(t),before=core.digestTree(f.cwd);
+  delete f.io.workerBackend;
+  const failed=await core.prepareNode(f.io);
+  assert.equal(failed.ok,false);assert.ok(failed.diagnostics.some(d=>d.code==='WORKER_UNAVAILABLE'));
+  assert.equal(core.approveRoot(f.io).ok,false);
+  backend(f,implement);
+  f.io.workerBackend.preflight=async()=>{throw Object.assign(Error('selected model unavailable'),{code:'WORKER_UNAVAILABLE'});};
+  assert.equal((await core.prepareNode(f.io)).ok,false);
+  assert.equal(core.approveRoot(f.io).ok,false);
+  backend(f,implement);
+  const passed=await core.prepareNode(f.io);
+  assert.equal(passed.ok,true,JSON.stringify(passed));
+  assert.ok(passed.stages.some(s=>s.stage==='execution-capability'&&s.ok));
+  assert.equal(f.lifecycle.filter(x=>x[0]==='start').length,0);
+  assert.equal(fs.existsSync(path.join(f.cwd,'.exitcode/parallel')),false);
+  assert.equal(core.digestTree(f.cwd),before);
+  assert.equal(core.loadRoot(f.io,'G1').consumedAttempts,0);
+  assert.equal(core.loadRoot(f.io,'G1').deadlineAt,null);
+});
+
+test('parallel: Git preflight accepts supported option forms and rejects missing or outdated Git', async t=>{
+  let workers=0;
+  const backend={preflight:async()=>{workers++;},start(){},send(){},cancel(){},dispose(){}};
+  for(const help of ['--write-tree --merge-base','--write-tree --[no-]merge-base']) {
+    await preflightExecution({workerBackend:backend},async(command,args)=>{
+      assert.equal(command,'git');assert.ok(args.includes('--merge-base=HEAD'));assert.equal(args.at(-1),'-h');
+      throw Object.assign(Error('usage'),{code:129,stderr:help});
+    });
+  }
+  assert.equal(workers,2);
+  for(const failure of [Object.assign(Error('not installed'),{code:'ENOENT'}),Object.assign(Error('usage'),{code:129,stderr:'--write-tree'})])
+    await assert.rejects(()=>preflightExecution({workerBackend:backend},async()=>{throw failure;}),e=>e.code==='GIT_UNAVAILABLE');
+  assert.equal(workers,2,'Git failure prevents worker runtime construction');
+  t.mock.timers.enable({apis:['setTimeout']});
+  let elapsed=0,entered;
+  t.mock.method(performance,'now',()=>elapsed);
+  const ready=new Promise(resolve=>{entered=resolve;});
+  const waiting=preflightExecution({workerBackend:{...backend,preflight:()=>{entered();return new Promise(()=>{});}}},
+    async()=>({stdout:'--write-tree --merge-base'}));
+  const rejected=assert.rejects(waiting,e=>e.code==='WORKER_UNAVAILABLE' && /timed out/.test(e.message));
+  await ready;elapsed=10_000;t.mock.timers.tick(10_000);await rejected;
+});
 
 test('parallel: DAG ownership and cycles are structural; horizons include transitive prerequisites and regressions', t => {
   for (const [name, execution, error] of [

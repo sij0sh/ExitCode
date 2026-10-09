@@ -24,7 +24,7 @@ function workspace(t, files = { feature: 'pending' }) {
 }
 const custom = command => ({ recipe: { kind: 'custom_command', command } });
 const OUTCOMES = [{ id: 'O1', requirement: 'The feature is done' }];
-const literal = (extra = {}) => [{ id: 'C1', requirement: 'Feature is done', outcome: 'O1', check: { recipe: { kind: 'file_contains', path: 'feature', value: 'done' } }, ...extra },
+const literal = (extra = {}) => [{ id: 'C1', outcome: 'O1', check: { recipe: { kind: 'file_contains', path: 'feature', value: 'done' } }, ...extra },
   { id: 'C2', requirement: 'Artifact persists', type: 'regression', check: { recipe: { kind: 'file_exists', path: 'feature' } } }];
 async function prepare(cwd, criteria, overrides = {}, args = {}) {
   const io = core.makeIo(cwd, { review: structuralReview, ...overrides });
@@ -46,7 +46,7 @@ function scenario(t, mode = 'strong') {
   const cwd = workspace(t, { 'store.mjs': good, 'profile.txt': 'existing',
     'profile.test.mjs': "import assert from 'node:assert/strict';import {test} from 'node:test';import {readFileSync} from 'node:fs';test('profile artifact remains',()=>assert.equal(readFileSync('profile.txt','utf8'),'existing'));" });
   const outcomes = [{ id: 'O1', requirement: 'Saving a timezone persists the selected value and rejects invalid input' }];
-  const criteria = [{ id: 'C1', requirement: 'Saving a timezone persists the selected value and rejects invalid input', outcome: 'O1',
+  const criteria = [{ id: 'C1', outcome: 'O1',
     check: { recipe: { kind: 'command_exit', command: 'node', args: ['--input-type=module', '-e', observe] } },
     controls: { accept: { mutations: [{ kind: 'write_file', path: 'store.mjs', content: good }] }, reject: [{ mutations: [{ kind: 'write_file', path: 'store.mjs', content: noop }] }] } },
   { id: 'C2', requirement: 'Existing profile artifact remains', type: 'regression', check: { recipe: { kind: 'existing_test', path: 'profile.test.mjs', selector: 'profile artifact remains' } } }];
@@ -54,7 +54,7 @@ function scenario(t, mode = 'strong') {
   if (structural) {
     fs.writeFileSync(path.join(cwd, 'LICENSE'), 'MIT');
     outcomes[0] = { id: 'O1', requirement: 'Package includes LICENSE' };
-    Object.assign(criteria[0], { requirement: 'Package includes LICENSE', check: { recipe: { kind: 'file_exists', path: 'LICENSE' } } });
+    Object.assign(criteria[0], {  check: { recipe: { kind: 'file_exists', path: 'LICENSE' } } });
     delete criteria[0].controls;
   }
   if (mode === 'thin' || mode === 'thin-new-feature') delete criteria[0].controls;
@@ -110,9 +110,21 @@ test('semantic: critic transport failures never block deterministic evidence', a
   });
 });
 
+test('semantic: critic concerns are visible warnings and never veto mechanical evidence', async t => {
+  for(const [mode,code] of [['critic-concern','MISSING_OUTCOME'],['critic-bundled','BUNDLED_OUTCOME']]) await t.test(mode,async t=>{
+    const {io}=scenario(t,mode),r=await core.prepareNode(io);
+    assert.equal(r.ok,true,JSON.stringify(r));
+    assert.deepEqual(r.diagnostics,[]);
+    assert.ok(r.warnings.some(w=>w.includes(code)));
+    assert.match(r.review,new RegExp(`Warnings[\\s\\S]*${code}`));
+    assert.match(core.statusText(io),new RegExp(code));
+    assert.equal(core.approveRoot(io).ok,true);
+    assert.equal((await core.sealNode(io,'G1')).ok,true);
+  });
+});
+
 test('semantic: uncovered, unchallenged, or contradictory evaluators never reach approval', async t => {
   const expected = { 'missing-outcome': 'OUTCOME_MISSING', 'unknown-outcome': 'OUTCOME_UNKNOWN', 'uncovered-outcome': 'OUTCOME_UNCOVERED',
-    'critic-concern': 'MISSING_OUTCOME', 'critic-bundled': 'BUNDLED_OUTCOME',
     thin: 'NEGATIVE_EVIDENCE_MISSING', 'thin-new-feature': 'POSITIVE_WITNESS_REQUIRED', 'setup-error': 'CONTROL_SETUP_FAILED',
     'witness-regression': 'REGRESSION_ON_WITNESS', 'runner-error': 'RUNNER_ERROR' };
   for (const mode of Object.keys(expected)) await t.test(mode, async t => {
@@ -120,7 +132,6 @@ test('semantic: uncovered, unchallenged, or contradictory evaluators never reach
     assert.equal(r.ok, false, JSON.stringify(r));
     assert.ok(r.diagnostics.length);
     if (expected[mode]) assert.ok(codes(r).includes(expected[mode]), `${mode}: ${codes(r)}`);
-    if (mode === 'critic-bundled') assert.match(r.diagnostics.find(d => d.code === 'BUNDLED_OUTCOME').recommendedRepair, /Split independently observable outcomes/);
     assert.equal(core.digestTree(cwd), before);
     assert.equal(r.review, undefined);
     assert.equal(core.statusSnapshot(io).awaitingApproval, false);
@@ -131,7 +142,7 @@ test('semantic: uncovered, unchallenged, or contradictory evaluators never reach
       'profile.test.mjs': "import assert from 'node:assert/strict';import {test} from 'node:test';import {readFileSync} from 'node:fs';test('profile artifact remains',()=>assert.equal(readFileSync('profile.txt','utf8'),'existing'));" });
     const io = core.makeIo(cwd, { review: structuralReview });
     const bad = core.draftNode(io, { goal: 'g', outcomes: [{ id: 'O1', requirement: 'o' }],
-      criteria: [{ id: 'C1', requirement: 'b', outcome: 'O1', check: { recipe: { kind: 'file_exists', path: 'store.mjs' } } },
+      criteria: [{ id: 'C1', outcome: 'O1', check: { recipe: { kind: 'file_exists', path: 'store.mjs' } } },
         { id: 'C2', requirement: 'r', type: 'regression', outcome: 'O1', check: { recipe: { kind: 'file_exists', path: 'profile.txt' } } }] });
     assert.equal(bad.ok, false, 'regression criteria must not claim requested outcomes');
   }
@@ -150,11 +161,11 @@ test('witnesses: built-in recipes need no controls; other checks need a passing 
   assert.ok(result.stages.find(s => s.stage === 'adversarial').probes.length >= 2, 'supervisor-generated negatives');
   for (const [label, value] of [['json', { kind: 'json_value', path: 'config.json', pointer: '/feature/enabled', value: true }],
     ['absence', { kind: 'file_not_contains', path: 'feature', value: 'pending' }]]) {
-    const { result } = await prepare(workspace(t), [{ id: 'C1', requirement: `Generated ${label} witness`, outcome: 'O1', check: { recipe: value } }, literal()[1]]);
+    const { result } = await prepare(workspace(t), [{ id: 'C1', outcome: 'O1', check: { recipe: value } }, literal()[1]]);
     assert.equal(result.ok, true, `${label}: ${JSON.stringify(result.diagnostics)}`);
   }
   // A custom check that already passes uses the candidate as its witness; one that cannot pass needs an authored witness.
-  const command = (cmd, extra = {}) => [{ id: 'C1', requirement: 'Feature observed', outcome: 'O1', check: custom(cmd), controls: { reject: [{ mutations: [{ kind: 'write_file', path: 'feature', content: 'broken' }] }] }, ...extra }, literal()[1]];
+  const command = (cmd, extra = {}) => [{ id: 'C1', outcome: 'O1', check: custom(cmd), controls: { reject: [{ mutations: [{ kind: 'write_file', path: 'feature', content: 'broken' }] }] }, ...extra }, literal()[1]];
   const exec = async (cmd, { cwd }) => ({ exit: read(cwd, 'feature') === (cmd === 'observe-done' ? 'done' : 'pending') ? 0 : 1, stdout: '', stderr: '', timedOut: false });
   assert.equal((await prepare(workspace(t), command('observe-pending'), { exec })).result.ok, true);
   const missing = (await prepare(workspace(t), command('observe-done'), { exec })).result;
@@ -164,13 +175,13 @@ test('witnesses: built-in recipes need no controls; other checks need a passing 
   const authored = command('observe-done', { controls: { accept: { mutations: [{ kind: 'write_file', path: 'feature', content: 'done' }] }, reject: [{ mutations: [{ kind: 'write_file', path: 'feature', content: 'broken' }] }] } });
   assert.equal((await prepare(workspace(t), authored, { exec })).result.ok, true);
   // A new behavior whose baseline already fails needs no explicit reject; one the baseline satisfies does.
-  const witnessOnly = [{ id: 'C1', requirement: 'Feature observed', outcome: 'O1', check: custom('observe-done'),
+  const witnessOnly = [{ id: 'C1', outcome: 'O1', check: custom('observe-done'),
     controls: { accept: { mutations: [{ kind: 'write_file', path: 'feature', content: 'done' }] } } }, literal()[1]];
   assert.equal((await prepare(workspace(t), witnessOnly, { exec })).result.ok, true, 'baseline FAIL plus witness PASS proves discrimination');
-  const baselineFail = [{ id: 'C1', requirement: 'Feature observed', outcome: 'O1', check: custom('observe-done') }, literal()[1]];
+  const baselineFail = [{ id: 'C1', outcome: 'O1', check: custom('observe-done') }, literal()[1]];
   assert.equal((await prepare(workspace(t), baselineFail, { exec })).result.ok, false, 'baseline failure is negative evidence but still needs a positive witness');
   assert.ok(codes((await prepare(workspace(t), baselineFail, { exec })).result).includes('POSITIVE_WITNESS_REQUIRED'));
-  const unchallenged = (await prepare(workspace(t), [{ id: 'C1', requirement: 'Feature observed', outcome: 'O1', check: custom('observe-pending') }, literal()[1]], { exec })).result;
+  const unchallenged = (await prepare(workspace(t), [{ id: 'C1', outcome: 'O1', check: custom('observe-pending') }, literal()[1]], { exec })).result;
   assert.ok(codes(unchallenged).includes('NEGATIVE_EVIDENCE_MISSING'));
 });
 
@@ -180,7 +191,7 @@ test('witnesses: controls that resemble a reference implementation are rejected 
   for (const [label, criteria, outcomes] of [
     ['bytes', literal({ controls: control(big) }), OUTCOMES],
     ['files', literal({ controls: { accept: { mutations: Array.from({ length: 17 }, (_, i) => ({ kind: 'write_file', path: `src/f${i}.mjs`, content: 'done' })) } } }), OUTCOMES],
-    ['repeated', [...literal({ controls: control(shared) }), { id: 'C3', requirement: 'Another outcome', outcome: 'O2', check: { recipe: { kind: 'file_contains', path: 'feature', value: 'y' } }, controls: control(shared) }], [...OUTCOMES, { id: 'O2', requirement: 'Another outcome' }]],
+    ['repeated', [...literal({ controls: control(shared) }), { id: 'C3', outcome: 'O2', check: { recipe: { kind: 'file_contains', path: 'feature', value: 'y' } }, controls: control(shared) }], [...OUTCOMES, { id: 'O2', requirement: 'Another outcome' }]],
   ]) {
     let reviews = 0;
     const { result } = await prepare(workspace(t), criteria, { review: async input => { reviews++; return structuralReview(input); } }, { outcomes });
@@ -221,7 +232,7 @@ test('review: critic concerns are compact and clipped; responses and prompts are
 test('review: critic input carries outcomes only, with small explicit specification text', t => {
   const cwd = workspace(t, { 'store.mjs': good, 'plan.md': 'Required outcome: the store persists.', 'huge.md': 'x'.repeat(20000) });
   const draft = { originalRequest: 'Persist the store', goal: 'Persist', outcomes: [{ id: 'O1', requirement: 'Store persists' }],
-    criteria: [{ id: 'C1', requirement: 'Store persists', outcome: 'O1', check: { recipe: { kind: 'file_exists', path: 'store.mjs' } } }],
+    criteria: [{ id: 'C1', outcome: 'O1', check: { recipe: { kind: 'file_exists', path: 'store.mjs' } } }],
     specificationPaths: ['plan.md', 'missing.md'] };
   const input = criticInput(draft, cwd);
   assert.equal(input.phase, 'critic');
@@ -233,7 +244,7 @@ test('review: critic input carries outcomes only, with small explicit specificat
   assert.ok(Buffer.byteLength(big.specificationText) <= 8192);
 });
 
-test('review: cancellation aborts reviewers, optional watchdogs are bounded, and slow reviews are not cut off', async t => {
+test('review: cancellation aborts reviewers, default watchdog bounds slow critics', async t => {
   const parent = new AbortController(); let nested;
   await assert.rejects(callReview(async (_input, { signal }) => { nested = signal; parent.abort(); return new Promise(() => {}); }, {}, { signal: parent.signal }), /cancelled/);
   assert.equal(nested.aborted, true);
@@ -242,14 +253,19 @@ test('review: cancellation aborts reviewers, optional watchdogs are bounded, and
   assert.equal(calls, 0);
   for (const timeoutMs of [0, -1, Infinity, NaN]) await assert.rejects(callReview(() => ({}), {}, { timeoutMs }), /finite and positive/);
   await assert.rejects(callReview(() => new Promise(() => {}), {}, { timeoutMs: 5 }), e => e.code === 'REVIEW_TIMEOUT');
-  assert.equal(core.REVIEW_TIMEOUT_MS, null);
+  assert.ok(core.REVIEW_TIMEOUT_MS >= 10_000 && core.REVIEW_TIMEOUT_MS <= 15_000);
   t.mock.timers.enable({ apis: ['setTimeout'] });
+  let elapsed=0;
+  t.mock.method(performance,'now',()=>elapsed);
   let slowSignal;
   const slow = callReview((_input, { signal }) => { slowSignal = signal; return new Promise(resolve => setTimeout(() => resolve({ reviewed: true }), 45000)); }, {});
+  const rejected = assert.rejects(slow,e=>e.code==='REVIEW_TIMEOUT');
   await Promise.resolve();
-  t.mock.timers.tick(45000);
-  assert.deepEqual(await slow, { reviewed: true });
-  assert.equal(slowSignal.aborted, false);
+  elapsed=core.REVIEW_TIMEOUT_MS;
+  t.mock.timers.tick(core.REVIEW_TIMEOUT_MS);
+  await rejected;
+  assert.equal(slowSignal.aborted, true);
+
 });
 
 // ---------------------------------------------------------------------------
@@ -265,7 +281,7 @@ test('discrimination: overfitted rejects, duplicates, false positives, and incon
   assert.equal(core.draftNode(io, { goal: 'Complete feature', criteria: literal(), revise: 'G1' }).ok, true);
   assert.equal((await core.prepareNode(io)).ok, true, 'repair precedes review without spending execution');
   assert.equal(core.statusSnapshot(io).consumedAttempts, 0);
-  const duplicate = literal(); duplicate[1].requirement = duplicate[0].requirement;
+  const duplicate = literal(); duplicate[1].requirement = OUTCOMES[0].requirement;
   assert.ok(codes((await prepare(workspace(t), duplicate)).result).includes('DUPLICATE_CRITERION'));
   // Empty-target wiring: a check that passes against nothing proves nothing.
   const always = async () => ({ exit: 0, stdout: '', stderr: '', timedOut: false });
@@ -276,7 +292,7 @@ test('discrimination: overfitted rejects, duplicates, false positives, and incon
   for (const [label, reject, failure, code] of [['timeout', broken, { timedOut: true }, 'RUNNER_ERROR'], ['error', broken, { error: 'unavailable' }, 'RUNNER_ERROR'],
     ['unappliable', { mutations: [{ kind: 'replace_text', path: 'feature', from: 'absent', to: 'x' }] }, null, 'CONTROL_SETUP_FAILED']]) {
     const exec = async (cmd, options) => failure && read(options.cwd, 'feature') === 'broken' ? { exit: null, stdout: '', stderr: '', timedOut: false, ...failure } : observed(cmd, options);
-    const criteria = [{ id: 'C1', requirement: 'Feature observed', outcome: 'O1', check: custom('observe'), controls: { accept: { mutations: [{ kind: 'write_file', path: 'feature', content: 'done' }] }, reject: [reject] } }, literal()[1]];
+    const criteria = [{ id: 'C1', outcome: 'O1', check: custom('observe'), controls: { accept: { mutations: [{ kind: 'write_file', path: 'feature', content: 'done' }] }, reject: [reject] } }, literal()[1]];
     const r = (await prepare(workspace(t), criteria, { exec })).result;
     assert.equal(r.ok, false, label);
     assert.ok(!codes(r).includes('REJECT_NOT_DISCRIMINATED'), `${label}: ${codes(r)}`);
@@ -289,7 +305,7 @@ test('discrimination: overfitted rejects, duplicates, false positives, and incon
 test('discrimination: inconsistent outcomes fail determinism, but harmless stdout variation does not', async t => {
   let n = 0;
   const flaky = async (_cmd, { cwd }) => ({ exit: read(cwd, 'feature') === 'done' && ++n % 2 === 1 ? 0 : 1, stdout: '', stderr: '', timedOut: false });
-  const criteria = [{ id: 'C1', requirement: 'Feature observed', outcome: 'O1', check: custom('observe'), controls: { accept: { mutations: [{ kind: 'write_file', path: 'feature', content: 'done' }] }, reject: [{ mutations: [{ kind: 'write_file', path: 'feature', content: 'pending' }] }] } }, literal()[1]];
+  const criteria = [{ id: 'C1', outcome: 'O1', check: custom('observe'), controls: { accept: { mutations: [{ kind: 'write_file', path: 'feature', content: 'done' }] }, reject: [{ mutations: [{ kind: 'write_file', path: 'feature', content: 'pending' }] }] } }, literal()[1]];
   assert.ok(codes((await prepare(workspace(t), criteria, { exec: flaky })).result).includes('NONDETERMINISTIC'));
   let count = 0;
   const timing = async (_cmd, { cwd }) => ({ exit: read(cwd, 'feature') === 'done' ? 0 : 1, stdout: `elapsed ${++count}ms`, stderr: '', timedOut: false });
@@ -304,8 +320,8 @@ test('recipes: selectors must be literal and discovered, discovery never execute
   assert.equal(fs.existsSync(path.join(cwd, 'leaked')), false);
   assert.throws(() => compileRecipe({ kind: 'existing_test', path: 'test/a.test.mjs', selector: 'absent' }, cap), /TEST_SELECTOR_NOT_FOUND/);
   for (const [recipe, code, hints] of [
-    [{ kind: 'existing_test', path: 'test/a.test.mjs', selector: 'future behavior' }, 'TEST_SELECTOR_NOT_FOUND', [/never invent/, /command_exit\/custom_command/, /test_suite/, /exitcode_stage_tests/]],
-    [{ kind: 'existing_test', path: 'future.test.mjs', selector: 'future behavior' }, 'CHECK_TARGET_MISSING', [/never invent/, /exitcode_stage_tests/]],
+    [{ kind: 'existing_test', path: 'test/a.test.mjs', selector: 'future behavior' }, 'TEST_SELECTOR_NOT_FOUND', [/never invent/, /test_asset/, /test_suite/]],
+    [{ kind: 'existing_test', path: 'future.test.mjs', selector: 'future behavior' }, 'CHECK_TARGET_MISSING', [/never invent/, /test_asset/]],
     [{ kind: 'command_exit', command: './scripts/verify' }, 'INVALID_SPEC', [/basename plus args/, /"command":"sh"/, /scripts\/verify/, /custom_command/, /test_suite/]],
   ]) {
     const diagnostics = lintEvaluators({ criteria: [{ id: 'C1', check: { recipe } }] }, cwd, cap);
@@ -393,26 +409,24 @@ async function sealed(t, files, criteria, args = {}, exec = sandboxCommand) {
   return { cwd, io };
 }
 
-test('assets: acceptance helpers and test inventory freeze while imported product source stays mutable', async t => {
+test('assets: live repository tests and helpers change while sealed copies remain authoritative', async t => {
   const source = "import{readFileSync}from'node:fs';export const value=()=>readFileSync('feature','utf8');";
   const helper = "import{value}from'../src/product.mjs';process.exit(value()==='done'?0:1);";
-  const criteria = [{ id: 'C1', requirement: 'The product reports done', outcome: 'O1', check: { ...custom('node checks/accept.mjs'), assets: ['checks/accept.mjs'] },
+  const criteria = [{ id: 'C1', outcome: 'O1', check: { ...custom('node checks/accept.mjs'), assets: ['checks/accept.mjs'] },
     controls: { accept: { mutations: [{ kind: 'write_file', path: 'feature', content: 'done' }] }, reject: [{ mutations: [{ kind: 'write_file', path: 'feature', content: 'broken' }] }] } }, literal()[1]];
   const { cwd, io } = await sealed(t, { 'src/product.mjs': source, 'checks/accept.mjs': helper, 'tests/mandatory.test.mjs': 'export const mandatory=true;' }, criteria);
   const bundle = core.loadBundle(io, 'G1');
   assert.ok(bundle.assets.files.some(f => f.path === 'checks/accept.mjs'));
-  assert.ok(!bundle.assets.files.some(f => f.path === 'src/product.mjs'));
+  assert.ok(!bundle.assets.files.some(f => f.path === 'src/product.mjs' || f.path === 'tests/mandatory.test.mjs'));
   fs.writeFileSync(path.join(cwd, 'src/product.mjs'), source + '\n// Permitted product implementation change.\n');
-  fs.writeFileSync(path.join(cwd, 'feature'), 'done');
   fs.writeFileSync(path.join(cwd, 'checks/accept.mjs'), 'process.exit(0);');
-  assert.equal((await core.evaluateNode(io)).pause.code, 'EVALUATOR_DRIFT');
-  fs.writeFileSync(path.join(cwd, 'checks/accept.mjs'), helper);
-  assert.equal(core.resumeRoot(io).ok, true);
-  fs.writeFileSync(path.join(cwd, 'tests/new.test.mjs'), 'export const newCase=true;');
-  assert.equal((await core.evaluateNode(io)).pause.code, 'EVALUATOR_DRIFT');
-  fs.rmSync(path.join(cwd, 'tests/new.test.mjs'));
-  assert.equal(core.resumeRoot(io).ok, true);
+  fs.writeFileSync(path.join(cwd, 'tests/new.test.mjs'), 'throw Error("not approved acceptance");');
+  fs.rmSync(path.join(cwd, 'tests/mandatory.test.mjs'));
+  const failed = await core.evaluateNode(io);
+  assert.equal(failed.ok,true); assert.equal(core.loadNodeState(io,'G1').lastResult.allPass,false,'live helper cannot weaken the sealed assertion');
+  fs.writeFileSync(path.join(cwd, 'feature'), 'done');
   assert.equal((await core.evaluateNode(io)).status, 'PASS');
+  assert.equal(read(cwd,'checks/accept.mjs'),'process.exit(0);','evaluation leaves product tests alone');
 });
 
 test('assets: the evaluator package closure stays frozen while approved product dependencies change', async t => {
@@ -455,7 +469,11 @@ test('assets: capture canonicalizes declared paths, pins runtimes and configurat
   assert.ok(assets.directories.includes('checks/fixtures'));
   verifyEvaluatorAssets(cwd, directory, assets);
   fs.writeFileSync(path.join(cwd, 'checks/accept.mjs'), 'process.exit(0);');
-  assert.throws(() => verifyEvaluatorAssets(cwd, directory, assets), /acceptance asset changed: checks\/accept.mjs/);
+  verifyEvaluatorAssets(cwd, directory, assets); // The repository copy is product content.
+  const frozenHelper = path.join(directory,'checks/accept.mjs');
+  fs.writeFileSync(frozenHelper,'process.exit(0);');
+  assert.throws(()=>verifyEvaluatorAssets(cwd,directory,assets),/acceptance asset changed: checks\/accept.mjs/);
+  fs.writeFileSync(frozenHelper,'process.exit(1);');
   fs.writeFileSync(path.join(cwd, 'checks/accept.mjs'), 'process.exit(1);');
   fs.writeFileSync(path.join(cwd, 'package.json'), '{"name":"product","dependencies":{"cli":"1"},"devDependencies":{"review":"2"},"scripts":{"test":"node --test"}}');
   assert.throws(() => verifyEvaluatorAssets(cwd, directory, assets), /acceptance asset changed: package.json/);

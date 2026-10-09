@@ -5,10 +5,10 @@ import { BUILTIN_RECIPES, candidateIdentity, digest, diagnostic, inventory, appl
 import { ensureRunning, operationError } from './exitcode-operation.mjs';
 
 export function emptyMetrics() {
-  return { evaluatorProposals:0,e0Attempts:0,shellExecutions:0,probeExecutions:0,cacheHits:0,fixtureCopies:0,fixtureBytes:0,wallTimeMs:0,reviewCalls:0,reviewCompleted:0,transportRetries:0,diagnosticCounts:{},reviewTurns:0,tokenUsage:{available:false},peakConcurrency:0 };
+  return { evaluatorProposals:0,e0Attempts:0,shellExecutions:0,probeExecutions:0,cacheHits:0,fixtureCopies:0,fixtureBytes:0,wallTimeMs:0,reviewCalls:0,reviewCompleted:0,diagnosticCounts:{},reviewTurns:0,tokenUsage:{available:false},peakConcurrency:0 };
 }
 export function addMetrics(total, step) {
-  for(const k of ['evaluatorProposals','e0Attempts','shellExecutions','probeExecutions','cacheHits','fixtureCopies','fixtureBytes','wallTimeMs','reviewTurns','reviewCalls','reviewCompleted','transportRetries'])total[k]=(total[k]??0)+(step[k]??0);
+  for(const k of ['evaluatorProposals','e0Attempts','shellExecutions','probeExecutions','cacheHits','fixtureCopies','fixtureBytes','wallTimeMs','reviewTurns','reviewCalls','reviewCompleted'])total[k]=(total[k]??0)+(step[k]??0);
   if(step.tokenUsage?.available){
     total.tokenUsage ??= {available:false};
     if(!total.tokenUsage.available)total.tokenUsage={available:true,input:0,output:0,cacheRead:0,cacheWrite:0,totalTokens:0,cost:{input:0,output:0,cacheRead:0,cacheWrite:0,total:0}};
@@ -46,14 +46,14 @@ export function releasePreparation(cwd) {const s=sessions.get(cwd);if(s)fs.rmSyn
 process.once('exit',()=>{for(const s of sessions.values())try{fs.rmSync(s.dir,{recursive:true,force:true});}catch{/* process is exiting */}});
 
 /** Staged E0: deterministic mechanical validation, then a best-effort semantic critic. */
-export async function prepareGate(draft, {cwd,exec,runCheck,defaultTimeoutMs,environment,maxBytes,candidateDigest,useCache=true,review,signal,reviewTimeoutMs,assets,assetsDirectory,onProgress,deadlineAt,nowMs=Date.now}) {
+export async function prepareGate(draft, {cwd,exec,runCheck,defaultTimeoutMs,environment,maxBytes,candidateDigest,useCache=true,review,signal,reviewTimeoutMs,executionPreflight,assets,assetsDirectory,onProgress,deadlineAt,nowMs=Date.now}) {
   ensureRunning(signal,deadlineAt,nowMs);
   const options={signal,deadlineAt,nowMs};
-  const metrics=emptyMetrics(),stages=[],diagnostics=[],start=Date.now();metrics.e0Attempts=1;
+  const metrics=emptyMetrics(),stages=[],diagnostics=[],warnings=[],start=Date.now();metrics.e0Attempts=1;
   const finish=extra=>{
     metrics.wallTimeMs=Date.now()-start;
     for(const d of diagnostics)metrics.diagnosticCounts[d.code]=(metrics.diagnosticCounts[d.code]??0)+1;
-    return {ok:!diagnostics.length,diagnostics,errors:diagnostics.map(d=>`${d.criterionId??'contract'}: ${d.code}: ${d.evidence}`),stages,metrics,...extra};
+    return {ok:!diagnostics.length,diagnostics,warnings,errors:diagnostics.map(d=>`${d.criterionId??'contract'}: ${d.code}: ${d.evidence}`),stages,metrics,...extra};
   };
   const report = (stage) => {ensureRunning(signal);onProgress?.({phase:'EVALUATOR_PREPARATION',stage,elapsedMs:Date.now()-start});};
   const boundaryDiagnostic = (e,stage) => {
@@ -79,6 +79,12 @@ export async function prepareGate(draft, {cwd,exec,runCheck,defaultTimeoutMs,env
   const identity=digest({candidateDigest,environment});
   try {
     report('preflight');
+    if(draft.execution) {
+      if(typeof executionPreflight !== 'function')throw operationError('WORKER_UNAVAILABLE','execution capability preflight unavailable');
+      await executionPreflight();
+      ensureRunning(signal,deadlineAt,nowMs);
+      stages.push({stage:'execution-capability',ok:true});
+    }
     session=sessionFor(cwd,identity,maxBytes,metrics,signal,options);
     if(candidateIdentity(session.base,options)!==candidateDigest)throw operationError('CANDIDATE_MUTATED','Candidate changed while copying preparation base');
     if(exec===sandboxCommand && draft.criteria.some(c=>!BUILTIN_RECIPES.includes(c.check.recipe.kind))) {
@@ -201,15 +207,20 @@ export async function prepareGate(draft, {cwd,exec,runCheck,defaultTimeoutMs,env
       const response=await callReview(review,criticInput({...draft,parentRequirement:draft.parentRequirement},cwd),{signal,timeoutMs:reviewTimeoutMs});
       metrics.reviewCompleted++;
       const concerns=validateCritic(response);
-      if(concerns.length){diagnostics.push(...concerns);criticStatus='concerns';}
+      if(concerns.length){warnings.push(...concerns.map(c=>`${c.code}: ${c.evidence}`));criticStatus='concerns';}
       else criticStatus='pass';
     }catch(e){
-      if(signal?.aborted||['CANCELLED','DEADLINE_EXCEEDED'].includes(e.code??signal?.reason?.code)){
+      if(signal?.aborted){
         diagnostics.push(diagnostic(signal?.reason?.code??e.code??'CANCELLED','preparation',null,e.message,'Resume with authorized remaining budget','supervisor'));
-      }else stages.push({stage:'critic-transport',code:e.code??'REVIEW_UNAVAILABLE',evidence:e.message});
+      }else {
+        const evidence=String(e.message??e).slice(0,300);
+        warnings.push(`Semantic critic unavailable (${e.code??'REVIEW_UNAVAILABLE'}): ${evidence}`);
+        stages.push({stage:'critic-unavailable',code:e.code??'REVIEW_UNAVAILABLE',evidence});
+      }
       criticStatus='unavailable';
     }
   }
+  if(typeof review !== 'function')warnings.push('Semantic critic unavailable: no critic configured');
   stages.push({stage:'critic',status:criticStatus,ok:!diagnostics.some(d=>d.stage==='critic')});
   const outcomes=completed.filter(r=>r.stage==='baseline').map(r=>r.outcome).filter(Boolean);
   return finish({capabilities,baseline:{outcomes,allPass:outcomes.length>0&&outcomes.every(o=>o.status==='PASS'),at:new Date().toISOString(),candidateDigest}});

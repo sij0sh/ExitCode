@@ -30,8 +30,8 @@ Only fresh supervisor evaluation can close it.
 
 The normal path needs one approval and no clarification turn.
 Contract-specific acceptance tests and challenge fixtures belong in the draft's `assets` map.
-ExitCode stores those files privately and validates them without changing the repository or requesting test-staging approval.
-Durable product regression tests stay in the repository. Explicit pre-seal edits to those tests can still use a bounded, user-authorized staging window.
+ExitCode stores those files privately and validates them without changing the repository.
+Durable product regression tests stay in the repository and may change after sealing.
 Ask a question in conversation, before drafting, only when ambiguity materially changes success and no repository convention or default resolves it.
 Clarification is not part of the contract schema.
 READY_FOR_APPROVAL pauses automatic continuation; the candidate stays read-only until sealing.
@@ -47,7 +47,7 @@ For persistent loading, run `pi install .` in this repository.
 Pi supplies `typebox` and its extension API.
 No production npm dependency is added.
 A compatible Pi installation and Node runtime are required.
-Parallel execution also requires Git with `merge-tree --write-tree --merge-base` support.
+Parallel execution also requires Git with `merge-tree --write-tree --merge-base` support. E0 checks this option form and verifies that the Pi worker backend can construct its runtime and use the selected model before the plan reaches approval; it creates no workers or Git candidates.
 
 **Executable evaluation requires Linux bubblewrap and usable unprivileged namespaces.**
 Install bubblewrap with your system package manager before using executable recipes.
@@ -63,7 +63,6 @@ Unavailable isolation is a runner error, not evidence of a detected defect.
 | --- | --- |
 | `/exitcode approve` | Approve and seal the exact validated plan. |
 | `/exitcode status [evidence]` | Show phase, criteria, budgets, diagnostics, and next action; `evidence` adds the full contract, E0 evidence, digests, and metrics. |
-| `/exitcode stage-tests [approve]` | Show the test-staging request, or approve it to open a test-only pre-seal window. |
 | `/exitcode exit` | Cancel enforcement without claiming success or deleting work. |
 | `/exitcode resume [Gid]` | Resume the same root; draft repair returns control to the agent, while retry-safe sealed evaluation reruns. |
 | `/exitcode resume minutes=N attempts=N evaluators=N` | Record explicit positive execution or evaluator-construction grants and resume. |
@@ -74,19 +73,18 @@ The supervisor binds it to the prepared bundle and policy.
 Roots approve an execution duration, not a countdown spent during review.
 It does not authenticate the origin or semantic meaning of that quote.
 
-The adapter exposes seven tools only during ExitCode mode.
+The adapter exposes six tools only during ExitCode mode.
 `exitcode_draft` automatically prepares root proposals and returns either typed repair diagnostics or a validated review.
-Include `assets` and a `test_asset` recipe for new contract-specific tests. Include `testStaging: { reason, paths }` only when durable repository tests explicitly need pre-seal edits; that defers E0 until staging completes and the next draft is submitted.
-Preparation infrastructure failures leave an unsealed root ACTIVE with a DRAFT and diagnostics, without spending evaluator-quality budget. The agent can revise, stage tests, inspect evidence, or retry preparation.
+Include `assets` and a `test_asset` recipe for new contract-specific tests.
+Preparation infrastructure failures leave an unsealed root ACTIVE with a DRAFT and diagnostics, without spending evaluator-quality budget. The agent can revise, inspect evidence, or retry preparation.
 `exitcode_seal` seals a reviewed bundle without rerunning preparation.
 Stale candidate, environment, or evaluator evidence requires preparation and approval again.
 `exitcode_evaluate` runs sealed checks fresh.
 `exitcode_child` proposes one reduction of a failed parent criterion.
 `exitcode_block` preserves a concrete external authority, infrastructure, budget, or viable-path blocker as a resumable root pause.
-A draft whose diagnostics are all agent-repairable (lint, review, witness, or discrimination findings) cannot be blocked; the supervisor rejects the call and returns the existing next action.
-Acceptance-asset edits use `exitcode_draft`; durable repository test edits use `exitcode_stage_tests`.
+A draft whose diagnostics are all agent-repairable (lint, witness, or discrimination findings) cannot be blocked; the supervisor rejects the call and returns the existing next action.
+Acceptance-asset edits use `exitcode_draft`; repository tests are mutable product content after sealing.
 Only a genuinely declined child path uses `NO_PATH` to withdraw child edits and rerun its ancestors.
-`exitcode_stage_tests` requests, opens, or completes a user-authorized pre-seal window to edit only conventional test files.
 `exitcode_status` shows operational state; `detail: "evidence"` adds full mechanics for debugging.
 Each agent turn receives only the five-sentence protocol and a status summary capped at 4 KiB.
 That summary never includes checks, controls, evaluator evidence, or metrics.
@@ -100,7 +98,7 @@ ExitCode never changes your tool loadout or classifies tools by name.
 Any built-in, custom, or extension tool stays available in every phase.
 Instead, ExitCode enforces two state invariants:
 
-- Before sealing, the product candidate is immutable; only a user-authorized test-staging window may change conventional test files.
+- Before sealing, the entire product candidate, including repository tests, is immutable.
 - `.exitcode/` is private to the supervisor in every phase.
 
 Entering `/exitcode` or proposing a child snapshots the current candidate as the pre-seal baseline.
@@ -113,31 +111,8 @@ The latest three discarded change sets are kept.
 This applies to every source, including your own edits during review.
 To change product files before approval, use `/exitcode exit`, edit, then `/exitcode resume` and review a fresh preparation.
 To author or revise contract-specific tests before sealing, submit their bytes through `exitcode_draft.assets`; the supervisor writes them under `.exitcode/`, and the candidate remains unchanged. Asset revisions invalidate preparation and approval, requiring fresh validation.
-When durable repository tests explicitly need pre-seal edits, the agent requests test staging with `exitcode_stage_tests`; one user reply (or `/exitcode stage-tests approve`) opens a bounded window for conventional test files only, and completion re-baselines the staged tests and requires fresh validation before approval.
 Sealing releases the baseline, and the agent then implements normally.
 
-For the exceptional task that requires durable product tests to change before implementation:
-
-1. Draft the observable outcomes using discovered checks or focused commands with minimal witnesses. Include `testStaging: { reason, paths }` to explain the acceptance tests that must change and defer the first E0. An existing draft can also request staging with `exitcode_stage_tests`.
-2. Quote the user's staging authorization to open the window, or use `/exitcode stage-tests approve`. While waiting, the root stays ACTIVE and automatic continuation stops.
-3. Edit the requested conventional test files and call `exitcode_stage_tests` with `complete: true`. Product files, installed dependencies, and tests outside the requested paths stay frozen. If paths are omitted, all conventional test files are eligible within the limits.
-4. Discover the staged literal test names, revise the draft, and validate it again. Present the fresh validated plan for approval, seal it, then implement the product change.
-
-Staging allows at most 32 changed files, 1 MiB of changed file content, and three nonempty completed windows per root.
-Files must be regular files; symlinks cannot be staged.
-The window survives reloads. A request or open window prevents plan approval and sealing; requesting staging immediately invalidates earlier preparation and approval.
-Revising the draft cancels an unopened staging request. An open window must be completed first; completing an empty window spends no staging allowance.
-After root sealing, acceptance assets remain immutable, including during child preparation.
-Use `/exitcode exit`, edit, then `/exitcode resume` when a product change or a replacement sealed contract requires leaving that boundary.
-
-Built-in file tools cannot read or write `.exitcode/`.
-Shell commands that mention it are blocked.
-ExitCode cannot inspect arbitrary tools' arguments, so sealed bundles also carry content digests that block execution when changed.
-ExitCode protects its candidate and supervisor state, not the world.
-A tool can still send email, change a database, push a branch, call an API, or write outside the project.
-Installed dependency content participates in candidate identity, snapshots, and pre-seal restoration.
-Git metadata and supervisor directories are excluded.
-These checks are not an operating-system boundary against compromised trusted host tools.
 
 ## Recipes and discovery
 
@@ -187,7 +162,7 @@ The bounded initial recipe set is:
 | `custom_command` | `command` | Run a visibly identified shell escape hatch inside isolation. |
 
 Every check has exactly one representation, `check.recipe`; `custom_command` is the isolated shell escape hatch.
-Roots need a regression criterion to protect existing behavior the work could break.
+Regression criteria are optional; add focused checks for existing behavior the work could break.
 `check.expect` can fix exit and stdout expectations.
 `check.timeoutSeconds` is an immutable explicit watchdog and is never silently shortened in the contract.
 Its actual execution allowance cannot exceed the remaining global deadline.
@@ -197,7 +172,7 @@ The capability manifest is content-keyed and cached.
 Dynamic test names are not discovered.
 Selectors must resolve to a discovered literal and execute at least one test.
 Never invent a future test name for `existing_test`; controls cannot make an undiscovered selector pass lint.
-Copy the exact name from the current test file or discovery manifest. After staging a new or renamed test, discover it again before drafting.
+Copy the exact name from the current test file or discovery manifest. For future behavior, supply a contract-owned `test_asset` instead of inventing a selector.
 The initial script recipes support npm only.
 Missing file/JSON targets fail normally, including negative-content checks.
 Malformed JSON fails normally.
@@ -207,14 +182,14 @@ No HTTP, JSON Schema, or non-Node runner integration is included.
 | Intent | Recipe |
 | --- | --- |
 | Run one test already discovered | `existing_test` with its exact `path` and literal `selector` |
-| Prove new behavior before implementation | A focused `command_exit` or `custom_command` with a minimal positive witness and discriminating negatives; stage tests first if their acceptance assertions must change |
+| Prove new behavior before implementation | A contract-owned `test_asset` with a minimal positive witness; focused `command_exit` or `custom_command` is also supported |
 | Require literal artifact content | `file_contains`; source text alone does not prove runtime behavior |
 | Preserve the discovered npm test suite | `test_suite` as a regression criterion; it runs `npm test`, not `scripts/verify` |
 | Run this repository's full verification | `{"kind":"command_exit","command":"sh","args":["scripts/verify"]}` or `{"kind":"custom_command","command":"sh scripts/verify"}` |
 
 `command_exit.command` must be an executable basename: `./scripts/verify` is invalid.
-Use `sh` with `scripts/verify` in `args`, or a `custom_command` shell string when shell syntax is needed.
-Each behavior outcome needs exactly one focused criterion. Split separate contracts such as response schema, model selection, and cancellation into focused outcomes; the semantic critic reports `BUNDLED_OUTCOME` for combined outcomes.
+Use `sh` with `scripts/verify` in `args`, or a `custom_command` shell string when shell syntax is needed. For custom commands, declare assertion runners and tests in `check.assets`; add `test_suite` when the conventional suite surface is part of the approved evaluator. Referenced scripts are not inferred from shell text.
+Each behavior outcome needs exactly one focused criterion. Behavior criteria contain `outcome` and `check`; their display text comes from `outcome.requirement`. Only regressions have their own `requirement`. Split separate contracts such as response schema, model selection, and cancellation into focused outcomes; the semantic critic reports `BUNDLED_OUTCOME` for combined outcomes.
 
 ```json
 {
@@ -222,7 +197,6 @@ Each behavior outcome needs exactly one focused criterion. Split separate contra
   "outcomes": [{ "id": "O1", "requirement": "Feature artifact contains the result" }],
   "criteria": [
     {
-      "requirement": "Feature artifact contains the result",
       "outcome": "O1",
       "check": {"recipe": {"kind": "file_contains", "path": "result.txt", "value": "done"}}
     },
@@ -272,8 +246,8 @@ E0 is deterministic mechanical validation plus one best-effort semantic critic.
 5. **Critic:** A tiny semantic check compares the request with the declared outcomes only. Unavailable, malformed, or slow critics never block mechanical evidence.
 
 An unchanged fixture, unappliable or unsafe mutation, timeout, or runner ERROR is not successful challenge evidence.
-Existing means discovered now; tests for future behavior require a focused witness or pre-seal test staging.
-Critic concerns produce repair diagnostics rather than silently rewriting criteria.
+Existing means discovered now; tests for future behavior normally use `test_asset` and a focused witness.
+Critic concerns are prominent plan warnings; they never veto mechanical validation or user approval.
 
 ### Immutable evaluator assets
 
@@ -288,14 +262,14 @@ For example, add the following fields to a draft with the usual goal, outcomes, 
     "C1.test.mjs": "import {test} from 'node:test'; import assert from 'node:assert/strict'; import {value} from '../src/value.mjs'; test('reports done', () => assert.equal(value, 'done'));"
   },
   "criteria": [{
-    "id": "C1", "outcome": "O1", "requirement": "The feature reports done",
+    "id": "C1", "outcome": "O1",
     "check": {"recipe": {"kind": "test_asset", "asset": "C1.test.mjs", "command": "node", "args": ["--test"]}},
     "controls": {"accept": {"mutations": [{"kind": "write_file", "path": "src/value.mjs", "content": "export const value = 'done';"}]}}
   }]
 }
 ```
 
-Asset names are canonical relative paths, with at most 64 files and 1 MiB of UTF-8 content per draft.
+Asset names are canonical relative paths, with at most 16 files and 128 KiB of UTF-8 content per draft. Larger payloads return `EVALUATOR_ASSETS_OVERBUILT`; narrow the proof.
 The supervisor stores the authoritative bytes under `.exitcode/assets/<node>.prepared/.exitcode-evaluator/`, then copies them into `<node>.sealed` at sealing.
 Every probe installs those files at `.exitcode-evaluator/` inside its disposable candidate copy, read-only during execution.
 Relative imports such as `../src/value.mjs` resolve against that copy; auxiliary fixtures can use `new URL('./fixtures/input.json', import.meta.url)`.
@@ -308,18 +282,15 @@ Revisions retain assets when omitted; an explicit `assets` map replaces them in 
 `/exitcode status evidence` shows each asset's supervisor source and execution command.
 Promotion to a durable repository test is an explicit follow-up after the contract passes, separate from the success path.
 
-Preparation captures conventional tests, fixtures, runner configuration, and required case inventory.
-The sealed bundle records their content identities and supervisor-owned copies.
+Repository tests, fixtures, and test runners are mutable product files after sealing.
+For `existing_test`, preparation seals a copy of the exact referenced test. For `test_suite`, it seals the approved conventional test, fixture, and runner configuration surface and constructs that exact suite in each disposable candidate, removing newly added conventional tests from that copy.
 Custom assertion helpers and imported expectation/configuration files outside those paths must appear in `check.assets`.
-For example, `"assets": ["checks/accept.mjs", "checks/expected.json"]` freezes those helpers.
+For example, `"assets": ["checks/accept.mjs", "checks/expected.json"]` seals copies of those helpers.
 Product source remains mutable merely because a check imports or executes it.
-Independent review must flag undeclared acceptance helpers.
-Automatic discovery cannot infer arbitrary shell or import graphs.
-Fixture mutations cannot replace the authoritative acceptance bytes.
-Each executable check gets frozen assets mounted read-only inside a disposable candidate copy.
-Changed acceptance bytes or test-selection inventory pause execution rather than weaken the evaluator.
-User resume can restore those exact supervisor-owned bytes and remove added acceptance files before reevaluating.
-It never constructs replacement acceptance from the current candidate.
+Automatic discovery cannot infer arbitrary shell or import graphs; declare unconventional suite helpers and runners explicitly.
+Each executable check receives the sealed copies read-only after fixture setup.
+Live repository test edits, additions, and deletions remain in the product candidate and never replace the evaluator copies.
+Tampering with supervisor-owned sealed copies pauses evaluation. Runtime and dependency drift still invalidate evidence; user resume restores only that runtime boundary, preserving product tests.
 
 Use `specificationPaths` to include small referenced Markdown plans as critic context.
 Missing specifications are omitted; they never block mechanical validation.
@@ -337,18 +308,18 @@ This flag does not grant installation, network, credentials, or external authori
 New root and child preparation optionally uses the currently selected Pi model through `ctx.modelRegistry.streamSimple()` for one best-effort semantic critic call.
 The call starts with a fresh context containing only the request, goal, outcomes, assumptions, exclusions, and small specification text, not the session history, and offers at most one `submit_review` response tool.
 Changing the session model applies to subsequent critic calls.
-The critic has a 1024 output-token ceiling and an 8 KiB response bound, with at most three clipped concerns.
+The critic has a 12-second timeout, a 1024 output-token ceiling and an 8 KiB response bound, with at most three clipped concerns.
 Tool updates report phase and elapsed progress.
 Cancellation still aborts preparation.
 Provider errors, invalid responses, malformed evidence, timeouts, and missing models mark the critic unavailable; deterministic E0 continues and the user can still approve.
-There are no transport retries or shape fallbacks for the critic.
+Concerns and availability failures are warnings; cancellation still stops preparation. There are no critic retries.
 Model calls add cost and latency even when mechanical probe evidence is cached.
 Nested model usage is reported in tool results and accumulated in preparation metrics.
 Core integrations may supply an `io.review(input, {signal})` callback; without one, the critic is unavailable.
 Tests and benchmarks use explicitly injected deterministic reviewers, not a production bypass.
 
 Diagnostics contain `code`, `stage`, `criterionId`, `evidence`, `repairability`, and `recommendedRepair`.
-Examples include OUTCOME_UNCOVERED, MISSING_OUTCOME, BUNDLED_OUTCOME, EVALUATOR_OVERBUILT, POSITIVE_WITNESS_REQUIRED, NEGATIVE_EVIDENCE_MISSING, REGRESSION_ON_WITNESS, REJECT_NOT_DISCRIMINATED, EMPTY_TARGET_PASS, NONDETERMINISTIC, and EXTERNAL_DEPENDENCY.
+Examples include OUTCOME_UNCOVERED, EVALUATOR_OVERBUILT, EVALUATOR_ASSETS_OVERBUILT, POSITIVE_WITNESS_REQUIRED, NEGATIVE_EVIDENCE_MISSING, REGRESSION_ON_WITNESS, REJECT_NOT_DISCRIMINATED, EMPTY_TARGET_PASS, NONDETERMINISTIC, and EXTERNAL_DEPENDENCY.
 Mechanical repair normalizes numeric timeouts.
 Other repairs are agent-authored evaluator revisions inside a bounded construction budget.
 The sealed execution start and implementation counters never reset.
@@ -432,14 +403,14 @@ Confirmed infrastructure failures are recorded without charging a substantive ev
 
 A pause preserves root identity, original request, phase, stack, approval, bundle, useful edits, diagnostics, and cumulative counters.
 Pauses record a recovery kind: `retry`, `repair`, `grant`, or `external`. `/exitcode resume` replays only explicitly retry-safe sealed operations, including evaluation after an explicit budget grant. An unsealed DRAFT returns control to the agent and never automatically replays preparation.
-Draft revision, test-staging request/approval/completion, and explicit preparation also recover legacy preparation pauses on an unsealed root. Recovery retains pause history, diagnostics, approval records, policy, grants, and cumulative budgets, and grants no product-write authority.
+Draft revision and explicit preparation also recover legacy preparation pauses on an unsealed root. Recovery retains pause history, diagnostics, approval records, policy, grants, and cumulative budgets, and grants no product-write authority.
 Only one supervisor operation owns a workspace at a time.
 Reload or another session cannot clear a live operation's lock.
 A transcript must explicitly adopt another active workspace root through the resume command.
-No external worker, scheduler, installation, credential acquisition, or authority grant is automatic.
+Independent workers start only for approved execution graphs. Installation, credential acquisition, and authority grants remain external prerequisites.
 
 Execution exhaustion requires `/exitcode resume minutes=N` or `/exitcode resume attempts=N`.
-Construction exhaustion reports EVALUATOR_UNBUILDABLE and requires `/exitcode resume evaluators=N` before further E0 attempts. Revision and staging remain available, and never reset consumed construction attempts.
+Construction exhaustion reports EVALUATOR_UNBUILDABLE and requires `/exitcode resume evaluators=N` before further E0 attempts. Revision remains available, and never reset consumed construction attempts.
 Values are positive additions, not replacement limits.
 Time additions extend the later of the previous deadline and the grant time.
 Grants are user-command records separate from sealed policy.
@@ -450,13 +421,13 @@ Fixing an incorrect sealed evaluator requires a superseding contract and fresh u
 ### Store generations
 
 Supervisor state is pre-1.0 and not backward compatible.
-`.exitcode/index.json` records one `formatVersion` for everything persisted under `.exitcode/`.
+`.exitcode/index.json` records one `formatVersion` for everything persisted under `.exitcode/` (currently generation 2).
 A store from any other generation is never migrated or partially interpreted.
 On first access, ExitCode moves it untouched to `.exitcode/archive/<timestamp>/` and starts fresh; the candidate is not modified.
 
 ## Instrumentation and benchmark
 
-Status exposes evaluator proposals, construction attempts, reviewer calls/completions/retries, probe/shell executions, fixture counts/bytes, elapsed preparation time, diagnostics, pauses, grants, review turns, cache hits, and peak concurrency.
+Status exposes evaluator proposals, construction attempts, critic calls/completions, probe/shell executions, fixture counts/bytes, elapsed preparation time, diagnostics, pauses, grants, review turns, cache hits, and peak concurrency.
 Model usage is reported when the provider returns it.
 Missing final usage is unavailable cost, not evidence of zero billing.
 Other integrations report usage only when their host supplies it.

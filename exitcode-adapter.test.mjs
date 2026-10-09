@@ -22,7 +22,7 @@ const custom = (command) => ({ recipe: { kind: "custom_command", command } });
 const writes = (path, content) => ({ mutations: [{ kind: "write_file", path, content }] });
 const outcomes = [{ id: "O1", requirement: "The feature is done" }];
 const criteria = [
-  { id: "C1", requirement: "The feature is done", outcome: "O1", check: custom("grep -qx done feature.txt"),
+  { id: "C1", outcome: "O1", check: custom("grep -qx done feature.txt"),
     controls: { accept: writes("feature.txt", "done\n"), reject: [writes("feature.txt", "todo\n")] } },
   { id: "C2", requirement: "Existing behavior is preserved", type: "regression", check: custom("test -f feature.txt") },
 ];
@@ -117,7 +117,7 @@ test("adapter: mode exposes ExitCode tools without ever changing the user's load
 
 test('adapter: an approved execution DAG runs SDK workers through evaluation and exits only after canonical root PASS', async t => {
   const launches=[];
-  const workers={async start(spec){launches.push(spec);return spec;},async send(spec){fs.writeFileSync(path.join(spec.cwd,'feature.txt'),'done\n');},async cancel(){},async dispose(){}};
+  const workers={async preflight(){},async start(spec){launches.push(spec);return spec;},async send(spec){fs.writeFileSync(path.join(spec.cwd,'feature.txt'),'done\n');},async cancel(){},async dispose(){}};
   const h=harness(t,'todo\n',['read','write','bash'],{...core,createPiWorkerBackend:()=>workers});
   const plan=await draft(h,{execution:[{id:'S1',objective:'Finish the feature',verify:['C1']} ]});
   assert.equal(plan.details.ok,true);
@@ -185,8 +185,9 @@ test("adapter: approval comes from a plain-English reply or /exitcode approve, a
   await draft(h);
   await h.reply("Looks good, but also require the existing interface.");
   const revised = structuredClone(criteria);
-  revised[0].requirement += " through the existing interface";
-  assert.match((await h.tool("exitcode_draft", { goal: "Finish the feature", outcomes, criteria: revised, revise: "G1" })).content[0].text, /through the existing interface/);
+  const revisedOutcomes = structuredClone(outcomes);
+  revisedOutcomes[0].requirement += " through the existing interface";
+  assert.match((await h.tool("exitcode_draft", { goal: "Finish the feature", outcomes:revisedOutcomes, criteria: revised, revise: "G1" })).content[0].text, /through the existing interface/);
   assert.equal((await h.tool("exitcode_seal", { node: "G1" })).isError, true);
   const accepted = "Yes, that version works. Please proceed.";
   await h.reply(accepted);
@@ -218,76 +219,6 @@ test("adapter: approval comes from a plain-English reply or /exitcode approve, a
   assert.equal(feature(c), "todo\n");
 });
 
-test("adapter: stage-tests opens a bounded test-only window without leaving mode or pausing for approval", async (t) => {
-  for (const approval of ["reply", "command"]) await t.test(approval, async (t) => {
-    const h = harness(t);
-    const registry=reviewRegistry();h.ctx.modelRegistry=registry;
-    const oldProof="import {test} from 'node:test'; test('old behavior',()=>{});";
-    const stagedProof="import {test} from 'node:test'; import assert from 'node:assert/strict'; import {readFileSync} from 'node:fs'; test('new behavior',()=>assert.equal(readFileSync('feature.txt','utf8'),'done\\n'));";
-    fs.writeFileSync(path.join(h.cwd, "proof.test.mjs"), oldProof);
-    const stagedCriteria = [
-      { id: "C1", requirement: "Artifact says done", outcome: "O1", check: { recipe: { kind: "existing_test", path: "proof.test.mjs", selector: "new behavior" } },
-        controls:{accept:writes("feature.txt","done\n"),reject:[writes("feature.txt","todo\n")]} },
-      { id: "C2", type: "regression", requirement: "Artifact remains", check: { recipe: { kind: "file_exists", path: "feature.txt" } } },
-    ];
-    const request = await draft(h, { criteria: stagedCriteria,testStaging:{reason:"Update the acceptance assertion for the requested behavior",paths:["proof.test.mjs"]} });
-    assert.equal(request.details.testStaging.status, "requested");
-    assert.equal(registry.calls.length,0,"staging request defers the first E0");
-    assert.equal(core.loadNodeState(io(h),"G1").evaluatorMetrics.e0Attempts,0);
-    assert.match(request.content[0].text, /quote it as userApproval/);
-    assert.match(promptText(h), /phase TEST_STAGING/);
-    assert.equal(core.statusSnapshot(io(h)).awaitingApproval, false);
-    for (let i = 0; i <= core.MAX_SETTLE_NUDGES; i++) assert.equal(await settle(h), undefined, "pending staging waits without a continuation loop");
-    assert.equal(core.loadRoot(io(h), "G1").status, "ACTIVE");
-    assert.equal((await h.tool("exitcode_stage_tests", { complete: true })).isError, true);
-    assert.equal((await h.tool("exitcode_stage_tests", { reason: "Update", userApproval: "yes" })).isError, true);
-    await h.command("stage-tests");
-    assert.match(h.notifications.at(-1).content, /proof\.test\.mjs/);
-    await h.command("approve");
-    assert.equal(core.loadNodeState(io(h), "G1").status, "DRAFT");
-    await h.reload();
-    assert.equal(core.statusSnapshot(io(h)).staging.status, "requested");
-    if (approval === "reply") {
-      await h.reply("Yes, update proof.test.mjs");
-      assert.equal(core.statusSnapshot(io(h)).staging.status, "requested", "a user message alone does not approve a window");
-      const opened = await h.tool("exitcode_stage_tests", { userApproval: "Yes, update proof.test.mjs" });
-      assert.equal(opened.details.status, "open");
-    } else {
-      h.setIdle(false);
-      await h.command("stage-tests approve");
-      assert.match(h.notifications.at(-1).content, /Wait for the agent/);
-      h.setIdle(true);
-      await h.command("stage-tests approve");
-      assert.equal(h.messages.at(-1).customType, "exitcode-staging");
-      assert.equal(h.messages.at(-1).triggerTurn, true);
-    }
-    await h.reload();
-    assert.equal(core.statusSnapshot(io(h)).staging.status, "open");
-    assert.equal((await settle(h)).continue, true, "an authorized staging window continues work");
-    fs.writeFileSync(path.join(h.cwd, "proof.test.mjs"), stagedProof);
-    fs.writeFileSync(path.join(h.cwd, "feature.txt"), "premature implementation");
-    assert.equal((await settle(h)).continue, true);
-    assert.equal(feature(h), "todo\n");
-    assert.equal(fs.readFileSync(path.join(h.cwd, "proof.test.mjs"), "utf8"), stagedProof);
-    const completed = await h.tool("exitcode_stage_tests", { complete: true });
-    assert.deepEqual(completed.details.staged.files, ["proof.test.mjs"]);
-    assert.equal(core.statusSnapshot(io(h)).staging, null);
-    const premature = await h.tool("exitcode_seal", { node: "G1", userApproval: "old acceptance" });
-    assert.equal(premature.isError, true);
-    assert.match(premature.content[0].text, /prepared and validated/);
-    const prepared = await h.tool("exitcode_draft", { goal: "Finish the feature", outcomes, criteria: stagedCriteria, revise: "G1" });
-    assert.equal(prepared.details.ok, true);
-    assert.equal(core.loadNodeState(io(h),"G1").phase,"READY_FOR_APPROVAL");
-    assert.equal(core.loadNodeState(io(h),"G1").evaluatorMetrics.e0Attempts,1);
-    assert.equal(await settle(h), undefined);
-    const sealed = await h.tool("exitcode_seal", { node: "G1", userApproval: "Approve the validated plan" });
-    assert.equal(sealed.details.ok, true);
-    fs.writeFileSync(path.join(h.cwd, "feature.txt"), "done\n");
-    assert.equal((await h.tool("exitcode_evaluate", {})).details.cascade.terminal.status, "PASS");
-    assert.equal(core.resolveModeFromBranch(h.entries).on, false);
-    assert.equal(h.tools.get("exitcode_stage_tests").exposure, "hidden");
-  });
-});
 
 test("adapter: settle restores pre-seal changes, bounds continuations, and cannot be reset by status calls", async (t) => {
   const h = harness(t, "todo\n", ["read", "write", "bash", "semantic_repo_search"]);
@@ -328,7 +259,7 @@ test("adapter: settle restores pre-seal changes, bounds continuations, and canno
 
 test("adapter: only a fresh root PASS exits mode; child PASS, stale PASS, and pauses keep enforcement", async (t) => {
   const ordered = harness(t);
-  const orderedCriteria = [...criteria, { id: "C3", requirement: "The final artifact contains done", outcome: "O3",
+  const orderedCriteria = [...criteria, { id: "C3", outcome: "O3",
     check: { recipe: { kind: "file_contains", path: "last.txt", value: "done" } } }];
   const orderedOutcomes = [...outcomes, { id: "O3", requirement: "The final artifact contains done" }];
   const sequence = [{ objective: "Prove the feature", verify: ["C1"] }, { objective: "Prove the last artifact", verify: ["C3"] }];
@@ -352,7 +283,7 @@ test("adapter: only a fresh root PASS exits mode; child PASS, stale PASS, and pa
   const h = harness(t);
   await draft(h);
   await h.command("approve");
-  const childCriteria = [{ id: "D1", requirement: "Helper ready", outcome: "O1", check: custom("grep -qx ready helper.txt"),
+  const childCriteria = [{ id: "D1", outcome: "O1", check: custom("grep -qx ready helper.txt"),
     controls: { accept: writes("helper.txt", "ready\n"), reject: [writes("helper.txt", "todo\n")] } }];
   await h.tool("exitcode_child", { parent: "G1", target: "C1", goal: "Prepare helper", outcomes: [{ id: "O1", requirement: "Helper ready" }], criteria: childCriteria, reason: "Helper is a prerequisite", prerequisite: true, prerequisiteArtifact: "helper.txt" });
   fs.writeFileSync(path.join(h.cwd, "progress.txt"), "parent work\n");

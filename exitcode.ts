@@ -40,12 +40,12 @@ const CheckSchema = Type.Object({
     command: Type.Optional(Type.String({ description: "command_exit: executable basename (e.g. sh), with args separately; custom_command: isolated shell string (e.g. sh scripts/verify)" })),
     args: Type.Optional(Type.Array(Type.String(), { description: "command_exit arguments; test_asset runner arguments before its appended asset path, e.g. [--test] with command node" })),
   }),
-  assets: Type.Optional(Type.Array(Type.String({minLength:1}), {description:"Acceptance helpers outside conventional test paths; frozen at seal, not product source"})),
+  assets: Type.Optional(Type.Array(Type.String({minLength:1}), {description:"Additional assertion helpers, fixtures, and runner configuration to seal as copies, including helpers for existing_test. Repository versions remain mutable"})),
   timeoutSeconds: Type.Optional(Type.Number({ description: "Immutable explicit check watchdog; otherwise use remaining execution time" })),
   expect: Type.Optional(ExpectSchema),
 });
 
-const AssetsSchema = Type.Record(Type.String(), Type.String(), {description:"Contract-owned test/fixture files as bundle-relative name -> UTF-8 content (up to 64 files, 1 MiB total). ExitCode stores and seals them privately; never write .exitcode directly. Use ../src imports from .exitcode-evaluator/; keep durable regression tests in the repository."});
+const AssetsSchema = Type.Record(Type.String(), Type.String(), {description:"Contract-owned test/fixture files as bundle-relative name -> UTF-8 content (up to 16 files, 128 KiB total). ExitCode stores and seals them privately; never write .exitcode directly. Use ../src imports from .exitcode-evaluator/; keep durable regression tests in the repository."});
 
 const MutationSchema = Type.Object({
   kind: Type.Union(core.MUTATION_KINDS.map((x: string) => Type.Literal(x))),
@@ -103,14 +103,21 @@ const ExecutionSchema = Type.Array(Type.Object({
   after: Type.Optional(Type.Array(Type.String({minLength:1}), {description:"Prerequisite behavior criteria; fresh integrated PASS unlocks this slice regardless of array order"})),
 }), {minItems:1,maxItems:12,description:"Root proof DAG. Independent ready slices run concurrently in private Git repositories; cannot combine with legacy sequence"});
 
-const CriterionSchema = Type.Object({
+const CriterionFields = {
   id: Type.Optional(Type.String({ description: "Suggested id (supervisor assigns C1..Cn when omitted)" })),
-  requirement: Type.String({ description: "One independently observable outcome in plain language; split unrelated behaviors into separate criteria" }),
-  type: Type.Optional(Type.Union([Type.Literal("behavior"), Type.Literal("regression")], { description: "behavior (default) or regression" })),
-  outcome: Type.Optional(Type.String({ description: "Behavior only: the declared outcome id this criterion proves (exactly one criterion per outcome)" })),
   check: CheckSchema,
   controls: Type.Optional(ControlsSchema),
-});
+};
+const CriterionSchema = Type.Union([
+  Type.Object({...CriterionFields,
+    type: Type.Optional(Type.Literal("behavior")),
+    outcome: Type.String({description:"Declared outcome id this criterion proves; display text comes from that outcome"}),
+  }, {additionalProperties:false}),
+  Type.Object({...CriterionFields,
+    type: Type.Literal("regression"),
+    requirement: Type.String({minLength:1,description:"Existing behavior this regression protects"}),
+  }, {additionalProperties:false}),
+]);
 
 const PolicySchema = Type.Object({
   localRepairs: Type.Optional(Type.Number({ description: "Local repair attempts before ordinary child decomposition is permitted (default 2)" })),
@@ -351,7 +358,7 @@ export default function (pi: ExtensionAPI) {
       label: "Exitcode Draft",
       description:
         "Submit the smallest observable acceptance contract: explicit outcomes plus one criterion per outcome. Prefer discovered existing tests; never invent an existing_test selector. " +
-        "For new behavior supply contract-owned assets with a test_asset recipe and a minimal positive witness; use the project's runtime and test_suite for regression. testStaging is only for explicitly requested durable product test edits. " +
+        "For new behavior supply contract-owned assets with a test_asset recipe and a minimal positive witness; use the project's runtime and test_suite for regression. " +
         "For independent root slices, supply execution as a complete acyclic proof graph; dependencies name behavior criteria. " +
         "ExitCode validates it before user review; repair returned diagnostics, then present the returned plan and wait for the user's reply.",
       promptSnippet: "exitcode_draft: submit the root contract (goal + outcomes + observable criteria + checks)",
@@ -367,10 +374,6 @@ export default function (pi: ExtensionAPI) {
         exclusions: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { description: "Out-of-scope work to show in user review" })),
         revise: Type.Optional(Type.String({ description: "Existing DRAFT root id to revise (e.g. G1)" })),
         policy: Type.Optional(PolicySchema),
-        testStaging: Type.Optional(Type.Object({
-          reason: Type.String({minLength:1,maxLength:1000,description:"Which durable product tests explicitly need pre-seal edits and why; contract-specific tests use assets"}),
-          paths: Type.Optional(Type.Array(Type.String({minLength:1}), {minItems:1,maxItems:core.MAX_STAGED_FILES,description:"Exact conventional test files to stage"})),
-        }, {description:"Create or revise the DRAFT, request authorized test staging, and defer automatic E0 until a later draft submission"})),
         specificationPaths: Type.Optional(Type.Array(Type.String({minLength:1}), {description:"Advanced: referenced Markdown plans to include as small critic context"})),
         mutableDependencies: Type.Optional(Type.Boolean({description:"Advanced: the task must change product dependencies; devDependencies and evaluator runtimes stay frozen"})),
       }),
@@ -393,7 +396,6 @@ export default function (pi: ExtensionAPI) {
           assumptions: params.assumptions,
           exclusions: params.exclusions,
           revise: params.revise,
-          testStaging: params.testStaging,
         });
         if (!result.ok) return textResult(`draft rejected:\n${errLines(result)}`, result, true);
         rt.rootId = result.rootId;
@@ -401,17 +403,11 @@ export default function (pi: ExtensionAPI) {
         persistMode();
         syncBaseline(ctx);
         io.expectedRootId=result.rootId;
-        if(result.testStaging) {
-          const staging=result.testStaging;
-          return textResult(withWarnings([`test staging requested for ${result.id}.`, `reason: ${staging.reason}`,
-            ...(staging.paths?.length?[`paths: ${staging.paths.join(", ")}`]:[]),
-            "Present this request and wait for the user's reply; quote it as userApproval to open the window.", `next: ${staging.next}`],result.warnings).join("\n"),result);
-        }
         const prepared = await core.prepareNode(io,result.id);
         prepared.warnings=[...(result.warnings??[]),...(prepared.warnings??[])];
         syncBaseline(ctx);
         if (!prepared.ok) return {...textResult(withWarnings([`Evaluator preparation needs repair:\n${errLines(prepared)}`],prepared.warnings).join("\n"),prepared,true),usage:io.reviewUsage};
-        return {...textResult(withWarnings([prepared.review],prepared.warnings).join("\n"),prepared),usage:io.reviewUsage};
+        return {...textResult(withWarnings([prepared.review],result.warnings).join("\n"),prepared),usage:io.reviewUsage};
       }),
     },
     {
@@ -501,7 +497,7 @@ export default function (pi: ExtensionAPI) {
     {
       name: "exitcode_block",
       label: "Exitcode Block",
-      description: "Pause for a concrete external authority, infrastructure, budget, or viable-path blocker. Ask the user directly about ambiguity. Contract-specific tests use draft assets; explicit durable test edits use exitcode_stage_tests. Agent-repairable evaluator diagnostics need evaluator repair. Only a child NO_PATH withdraws that path and reruns its parent.",
+      description: "Pause for a concrete external authority, infrastructure, budget, or viable-path blocker. Ask the user directly about ambiguity. Contract-specific tests use draft assets; repository tests can change after sealing. Agent-repairable evaluator diagnostics need evaluator repair. Only a child NO_PATH withdraws that path and reruns its parent.",
       promptSnippet: "exitcode_block: pause with the concrete missing requirement",
       parameters: Type.Object({
         node: Type.Optional(Type.String({ description: "Node id (defaults to the active leaf)" })),
@@ -523,47 +519,7 @@ export default function (pi: ExtensionAPI) {
         return textResult((result.events ?? []).join("\n"), result);
       }),
     },
-    {
-      name: "exitcode_stage_tests",
-      label: "Exitcode Stage Tests",
-      description: "For explicitly requested durable product test edits before root sealing, request, open, or complete a user-authorized window. Contract-specific tests use exitcode_draft assets instead. Present the reason and paths, quote the user's reply, edit only those tests, then complete to re-baseline and revalidate. Pending staging waits without pausing the root.",
-      promptSnippet: "exitcode_stage_tests: request, open, or complete a test-only pre-seal window",
-      parameters: Type.Object({
-        node: Type.Optional(Type.String({ description: "Draft node id (defaults to the active leaf)" })),
-        reason: Type.Optional(Type.String({ description: "Why durable product tests explicitly need edits before validation (requests a window)" })),
-        paths: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { description: "Exact conventional test files authorized for this window; omit to allow conventional test files within the staging limits" })),
-        userApproval: Type.Optional(Type.String({ minLength: 1, description: "Quote the user's reply authorizing test staging (e.g. 'yes, update the tests'). Silence or a change request is not approval." })),
-        complete: Type.Optional(Type.Boolean({ description: "Close the open window, re-baseline staged tests, and require fresh validation" })),
-      }),
-      execute: async (_id, params, _signal, _onUpdate, ctx) => withOperation(ctx,_signal,_onUpdate,async io => {
-        assertMode();
-        const actions = Number(params.complete === true) + Number(params.userApproval !== undefined) + Number(params.reason !== undefined);
-        if (actions !== 1 || params.paths !== undefined && params.reason === undefined)
-          return textResult("stage rejected:\n- supply exactly one action: reason (with optional paths), userApproval, or complete:true", { ok: false }, true);
-        const target = params.node ?? (() => {
-          const snap = core.statusSnapshot(io);
-          const stack = snap.stack ?? [];
-          return stack.length > 0 ? stack[stack.length - 1] : null;
-        })();
-        if (!target) return textResult("stage rejected:\n- no active node", { ok: false }, true);
-        const run = params.complete === true
-          ? core.completeTestStaging(io, target)
-          : params.userApproval !== undefined
-            ? core.approveTestStaging(io, target, { userApproval: params.userApproval })
-            : params.reason !== undefined
-              ? core.requestTestStaging(io, target, { reason: params.reason, paths: params.paths })
-              : { ok: false, errors: ["supply reason to request, userApproval to open, or complete:true to close test staging"] };
-        if (!run.ok) {syncBaseline(ctx);return textResult(`stage rejected:\n${errLines(run)}`, run, true);}
-        syncBaseline(ctx);
-        const lines = [`test staging ${run.status} for ${run.id}.`];
-        if (run.status === "requested") lines.push(`reason: ${run.reason}`, ...(run.paths?.length ? [`paths: ${run.paths.join(", ")}`] : []),
-          "Present this request and wait for the user's reply; quote it as userApproval to open the window.");
-        if (run.status === "open") lines.push("Edit only conventional test files; product changes are restored. Complete with exitcode_stage_tests when done.");
-        if (run.status === "completed") lines.push(`staged: ${run.staged.files.join(", ") || "(no test changes)"} (${run.staged.bytes} bytes).`);
-        if (run.next) lines.push(`next: ${run.next}`);
-        return textResult(withWarnings(lines, run.warnings).join("\n"), run);
-      }),
-    },
+
   ];
 
   // Register hidden: outside exitcode mode the tools are unreachable and the
@@ -641,7 +597,7 @@ export default function (pi: ExtensionAPI) {
       if(root?.status==='PASS')maybeAutoExit({terminal:{root:root.id,status:root.status,outcome:root.outcome}},ctx);
       return undefined;
     }
-    if(snap.status==='PAUSED' || snap.awaitingApproval || snap.staging?.status==='requested')return undefined;
+    if(snap.status==='PAUSED' || snap.awaitingApproval)return undefined;
     const leafId=snap.stack?.at(-1),leaf=leafId?(snap.nodes as any)?.[leafId]:null;
     if(!leaf || !['ACTIVE','DRAFT'].includes(leaf.status))return undefined;
     if(snap.expired) {
@@ -672,7 +628,6 @@ export default function (pi: ExtensionAPI) {
       "/exitcode <goal>  enter exitcode mode rooted at your goal (root only; children come from exitcode_child)",
       "/exitcode approve optional shortcut to approve the root draft and start autonomous work",
       "/exitcode status [evidence]  show the active contract, vectors, and budgets (evidence adds full E0 evidence)",
-      "/exitcode stage-tests [approve]  show the test-staging request, or approve it to open a test-only pre-seal window",
       "/exitcode resume [Gid] [minutes=N] [attempts=N] [evaluators=N]  retry the same paused operation; optional positive grants require this user command",
       "/exitcode exit    user cancellation only; not successful completion (work on disk is preserved)",
     ].join("\n");
@@ -722,46 +677,7 @@ export default function (pi: ExtensionAPI) {
         }, { triggerTurn: rt.modeOn && core.statusSnapshot(io).status==="ACTIVE" });
         return;
       }
-      if (sub === "stage-tests") {
-        const rest = text.split(/\s+/).slice(1);
-        if (rest.length > 1 || (rest.length === 1 && rest[0] !== "approve")) {
-          ctx.ui.notify("Usage: /exitcode stage-tests [approve]", "warning");
-          return;
-        }
-        if (!rt.modeOn) {
-          ctx.ui.notify("Enter exitcode mode with /exitcode resume before staging tests.", "warning");
-          return;
-        }
-        const snap = core.statusSnapshot(core.makeIo(ctx.cwd, { expectedRootId: rt.rootId }));
-        const leafId = snap.stack?.at(-1);
-        const staging = (snap as any).staging;
-        if (!leafId || !staging) {
-          ctx.ui.notify("No test-staging request is pending. Contract-specific tests use draft assets; exitcode_stage_tests handles explicit durable product test edits.", "info");
-          return;
-        }
-        if (rest.length === 0) {
-          ctx.ui.notify(`Test staging for ${staging.node} [${staging.status}]: ${staging.reason}${staging.paths?.length ? `\nPaths: ${staging.paths.join(", ")}` : ""}\n${snap.next}`, "info");
-          return;
-        }
-        if (!ctx.isIdle()) {
-          ctx.ui.notify("Wait for the agent to finish before approving test staging.", "warning");
-          return;
-        }
-        const approved = core.approveTestStaging(core.makeIo(ctx.cwd, { expectedRootId: rt.rootId }), leafId, {});
-        if (!approved.ok) {
-          ctx.ui.notify(withWarnings([`staging approval rejected:\n${errLines(approved)}`], (approved as any).warnings).join("\n"), "warning");
-          return;
-        }
-        rt.nudges = 0; rt.progress = undefined;
-        syncBaseline(ctx);
-        pi.sendMessage({
-          customType: "exitcode-staging",
-          content: `User approved test staging for ${leafId}. Edit only conventional test files, then complete staging with exitcode_stage_tests.`,
-          display: true,
-          details: approved,
-        }, { triggerTurn: true });
-        return;
-      }
+
       if (sub === "exit") {
         if (text !== "exit") {
           ctx.ui.notify("Usage: /exitcode exit", "warning");
@@ -803,7 +719,7 @@ export default function (pi: ExtensionAPI) {
             pi.sendMessage({customType:'exitcode-resume',content:result.review??withWarnings(result.events??[result.ok?result.next??result.vector??'operation completed':errLines(result)],result.warnings).join('\n'),display:true,details:result},
               {triggerTurn:rt.modeOn && core.statusSnapshot(operation).status==='ACTIVE' && !core.statusSnapshot(operation).awaitingApproval});
           });
-        } else if(!snap.awaitingApproval && snap.staging?.status!=="requested") {
+        } else if(!snap.awaitingApproval) {
           pi.sendMessage({customType:'exitcode-resume',content:`Resumed root ${resumed.id}. ${snap.next}`,display:true,details:resumed},{triggerTurn:true});
         }
         return;

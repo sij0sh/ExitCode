@@ -50,7 +50,7 @@ export function validateEvaluatorAssetDefinitions(draft) {
   if (typeof assets !== 'object' || assets === null || Array.isArray(assets))
     throw operationError('EVALUATOR_ASSET_INVALID', 'assets must map evaluator file names to UTF-8 content');
   const names = Object.keys(assets);
-  if (names.length > 64) throw operationError('EVALUATOR_ASSET_INVALID', 'at most 64 evaluator assets are allowed');
+  if (names.length > 16) throw operationError('EVALUATOR_ASSETS_OVERBUILT', 'at most 16 evaluator assets are allowed; narrow the proof');
   let bytes = 0;
   for (const name of names) {
     evaluatorAssetPath(name);
@@ -59,7 +59,7 @@ export function validateEvaluatorAssetDefinitions(draft) {
     if (names.some(other => other.startsWith(name + '/')))
       throw operationError('EVALUATOR_ASSET_INVALID', `asset file conflicts with a directory: ${name}`);
   }
-  if (bytes > 1024 * 1024) throw operationError('EVALUATOR_ASSET_INVALID', 'evaluator assets exceed 1 MiB');
+  if (bytes > 128 * 1024) throw operationError('EVALUATOR_ASSETS_OVERBUILT', 'evaluator assets exceed 128 KiB; narrow the proof');
   for (const c of draft.criteria ?? []) if (c.check?.recipe?.kind === 'test_asset') {
     const name = c.check.recipe.asset;
     evaluatorAssetPath(name);
@@ -330,11 +330,14 @@ export function evaluatorEnvironment(cwd,options) {
     dependencies:fs.existsSync(path.join(cwd,'node_modules'))?digest(inventory(path.join(cwd,'node_modules'),{...options,dependencies:true}).map(({rel,sha,mode,link})=>({rel,sha,mode,link}))):null};
 }
 
+/** Behavior text has one authority; regression text belongs to its criterion. */
+export function criterionRequirement(contract, criterion) {
+  return criterion.type === 'regression' ? criterion.requirement : contract.outcomes?.find(o=>o.id===criterion.outcome)?.requirement;
+}
+
 /**
- * Deterministic intent-contract validation. The agent explicitly states what
- * it believes the user wants (outcomes); every stated outcome needs
- * executable evidence and every behavior criterion maps to exactly one
- * outcome. No model judgment here.
+ * Deterministic intent-contract validation. Every declared outcome needs
+ * exactly one behavior criterion; regression criteria claim no outcomes.
  */
 export function auditCriteria(criteria = [], outcomes = []) {
   const list = Array.isArray(criteria) ? criteria : criteria?.criteria ?? [];
@@ -342,8 +345,10 @@ export function auditCriteria(criteria = [], outcomes = []) {
   const diagnostics = [];
   const seen = new Set();
   for (const c of list) {
-    const norm = c.requirement?.trim().replace(/\s+/g, ' ').toLowerCase();
-    if (seen.has(norm)) diagnostics.push(diagnostic('DUPLICATE_CRITERION', 'intent', c.id, c.requirement, 'Merge criteria that restate the same outcome'));
+    const requirement = criterionRequirement({outcomes:outs},c);
+    const norm = requirement?.trim().replace(/\s+/g, ' ').toLowerCase();
+    if (!norm) continue;
+    if (seen.has(norm)) diagnostics.push(diagnostic('DUPLICATE_CRITERION', 'intent', c.id, requirement, 'Merge criteria that restate the same outcome'));
     seen.add(norm);
   }
   const outcomeIds = new Set();
@@ -414,7 +419,7 @@ export function lintEvaluators(draft, cwd, capabilities) {
       const code=e.message.split(':')[0];
       const lintCode=['RUNNER_NOT_FOUND','CHECK_TARGET_MISSING','TEST_SELECTOR_NOT_FOUND'].includes(code)?code:/^(command_exit|test_asset) requires/.test(e.message)?'INVALID_SPEC':'UNSAFE_COMMAND';
       const repair = recipe?.kind === 'existing_test' && ['TEST_SELECTOR_NOT_FOUND','CHECK_TARGET_MISSING'].includes(lintCode)
-        ? 'Copy a literal selector from discovery; never invent a future name. For new acceptance evidence, supply assets and a test_asset recipe, or use command_exit/custom_command with a minimal positive witness; use test_suite for regression. Use exitcode_stage_tests only for explicitly requested durable product test edits.'
+        ? 'Copy a literal selector from discovery; never invent a future name. For new acceptance evidence, supply assets and a test_asset recipe, or use command_exit/custom_command with a minimal positive witness; use test_suite for regression. Repository tests may change after sealing.'
         : lintCode === 'INVALID_SPEC'
           ? recipe.kind === 'test_asset'
             ? 'test_asset takes an authored asset name, a runtime basename, and arguments before its appended path: {"kind":"test_asset","asset":"C1.test.mjs","command":"node","args":["--test"]}.'
@@ -457,7 +462,7 @@ export function fixtureDirectory(cwd, prefix = 'exitcode-fixture-') {
 }
 
 export const TEST_PATH = /(?:^|\/)(?:tests?|__tests__|fixtures)(?:\/|$)|(?:\.test|\.spec)\.[^/]+$|(?:^|\/)(?:jest|vitest|pytest|playwright|tsconfig)[^/]*\.(?:[cm]?[jt]s|json)$|(?:^|\/)(?:pytest.ini|tox.ini|scripts\/verify)$/;
-/** Conventional test paths stageable under user-authorized pre-seal test staging. Installed packages never qualify. */
+/** Conventional suite surface, captured only when test_suite is approved. */
 export const isTestPath = rel => typeof rel === 'string' && !rel.split('/').includes('node_modules') && TEST_PATH.test(rel);
 // Development dependencies and runner settings remain immutable. Only these
 // product dependency declarations may change under explicit plan approval.
@@ -519,13 +524,15 @@ export function captureEvaluatorAssets(cwd, draft, directory) {
   const files = inventory(cwd, {dependencies:true});
   if (fs.existsSync(path.join(cwd, EVALUATOR_MOUNT)) || files.some(f=>f.rel===EVALUATOR_MOUNT || f.rel.startsWith(EVALUATOR_MOUNT+'/')))
     throw operationError('EVALUATOR_ASSET_INVALID', `candidate must not contain the reserved ${EVALUATOR_MOUNT} mount`);
-  const conventionalPaths=files.filter(f=>isTestPath(f.rel)).map(f=>f.rel).sort();
-  const paths = new Set(conventionalPaths);
+  const suiteSurface = draft.criteria.some(c=>c.check.recipe?.kind === 'test_suite');
+  const paths = new Set(suiteSurface ? files.filter(f=>isTestPath(f.rel)).map(f=>f.rel) : []);
   const readOnly = new Set(), directories=new Set();
-  for(const f of files.filter(f=>!f.rel.split('/').includes('node_modules'))) {
-    const parts=f.rel.split('/');
-    const i=parts.findIndex(p=>/^(?:tests?|__tests__|fixtures)$/.test(p));
-    if(i>=0){const rel=parts.slice(0,i+1).join('/');if(fs.lstatSync(safePath(cwd,rel)).isDirectory()){readOnly.add(rel);directories.add(rel);}}
+  if (suiteSurface) for (const f of files.filter(f=>isTestPath(f.rel))) {
+    const parts=f.rel.split('/'), i=parts.findIndex(p=>/^(?:tests?|__tests__|fixtures)$/.test(p));
+    if (i>=0) {
+      const rel=parts.slice(0,i+1).join('/');
+      if (fs.lstatSync(safePath(cwd,rel)).isDirectory()) {readOnly.add(rel);directories.add(rel);}
+    }
   }
   const declare = rel => {
     const full = safePath(cwd, rel);
@@ -566,14 +573,14 @@ export function captureEvaluatorAssets(cwd, draft, directory) {
         safePath(cwd, target, {allowFinalSymlink:true});
         if (!paths.has(target)) throw operationError('EVALUATOR_ASSET_INVALID', `acceptance symlink must target another frozen asset: ${rel}`);
         fs.symlinkSync(link, full);
-        entries.push({path:rel, link});
+        entries.push({path:rel, owner:rel.startsWith('node_modules/')?'runtime':'repository', link});
         continue;
       }
       if (!stat.isFile()) throw operationError('EVALUATOR_ASSET_INVALID', `acceptance asset is not a regular file: ${rel}`);
       const kind = rel === 'package.json' && draft.mutableDependencies === true ? 'package_configuration' : 'file';
       fs.copyFileSync(source, full, fs.constants.COPYFILE_FICLONE);
       fs.chmodSync(full, stat.mode & 0o777);
-      entries.push({path:rel, mode:stat.mode & 0o777, size:stat.size, kind,
+      entries.push({path:rel, owner:rel === 'package.json' || rel.startsWith('node_modules/')?'runtime':'repository', mode:stat.mode & 0o777, size:stat.size, kind,
         sha:kind === 'package_configuration' ? digest(acceptancePackage(fs.readFileSync(full, 'utf8'))) : fileDigest(full)});
       if (![...readOnly].some(p => rel === p || rel.startsWith(p + '/'))) readOnly.add(rel);
     }
@@ -585,14 +592,14 @@ export function captureEvaluatorAssets(cwd, draft, directory) {
       entries.push({path:rel, owner:'supervisor', mode:0o644, size:Buffer.byteLength(content), kind:'file', sha:fileDigest(full)});
     }
     if (Object.keys(draft.assets ?? {}).length) { directories.add(EVALUATOR_MOUNT); readOnly.add(EVALUATOR_MOUNT); }
-    const manifest = {files:entries, conventionalPaths, directories:[...directories].sort(), readOnlyPaths:[...readOnly].sort(), dependencyBoundary};
+    const manifest = {files:entries, suiteSurface, directories:[...directories].sort(), readOnlyPaths:[...readOnly].sort(), dependencyBoundary};
     return {...manifest, digest:digest(manifest)};
   } catch (e) { fs.rmSync(directory, {recursive:true, force:true}); throw e; }
 }
 
 export function verifyEvaluatorAssets(cwd, directory, assets, {installed = false} = {}) {
   const {digest:expected, ...manifest} = assets ?? {};
-  if (!Array.isArray(manifest.files) || !Array.isArray(manifest.readOnlyPaths) || !Array.isArray(manifest.directories) || !Array.isArray(manifest.conventionalPaths) || expected !== digest(manifest))
+  if (!Array.isArray(manifest.files) || !Array.isArray(manifest.readOnlyPaths) || !Array.isArray(manifest.directories) || typeof manifest.suiteSurface !== 'boolean' || expected !== digest(manifest))
     throw operationError('EVALUATOR_ASSET_INVALID', 'acceptance asset manifest mismatch');
   for(const rel of assets.dependencyBoundary?.absentPaths??[])if(fs.existsSync(safePath(cwd,rel)))throw operationError('EVALUATOR_DRIFT',`evaluator dependency resolution changed: ${rel}`);
   const stored = path.resolve(cwd) === path.resolve(directory);
@@ -601,16 +608,19 @@ export function verifyEvaluatorAssets(cwd, directory, assets, {installed = false
   const liveFiles=inventory(cwd,{dependencies:true});
   if (!installed && !stored && liveFiles.some(f=>f.rel===EVALUATOR_MOUNT || f.rel.startsWith(EVALUATOR_MOUNT+'/')))
     throw operationError('EVALUATOR_DRIFT', `candidate contains reserved evaluator mount: ${EVALUATOR_MOUNT}`);
-  const conventionalPaths=liveFiles.filter(f=>!f.rel.startsWith(EVALUATOR_MOUNT+'/') && isTestPath(f.rel)).map(f=>f.rel).sort();
-  if(stable(conventionalPaths)!==stable(assets.conventionalPaths))throw operationError('EVALUATOR_DRIFT','acceptance test or runner inventory changed');
+  if (assets.suiteSurface && (installed || stored)) {
+    const live=liveFiles.filter(f=>!f.rel.startsWith(EVALUATOR_MOUNT+'/') && isTestPath(f.rel)).map(f=>f.rel).sort();
+    const approved=assets.files.filter(f=>f.owner!=='supervisor' && isTestPath(f.path)).map(f=>f.path).sort();
+    if(stable(live)!==stable(approved))throw operationError('EVALUATOR_DRIFT','installed acceptance suite inventory changed');
+  }
   for(const rel of assets.directories){
-    if (rel === EVALUATOR_MOUNT && !installed && !stored) continue;
+    if (!installed && !stored && !rel.startsWith('node_modules/')) continue;
     const live=liveFiles.filter(f=>f.rel.startsWith(rel+'/')).map(f=>f.rel).sort();
     const expected=assets.files.filter(f=>f.path.startsWith(rel+'/')).map(f=>f.path).sort();
     if(stable(live)!==stable(expected))throw operationError('EVALUATOR_DRIFT',`acceptance inventory changed: ${rel}`);
   }
   for (const root of [directory, cwd]) for (const f of assets.files) {
-    if (root !== directory && f.owner === 'supervisor' && !installed && !stored) continue;
+    if (root !== directory && f.owner !== 'runtime' && !installed && !stored) continue;
     const full = safePath(root, f.path, {allowFinalSymlink:true, allowEvaluator:f.owner === 'supervisor'});
     let stat;
     try { stat = fs.lstatSync(full); }
@@ -627,6 +637,14 @@ export function verifyEvaluatorAssets(cwd, directory, assets, {installed = false
 
 /** Overlay the validated evaluator after product-only fixture setup. */
 export function installEvaluatorAssets(fixture, directory, assets, {ownedOnly = false} = {}) {
+  if (!ownedOnly) {
+    const expected = new Set(assets.files.map(f=>f.path));
+    // Construct the approved suite exactly; new product tests cannot enlarge it.
+    for (const f of inventory(fixture,{dependencies:true})) if (!expected.has(f.rel) &&
+      (assets.suiteSurface && isTestPath(f.rel) || assets.directories.some(rel=>f.rel.startsWith(rel+'/'))))
+      fs.rmSync(safePath(fixture,f.rel,{allowFinalSymlink:true,allowEvaluator:true}),{force:true});
+    for (const rel of assets.directories) fs.mkdirSync(safePath(fixture,rel,{allowEvaluator:true}),{recursive:true});
+  }
   for (const f of assets.files.filter(f => !ownedOnly || f.owner === 'supervisor')) {
     const full = safePath(fixture, f.path, {allowFinalSymlink:f.kind !== 'package_configuration', allowEvaluator:f.owner === 'supervisor'});
     fs.mkdirSync(path.dirname(full), {recursive:true});
@@ -649,21 +667,21 @@ export function installEvaluatorAssets(fixture, directory, assets, {ownedOnly = 
   }
 }
 
-/** User resume may restore approved acceptance bytes, never construct new acceptance. */
+/** User resume restores the pinned runtime boundary while preserving product tests. */
 export function restoreEvaluatorAssets(cwd,directory,assets) {
   verifyEvaluatorAssets(directory,directory,assets);
   const expected=new Set(assets.files.map(f=>f.path)),removed=[];
   for(const f of inventory(cwd,{dependencies:true}))if(!expected.has(f.rel) &&
-    (assets.directories.some(p=>f.rel===p || f.rel.startsWith(p+'/')) || isTestPath(f.rel))) {
+    assets.directories.filter(p=>p.startsWith('node_modules/')).some(p=>f.rel===p || f.rel.startsWith(p+'/'))) {
     fs.rmSync(safePath(cwd,f.rel,{allowFinalSymlink:true}),{force:true});removed.push(f.rel);
   }
   for(const rel of assets.dependencyBoundary?.absentPaths??[])if(fs.existsSync(safePath(cwd,rel))){
     fs.rmSync(safePath(cwd,rel),{recursive:true,force:true});removed.push(rel);
   }
-  // Supervisor-owned assets are restored only in disposable execution copies.
-  installEvaluatorAssets(cwd,directory,{...assets,files:assets.files.filter(f=>f.owner!=='supervisor')});
+  // Repository and supervisor-owned acceptance copies install only in disposable candidates.
+  installEvaluatorAssets(cwd,directory,{...assets,files:assets.files.filter(f=>f.owner==='runtime'),directories:assets.directories.filter(p=>p.startsWith('node_modules/')),suiteSurface:false});
   verifyEvaluatorAssets(cwd,directory,assets);
-  return {restored:assets.files.filter(f=>f.owner!=='supervisor').map(f=>f.path),removed};
+  return {restored:assets.files.filter(f=>f.owner==='runtime').map(f=>f.path),removed};
 }
 
 /** Mutable product bytes are candidate inputs; pinned evaluator dependencies still must match. */

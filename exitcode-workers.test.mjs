@@ -8,7 +8,7 @@ test('workers: sessions isolate cwd and context, retain selected model settings,
   const sdk = {
     getAgentDir: () => '/agent-config',
     SettingsManager: { inMemory: settings => ({settings}) },
-    ModelRuntime: { create: async () => ({ registerNativeProvider: p => providerCalls.push(p), registerProvider: (id,cfg) => providerCalls.push([id,cfg]) }) },
+    ModelRuntime: { create: async () => ({ getAvailable:async()=>[{id:"selected",provider:"custom"}], registerNativeProvider: p => providerCalls.push(p), registerProvider: (id,cfg) => providerCalls.push([id,cfg]) }) },
     SessionManager: { inMemory: cwd => ({cwd,messages:[]}) },
     DefaultResourceLoader: class { constructor(options){this.options=options;loaded.push(options);} async reload(){} },
     createAgentSession: async options => {
@@ -25,6 +25,9 @@ test('workers: sessions isolate cwd and context, retain selected model settings,
   };
   const model={id:'selected',provider:'custom'}, native={id:'custom'}, config={baseUrl:'configured'};
   const backend=createPiWorkerBackend({model,thinkingLevel:'high',modelRegistry:{getRegisteredNativeProvider:()=>native,getRegisteredProviderConfig:()=>config}},async()=>sdk);
+  await backend.preflight();
+  assert.equal(created.length,0,"preflight constructs no worker sessions");
+  assert.equal(loaded.length,0,"preflight loads no project resources");
   const controller=new AbortController();
   const a=await backend.start({id:'S1',cwd:'/private/one',objective:'first',signal:controller.signal});
   const b=await backend.start({id:'S2',cwd:'/private/two',objective:'second',signal:controller.signal});
@@ -41,7 +44,7 @@ test('workers: sessions isolate cwd and context, retain selected model settings,
   assert.equal(boundary({toolName:'read',input:{path:'.exitcode/roots/G1.json'}}).block,true);
   assert.equal(boundary({toolName:'bash',input:{command:'cat .exitcode/contracts/G1.sealed.json'}}).block,true);
   assert.equal(prompts[2][1].assignment,undefined,'repair feedback uses the existing session');
-  assert.equal(providerCalls.length,4);
+  assert.equal(providerCalls.length,6);
   controller.abort(); await assert.rejects(()=>backend.send(a,{}),e=>e.code==='CANCELLED');
   await Promise.all([backend.cancel(a),backend.cancel(b)]);
   await Promise.all([backend.dispose(a),backend.dispose(b)]);
@@ -50,7 +53,7 @@ test('workers: sessions isolate cwd and context, retain selected model settings,
 
 test('workers: model errors never become a settled successful candidate', async () => {
   let listener;
-  const sdk={getAgentDir:()=>'/config',SettingsManager:{inMemory:()=>({})},ModelRuntime:{create:async()=>({})},SessionManager:{inMemory:()=>({})},
+  const sdk={getAgentDir:()=>'/config',SettingsManager:{inMemory:()=>({})},ModelRuntime:{create:async()=>({getAvailable:async()=>[{id:"m",provider:"p"}]})},SessionManager:{inMemory:()=>({})},
     DefaultResourceLoader:class{async reload(){}},createAgentSession:async()=>({extensionsResult:{errors:[]},session:{
       async bindExtensions(){},subscribe(fn){listener=fn;return()=>{};},async prompt(){listener({type:'message_end',message:{role:'assistant',stopReason:'error',errorMessage:'provider unavailable'}});},
       async abort(){},dispose(){},
@@ -59,4 +62,23 @@ test('workers: model errors never become a settled successful candidate', async 
   const handle=await backend.start({id:'S1',cwd:'/private'});
   await assert.rejects(()=>backend.send(handle,{}),e=>e.code==='WORKER_FAILED');
   await backend.dispose(handle);
+});
+
+test('workers: preflight rejects missing SDK capabilities or an unavailable selected model without launching sessions', async t => {
+  for (const mode of ['no-model','missing-sdk','missing-api','unavailable-model']) await t.test(mode,async()=>{
+    let sessions=0,loads=0;
+    const sdk={getAgentDir:()=>'/config',SettingsManager:{inMemory:()=>({})},SessionManager:{inMemory:()=>({})},
+      DefaultResourceLoader:class{},createAgentSession:async()=>{sessions++;},ModelRuntime:{create:async options=>{
+        assert.equal(options.allowModelNetwork,false);assert.equal(options.refreshOnCreate,false);
+        return {getAvailable:async()=>[]};
+      }}};
+    if(mode==='missing-api')delete sdk.SessionManager;
+    const backend=createPiWorkerBackend({model:mode==='no-model'?null:{id:'selected',provider:'p'}},async()=>{
+      loads++;if(mode==='missing-sdk')throw Error('SDK not installed');return sdk;
+    });
+    await assert.rejects(()=>backend.preflight(),e=>e.code==='WORKER_UNAVAILABLE');
+    assert.equal(sessions,0);if(mode==='no-model')assert.equal(loads,0);
+  });
+  const stopped=new AbortController();stopped.abort();
+  await assert.rejects(()=>createPiWorkerBackend({}).preflight({signal:stopped.signal}),e=>e.code==='CANCELLED');
 });

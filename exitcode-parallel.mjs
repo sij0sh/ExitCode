@@ -4,8 +4,8 @@ import * as path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { inventory, candidateIdentity } from './exitcode-evaluator.mjs';
-import { ensureRunning, operationError } from './exitcode-operation.mjs';
+import { inventory, candidateIdentity, criterionRequirement } from './exitcode-evaluator.mjs';
+import { ensureRunning, operationError, operationSignal, abortable } from './exitcode-operation.mjs';
 
 const execute = promisify(execFile);
 const oid = /^[0-9a-f]{40,64}$/;
@@ -14,6 +14,38 @@ function gitEnvironment(extra = {}) {
   const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith('GIT_')));
   return { ...env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_TERMINAL_PROMPT: '0',
     GIT_AUTHOR_NAME: 'ExitCode', GIT_AUTHOR_EMAIL: 'exitcode@localhost', GIT_COMMITTER_NAME: 'ExitCode', GIT_COMMITTER_EMAIL: 'exitcode@localhost', ...extra };
+}
+
+/** Read capability information without creating repos, sessions, or candidates. */
+export async function preflightExecution(io, executeGit = execute) {
+  ensureRunning(io.signal, io.deadlineAt, io.nowMs);
+  try {
+    const result = await executeGit('git', ['merge-tree', '--write-tree', '--name-only', '-z', '--merge-base=HEAD', '-h'],
+      {signal:io.signal, env:gitEnvironment(), timeout:10_000});
+    checkGit(result);
+  } catch (error) {
+    ensureRunning(io.signal, io.deadlineAt, io.nowMs);
+    // Git prints usage with exit 129 even when the required form is supported.
+    if (error.code === 129) checkGit(error);
+    else throw operationError('GIT_UNAVAILABLE', error.message);
+  }
+  const backend = io.workerBackend;
+  if (!backend || ['preflight','start','send','cancel','dispose'].some(k=>typeof backend[k] !== 'function'))
+    throw operationError('WORKER_UNAVAILABLE', 'independent worker backend with capability preflight unavailable');
+  const operation = operationSignal(io.signal,{timeoutMs:10_000});
+  try { await abortable(()=>backend.preflight({signal:operation.signal}),operation.signal); }
+  catch (error) {
+    if(error.code==='CHECK_TIMEOUT')throw operationError('WORKER_UNAVAILABLE','worker capability preflight timed out');
+    throw error;
+  }
+  finally { operation.dispose(); }
+  ensureRunning(io.signal, io.deadlineAt, io.nowMs);
+}
+
+function checkGit(result) {
+  const usage = `${result.stdout ?? ''}\n${result.stderr ?? ''}`;
+  if (!usage.includes('--write-tree') || !/--(?:\[no-\])?merge-base/.test(usage) || /unknown option/.test(usage))
+    throw operationError('GIT_UNAVAILABLE', 'Git requires merge-tree --write-tree --merge-base support');
 }
 
 export function validateExecution(draft) {
@@ -162,7 +194,7 @@ function unresolvedConflicts(record, io) {
 function prompt(contract, slice, failures) {
   const ids = new Set(executionHorizon(contract, slice.id));
   return { objective: slice.objective, rootGoal: contract.goal, assumptions: contract.assumptions ?? [], exclusions: contract.exclusions ?? [],
-    criteria: contract.criteria.filter(c => ids.has(c.id)).map(({ id, requirement, type }) => ({ id, requirement, type })), failures };
+    criteria: contract.criteria.filter(c => ids.has(c.id)).map(c => ({ id:c.id, requirement:criterionRequirement(contract,c), type:c.type })), failures };
 }
 
 /** One locked supervisor; workers only return settled candidates, never verdicts. */
@@ -214,7 +246,7 @@ export async function runExecution(io, root, bundle, host) {
       if (remaining() <= 0) throw operationError('BUDGET_EXHAUSTED', 'shared reconciliation budget exhausted');
       const wanted = record.ids ? new Set(record.ids) : null;
       await start(record, { kind: 'reconciliation', contract: { goal: contract.goal, assumptions: contract.assumptions, exclusions: contract.exclusions },
-        criteria: contract.criteria.filter(c => !wanted || wanted.has(c.id)).map(({id,requirement,type}) => ({id,requirement,type})),
+        criteria: contract.criteria.filter(c => !wanted || wanted.has(c.id)).map(c => ({id:c.id,requirement:criterionRequirement(contract,c),type:c.type})),
         context: record.context }, { failures: evidence?.outcomes, conflicts: record.context.conflicts, unresolvedConflicts:evidence?.unresolvedConflicts });
       const settled = await running.get(record.id); running.delete(record.id);
       if (settled.error) throw settled.error;
