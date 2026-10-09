@@ -1,44 +1,97 @@
-# ExitCode scenario implementation
+<div align="center">
 
-ExitCode holds an agent to a fixed, observable definition of done. The user describes a problem and the desired happy path. Before approval, the agent establishes a reusable way to exercise the project and prepares scenarios that reproduce the problem. After approval, the normal Pi session chooses and changes its implementation approach. Fresh scenario observations determine completion.
+# ExitCode
 
-This is a replacement for the supplied contract and proof-DAG implementation. It has one state format and one driver protocol. It does not read, migrate, or execute older contracts. Read [IMPLEMENTATION.md](IMPLEMENTATION.md) for the exact removal scope.
+**Let the agent change its plan. Not your definition of done.**
 
-## Start and approve a task
+[Why ExitCode](#why-exitcode) &bull; [Get started](#get-started) &bull;
+[Example](#example) &bull; [Configuration](#configuration)
 
-Load the replacement entry point with your existing Pi installation:
+</div>
 
-```sh
-pi --extension /absolute/path/to/exitcode/exitcode.ts
+---
+
+A coding agent's "done" is a claim.
+**ExitCode makes completion a checked result.**
+
+ExitCode is a [Pi](https://pi.dev) extension for ambitious coding tasks.
+You describe the problem and the experience you want.
+The agent reproduces it, you approve what success looks like, and fresh scenario
+observations decide whether the task is complete.
+
+## Why ExitCode
+
+A "keep going" prompt asks the agent to do the work and decide when to stop.
+ExitCode separates implementation from certifying completion.
+
+- **Reproduce before repair.** The agent builds or reuses the smallest project driver
+  needed to observe the problem before changing product code.
+- **Approve outcomes, not plans.** Every declared success condition must map to a
+  concrete scenario you can review.
+- **Keep Pi as Pi.** The agent keeps your project instructions, tools, context, and
+  freedom to revise its approach.
+- **Count every trial.** ExitCode runs the approved scenarios on fresh candidate copies.
+  Every scheduled trial must pass; stale evidence cannot close the task.
+
+Project drivers and prepared runtimes are reusable across tasks.
+Each approval freezes that task's checks, captured driver, and runtime identity.
+**The implementation can evolve. The acceptance conditions stay put.**
+
+## Get started
+
+```bash
+pi install .
 ```
 
-For persistent loading, run `pi install .` from this directory. Remove the previous ExitCode extension registration before loading this implementation; run one ExitCode implementation in a session.
+Run this from the ExitCode checkout.
+Requires [Pi](https://pi.dev) with a configured model and Node.js 22.18 or newer.
+Then start `pi` in the project you want to change:
 
-Node 22.18 or newer is required. Pi supplies its extension API and TypeBox. There are no added production dependencies. The adapter uses the current Pi APIs represented by the attached source and documented at [Pi SDK](https://pi.dev/docs/latest/sdk) and [Pi extensions](https://pi.dev/docs/latest/extensions).
+```text
+/exitcode Users cannot reset passwords. Add emailed, single-use links and revoke sessions.
+```
 
-| Command | Behavior |
+The agent investigates and presents prepared acceptance conditions.
+Review them and request changes if needed.
+When they match what you want:
+
+```text
+/exitcode approve
+```
+
+Pi continues with implementation and submits the candidate for fresh acceptance.
+The agent handles the contract and driver; you do not need to write them by hand.
+
+## Example
+
+For that password-reset request, an illustrative review might look like this:
+
+| What must be true | Where it is observed |
 | --- | --- |
-| `/exitcode <problem>` | Start a fresh task and detach an unfinished owner without deleting work |
-| `/exitcode approve` | Approve the exact prepared acceptance and seal it |
-| `/exitcode status` | Show the current phase, result, issue, hypothesis, and resolved storage path |
-| `/exitcode config` | Inspect effective settings, source files, and configured and active storage paths |
-| `/exitcode help` | Show command usage and configuration defaults |
-| `/exitcode status evidence` | Show the stored contract, preparation, and latest run |
-| `/exitcode resume [taskId]` | Adopt an unfinished task against the current workspace |
-| `/exitcode exit` | Cancel validation, detach the task, and preserve work without claiming completion |
+| The user receives a usable reset link | Reset flow |
+| The link changes the password exactly once | Reset flow, including attempted reuse |
+| Existing sessions stop authenticating | Session revocation |
 
-Approval is a user command. There is no model-callable sealing tool and no interpretation of quoted plain-English approval.
+One scenario can cover several outcomes.
+A fix that changes the password but leaves existing sessions alive still fails these checks.
+The agent can try another approach, but it cannot drop the approved revocation requirement.
 
-The lifecycle is `DISCOVERY -> READY -> SEALED -> PASS`. A failed acceptance or infrastructure error leaves the task sealed and unfinished. A detached task retains its phase. Resuming an unsealed task adopts the current candidate and drops preparation; resuming a sealed task preserves its exact acceptance and starts from current product files. There is no automatic rewind.
+**Not "the patch looks right." The requested experience works under the approved scenarios.**
+
+## What PASS means
+
+PASS requires every scheduled trial to pass on the exact current candidate.
+Changing the product after evaluation makes that evidence stale.
+Changed sealed checks or a changed evaluator runtime invalidate acceptance.
+Timeouts, missing measurements, and failed cleanup are errors, not successful completion.
+
+Scenario quality still matters.
+Coverage checks ensure every declared claim has a scenario, not that it measures the claim well.
+Review the actual observations before approving.
+Drivers run as trusted host processes or in explicitly selected offline Linux bubblewrap isolation.
+Native Pi tools retain their normal permissions.
 
 ## Configuration
-
-ExitCode reads a small flat JSON file on session start and `/reload`.
-User defaults live at `<Pi agent directory>/exitcode.json`, normally `~/.pi/agent/exitcode.json`.
-Pi's `getAgentDir()` supplies this location and honors `PI_CODING_AGENT_DIR`.
-Trusted project overrides live at `.pi/exitcode.json` in the working directory.
-Project values override user values by key.
-Missing values use these defaults:
 
 ```json
 {
@@ -48,220 +101,60 @@ Missing values use these defaults:
 }
 ```
 
-| Setting | Allowed values | Behavior |
-| --- | --- | --- |
-| `storeDir` | A dedicated project-relative directory | Keep all project definitions and private state under this path |
-| `maxNudges` | An integer from 0 through 10 | Limit automatic continuation on unchanged progress; 0 disables nudges |
-| `showStatus` | `true` or `false` | Show a compact phase, progress, or result in Pi's terminal footer |
+These defaults need no setup.
+Override them in `~/.pi/agent/exitcode.json` or a trusted project's `.pi/exitcode.json`.
+Project values take precedence.
+Run `/reload` after editing.
 
-Use `/exitcode config` to see the effective values and source files.
-Use `/exitcode status` to see the task's resolved store.
-Both are read-only and do not initialize a store or start a task.
-Command completion exposes the supported subcommands and `status evidence`.
-The footer is optional and does not affect non-interactive execution or acceptance guards.
-
-Storage paths are relative to the project working directory, even in user defaults.
-Absolute paths, home expansion, the project root, `.git`, traversal, and symlink components are rejected.
-Choose a dedicated directory, not an existing product directory.
-Only the selected store and Git metadata are excluded from candidate snapshots.
-Siblings under `.agents/` or another store parent remain product files.
-Malformed JSON, unknown keys, and invalid values report the source file and prevent starting or approving a task.
-Fix the file and run `/reload`.
-Untrusted project configuration is not read.
-
-An active task keeps its original store across reloads and session restoration.
-Changed settings affect new tasks after `/exitcode exit` or fresh completion.
-A reload does not move files or silently adopt a task in another store.
-Stores are never migrated, deleted, or cleaned up automatically.
-To retain an existing current-format store at the previous location, set `storeDir` to `".exitcode"` before starting or resuming.
-Unsupported legacy formats remain unsupported.
-To move a store, exit the mode and move it explicitly before changing `storeDir`.
-An unsealed task needs fresh preparation after a move.
-
-## Reusable project definitions
-
-On initial use, the agent inspects project instructions, entry points, dependencies, and existing tests. It creates the smallest useful execution boundary for the reported issue. It can wrap a library, command, API, browser, installation, container, or isolated remote service. It can use an SDK agent for scenario actions. ExitCode does not prescribe a testing framework or package manager.
-
-The agent submits a manifest and UTF-8 driver files through `exitcode_project`. The same files remain readable and editable before sealing under `.agents/.exitcode/project/`. Future tasks reuse them when sufficient. More coverage can be added as actual problems require it; bootstrap is not an exhaustive model of the codebase.
-
-| Location | Purpose |
+| Setting | Meaning |
 | --- | --- |
-| `.agents/.exitcode/project/manifest.json` | Versioned driver command, watchdog, explicit environment-variable names, and isolation choice |
-| `.agents/.exitcode/project/files/` | Versioned setup scripts, drivers, fixtures, lockfiles, and project notes |
-| `.agents/.exitcode/state/environments/` | Prepared environment instances identified by content |
-| `.agents/.exitcode/state/tasks/` | Private task state, sealed bundles, evidence, and work journals |
+| `storeDir` | Dedicated project-relative folder for validation definitions and evidence |
+| `maxNudges` | Continuation nudges on unchanged progress; 0 disables them, maximum 10 |
+| `showStatus` | Show the phase and result in Pi's terminal footer |
 
-Commit the project definitions if they should be shared.
-Ignore `.agents/.exitcode/state/`, not the whole store.
-If `.agents/` is broadly ignored, replace that rule with patterns that leave project definitions visible:
+Share reusable definitions under `project/` if useful.
+Keep private evidence under `state/` out of Git.
 
-```gitignore
-.agents/*
-!.agents/.exitcode/
-.agents/.exitcode/*
-!.agents/.exitcode/project/
-```
+## Try the acceptance boundary
 
-These patterns keep private state and unrelated agent artifacts local.
-For a custom `storeDir`, ignore its `state/` directory and any temporary `project-*` staging directories.
-Update broad parent-directory ignore rules before committing reusable definitions.
-
-Preparation creates an environment once per project definition and reuses it across tasks. Its files and runner identity are checked. `exitcode_project` with `refresh: true` rebuilds the latest environment pointer while retaining earlier immutable instances required by sealed tasks. An existing seal continues to use its original driver and environment even when live project definitions change.
-
-Validation dependencies belong in `runtimeDirectory`. Mutable product dependencies belong in the independent candidate. Provisioning should use pinned versions and lockfiles, install into the provided directory, and avoid host-file aliases. The fingerprint covers the prepared directory, selected runner executable, and platform identity. It does not automatically discover every system library or remote dependency; make material inputs part of the provisioned environment or scenario and describe remaining external conditions.
-
-## Driver protocol
-
-A manifest has this shape:
-
-```json
-{
-  "protocol": 1,
-  "name": "Project validation",
-  "command": { "program": "node", "args": ["driver.mjs"] },
-  "timeoutSeconds": 300,
-  "environment": [],
-  "isolation": "workspace"
-}
-```
-
-ExitCode launches the command without implicit shell interpretation. Its working directory contains the captured driver files. Standard input is one JSON request. Standard output must contain one JSON response, without prose or Markdown; diagnostic text belongs on stderr.
-
-Every request supplies `protocol: 1`, `operation`, `projectDirectory`, `runtimeDirectory`, `candidateDirectory`, and `runDirectory`. A run additionally supplies `scenario: {id, instructions, input}` and a trial number.
-
-| Operation | Driver responsibility |
-| --- | --- |
-| `prepare` | Provision a reusable, pinned runtime; leave product source unchanged |
-| `run` | Reset scenario state, exercise this candidate, and collect observations |
-| `dispose` | Release trial or setup resources while retaining installed runtime files |
-
-Each operation runs in a new process. Carry required handles through the supplied directories, not module globals. Each trial receives an independent candidate copy. Put scenario state and writable caches in its candidate or run directory; the prepared runtime is frozen during trials. Dispose runs after successful and failed setup or trials, with an independent watchdog of at most ten seconds. Drivers managing external resources must make disposal idempotent and be able to identify those resources from the supplied directories.
-
-Successful setup and disposal return:
-
-```json
-{ "protocol": 1, "status": "OK" }
-```
-
-Successful observation returns:
-
-```json
-{
-  "protocol": 1,
-  "status": "OK",
-  "observations": { "completed": true, "elapsedMs": 900000 },
-  "artifacts": ["artifacts/events.json"]
-}
-```
-
-`UNAVAILABLE` with a reason means the target software is absent. This is accepted only for the empty-target wiring probe. An unavailable real baseline is an error. A missing feature or artifact within an available product is a valid observation, such as `exists: false`, rather than target unavailability. `ERROR` with a reason reports failed setup, invalid conditions, or another inconclusive run; it is never successful reproduction evidence.
-
-Artifact paths must identify regular files confined to the run directory. ExitCode copies and hashes them into retained evidence. Candidate, project, and temporary home copies are removed after the trial. stdout and stderr are retained for diagnosis; drivers should avoid printing credentials.
-
-`$run` is reserved for externally collected elapsed time and timestamps. A driver cannot supply or overwrite it. For a scenario driven by an agent, schema validation confirms the response shape, and assertions compare the observations mechanically. It does not make an agent's choices or semantic interpretations deterministic. Prefer timestamps, actual responses, artifacts, and independent checks over an agent's declaration that it succeeded.
-
-## Isolation choices
-
-Choose the execution boundary explicitly in the manifest. ExitCode never silently changes it.
-
-`workspace` uses a trusted host process in disposable copies, with a private home and a sanitized environment. Only named environment variables are passed. It can access the network and wrap project-managed containers or other environments. It is suitable for trusted infrastructure and the live SDK example; it is not an adversarial operating-system sandbox. Native implementation tools also retain their normal host permissions.
-
-`bubblewrap` is an offline Linux sandbox. It mounts driver files and the prepared runtime read-only during a trial, exposes the disposable candidate and run directory, and excludes the canonical workspace, supervisor state, host home, and sockets. Missing bubblewrap or unusable namespaces produce `ISOLATION_UNAVAILABLE`; there is no host fallback. System runtimes are read-only. Projects needing networked provisioning or a live model can explicitly use a project-managed boundary through workspace mode.
-
-## Scenarios and observations
-
-`exitcode_contract` accepts `version: 1`, `problem`, `happyPath`, `constraints`, and `scenarios`.
-It does not accept an implementation plan, worker graph, validation sequence, controls, or source patches.
-
-`happyPath` contains 1 to 8 observable claims shaped as `{ "id": "H1", "claim": "A user-visible outcome" }`.
-Each claim needs a unique identifier of 1 to 64 letters, digits, underscores, or hyphens.
-Split only independently observable user outcomes, not implementation steps.
-Each scenario must declare `covers`, an array of claim IDs.
-Every claim must be covered by at least one scenario.
-Every referenced ID must identify a declared claim.
-One scenario can cover several claims, and several scenarios can cover the same claim.
-A guardrail-only scenario can use `covers: []`.
-Coverage does not depend on the scenario's baseline.
-
-For example, this password-reset acceptance fragment maps three claims to two scenarios:
-
-```json
-{
-  "happyPath": [
-    { "id": "H1", "claim": "The user receives a usable reset link" },
-    { "id": "H2", "claim": "The link changes the password exactly once" },
-    { "id": "H3", "claim": "Existing sessions are invalidated" }
-  ],
-  "scenarios": [
-    { "id": "reset-flow", "covers": ["H1", "H2"] },
-    { "id": "session-revocation", "covers": ["H3"] }
-  ]
-}
-```
-
-The approval review shows each claim and each scenario's mapping.
-Validation checks the references and coverage, not whether a scenario truly observes its claims.
-The user reviews that judgment before approval.
-There is no semantic model call or criteria layer.
-New drafts must use this shape; prose `happyPath` values are rejected.
-Existing prepared or sealed contracts with the prose shape cannot be approved or evaluated.
-Resume an unsealed task to prepare new acceptance, or start a new task to supersede an old seal.
-No automatic conversion changes approved acceptance.
-
-Each scenario also declares its initial-state input, action instructions, expected baseline, number of trials, watchdog, and assertions. `baseline: "FAIL"` reproduces a defect or missing behavior. `baseline: "PASS"` protects existing behavior. All scheduled trials must match that baseline during preparation. Each scenario also receives an empty target; a passing empty target rejects the observer. Neither preparation PASS nor a passing baseline completes the task.
-
-Assertions use JSON pointers into observations:
-
-| Operator | Passing condition |
-| --- | --- |
-| `eq` | JSON values are equal |
-| `lte` | A finite number is at most the threshold |
-| `gte` | A finite number is at least the threshold |
-| `contains` | A string contains the specified nonempty text |
-| `present` | The specified field exists |
-
-Missing required measurements, invalid numeric measurements, malformed reports, driver watchdogs, failed cleanup, and environment drift are ERROR. A valid measurement outside its accepted range is FAIL. A driver measuring a task deadline should stop that inner task and report its incomplete state; an outer watchdog only proves that the driver did not finish valid observation.
-
-After sealing, every scheduled trial must pass. Trials are retained rather than retried until a favorable sample appears. There is no proof reuse or automatic retry. For live systems, start with a clearly scoped trial and increase repetitions or representative fixtures when the requested claim requires them.
-
-The contract is limited to 64 KiB, project definitions to 64 UTF-8 files and 2 MiB, candidate/environment inventories to 512 MiB, command output to 1 MiB, and copied artifacts to 16 MiB per trial. Use focused workspaces and reusable fixture definitions when a bound is reached.
-
-## Ordinary implementation and long-session state
-
-After approval, the agent follows native project instructions, chooses a plan, edits normally, and uses focused checks. The extension preserves the existing tool loadout and prompt sections. It does not create worker sessions, override project context loading, schedule a DAG, force decomposition, or own compaction. Pi owns conversation persistence and compaction; its harness or available tools own any delegation.
-
-The four model-facing tools are:
-
-| Tool | Purpose |
-| --- | --- |
-| `exitcode_project` | Publish or refresh reusable validation definitions before sealing |
-| `exitcode_contract` | Prepare problem and happy-path acceptance before sealing |
-| `exitcode_evaluate` | Run fresh acceptance, or explicitly inspect the contract, historical run, or notes |
-| `exitcode_note` | Record a short hypothesis, attempted change, result, disposition, next experiment, and evidence IDs |
-
-An inspection does not execute validation or certify completion. `inspect: "contract"`, `inspect: "run"`, and `inspect: "notes"` are read-only views; a `runId` selects older evidence and an `offset` continues a long result. This lets the agent recover exact acceptance and earlier experiments after compaction without another state-management tool.
-
-Notes reference real evidence but retain agent interpretations separately. A `revert` disposition records a decision and never rolls files back. `waitingFor` records needed user or external input and ends automatic continuation. The next user input releases that wait. Only the latest working hypothesis and next experiment appear in the small per-turn summary. By default, two unchanged continuation nudges are allowed; `maxNudges` changes that limit, and 0 disables nudges. Native session control remains authoritative without a forced strategy loop.
-
-Before approval, direct product writes through standard edit tools are blocked. Other or external mutations are detected at supervisor boundaries and invalidate preparation. Files are preserved; explicit resume adopts the changed candidate. These guards supplement the normal trusted-agent workflow rather than provide an adversarial capability boundary.
-
-## Examples and verification
-
-Run the complete deterministic example:
-
-```sh
+```bash
 node examples/file-project/demo.mjs
 ```
 
-It demonstrates prepared baseline failure, approval, fresh implementation failure, a normal product edit, and fresh PASS using the same warm environment. It uses a temporary workspace and cleans it up.
+```json
+{
+  "preparation": "READY",
+  "before": "FAIL",
+  "after": "PASS",
+  "warmEnvironment": true
+}
+```
 
-`examples/pi-extension/` supplies a live Pi scenario driver. It copies a self-contained npm SDK installation with a matching pinned lockfile into the frozen runtime, selects a fixed model from scenario input, loads the candidate extension into a separate fixture session, preserves `AGENTS.md`, supplies one immediate simulated approval, and independently reads expected output files. Its clock covers the task through verified completion, including discovery and acceptance preparation. This example targets this replacement's single state format and its default `.agents/.exitcode` storage.
+This local demo simulates approval and an ordinary product edit in a temporary workspace.
+The task passes only after the edit, using the same prepared environment.
+It needs no model and cleans up afterward.
+See the [driver](./examples/file-project/driver.mjs) and
+[complete contract](./examples/file-project/contract.json) for the runnable example.
 
-Before using that live example, provide `EXITCODE_PI_INSTALLATION`, the declared provider credential, and concrete `input.model.provider` and `input.model.id` values. The installation must contain its package-lock and installed SDK dependencies, with no credentials or unrelated project files. Set the baseline to the behavior actually reproduced; if the replacement already satisfies the time limit, a baseline FAIL is correctly rejected. The twenty-minute example can itself require twenty minutes to reproduce a timeout and is not the default bootstrap for ordinary tasks.
+## Development
 
-```sh
+```bash
 npm test
 npm run check
 ```
 
-The tests execute real local drivers and the Pi adapter against a host fixture. They cover happy-path claim validation and review mappings, default and nested stores, path safety, candidate drift, configuration trust and precedence, reload retention, and optional native UX. The SDK observer test uses an explicitly labeled SDK fixture, not a live provider. Live Pi/provider behavior and the twenty-minute latency target require a separately configured integration run. A successful local test suite is not evidence of that latency claim.
+The tests exercise local drivers and Pi host/SDK fixtures.
+
+## License
+
+MIT, as declared in [package.json](./package.json).
+
+---
+
+<div align="center">
+
+**Done should come with evidence.**
+
+[Report an issue](https://github.com/sij0sh/ExitCode/issues) &bull; [Examples](./examples/)
+
+</div>
