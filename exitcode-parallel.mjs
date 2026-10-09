@@ -4,7 +4,7 @@ import * as path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { inventory, candidateIdentity, criterionRequirement } from './exitcode-evaluator.mjs';
+import { inventory, candidateIdentity, criterionRequirement, evaluatorEnvironment, compatibleEnvironment, digest } from './exitcode-evaluator.mjs';
 import { ensureRunning, operationError, operationSignal, abortable } from './exitcode-operation.mjs';
 
 const execute = promisify(execFile);
@@ -82,8 +82,8 @@ export function validateExecution(draft) {
   return errors;
 }
 
-export function executionHorizon(contract, sliceId) {
-  const wanted = new Set(contract.criteria.filter(c => c.type === 'regression').map(c => c.id));
+export function workerBehaviorHorizon(contract, sliceId) {
+  const wanted = new Set();
   const owners = new Map(contract.execution.flatMap(s => s.verify.map(c => [c, s]))), seen = new Set();
   const add = slice => {
     if (!slice || seen.has(slice.id)) return;
@@ -93,6 +93,29 @@ export function executionHorizon(contract, sliceId) {
   };
   add(contract.execution.find(s => s.id === sliceId));
   return contract.criteria.filter(c => wanted.has(c.id)).map(c => c.id);
+}
+
+/** Integration always proves global regressions alongside cumulative behavior. */
+export function integrationHorizon(contract, behaviorIds) {
+  const wanted = new Set(behaviorIds);
+  return contract.criteria.filter(c => c.type === 'regression' || wanted.has(c.id)).map(c => c.id);
+}
+
+/** Diagnostic counters never authorize proof or scheduler transitions. */
+export function executionMetrics(state) {
+  const metrics = state.metrics ??= {};
+  for (const key of ['workerStarts', 'workerTurns', 'workerMs', 'evaluationRuns', 'evaluationMs', 'proofReuseHits', 'mergeCount', 'reconciliationTurns', 'totalMs']) metrics[key] ??= 0;
+  metrics.criteria ??= {};
+  return metrics;
+}
+
+export function recordExecutionEvaluation(state, result, durationMs) {
+  const metrics = executionMetrics(state);
+  metrics.evaluationRuns++; metrics.evaluationMs += durationMs;
+  for (const outcome of result.outcomes) {
+    const criterion = metrics.criteria[outcome.criterionId] ??= { runs: 0, durationMs: 0 };
+    criterion.runs++; criterion.durationMs += outcome.durationMs ?? 0;
+  }
 }
 
 /** No command reads worker Git metadata, user configuration, hooks, or refs. */
@@ -192,22 +215,48 @@ function unresolvedConflicts(record, io) {
 }
 
 function prompt(contract, slice, failures) {
-  const ids = new Set(executionHorizon(contract, slice.id));
+  const ids = new Set(workerBehaviorHorizon(contract, slice.id));
   return { objective: slice.objective, rootGoal: contract.goal, assumptions: contract.assumptions ?? [], exclusions: contract.exclusions ?? [],
-    criteria: contract.criteria.filter(c => ids.has(c.id)).map(c => ({ id:c.id, requirement:criterionRequirement(contract,c), type:c.type })), failures };
+    criteria: contract.criteria.filter(c => ids.has(c.id)).map(c => ({ id:c.id, requirement:criterionRequirement(contract,c), type:c.type })),
+    regressions: contract.criteria.filter(c => c.type === 'regression').map(c => ({id:c.id, requirement:criterionRequirement(contract,c)})), failures };
 }
 
 /** One locked supervisor; workers only return settled candidates, never verdicts. */
 export async function runExecution(io, root, bundle, host) {
   const state = root.execution, contract = bundle.contract, backend = io.workerBackend;
   if (!backend) throw operationError('WORKER_UNAVAILABLE', 'independent Pi worker backend unavailable');
-  const handles = new Map(), running = new Map();
+  const handles = new Map(), running = new Map(), proofs = new Map();
+  const metrics = executionMetrics(state), startedAt = performance.now();
+  const rememberProof = result => {
+    const candidates = proofs.get(result.candidateDigest) ?? [];
+    candidates.push(result); proofs.set(result.candidateDigest, candidates);
+  };
+  const coveredProof = (artifact, requiredIds) => {
+    if (contract.mutableDependencies === true || !artifact.digest) return null;
+    const candidates = proofs.get(artifact.digest);
+    if (!candidates) return null;
+    const environment = evaluatorEnvironment(io.cwd, io);
+    if (!compatibleEnvironment(bundle.env, environment, false, bundle.assets)) return null;
+    const proof = candidates.find(result => result.bundleDigest === bundle.digest &&
+      result.environmentIdentity === digest(environment) &&
+      requiredIds.every(id => result.outcomes.some(o => o.criterionId === id && o.status === 'PASS')));
+    if (!proof) return null;
+    metrics.proofReuseHits++;
+    const wanted = new Set(requiredIds);
+    return {...proof, outcomes:proof.outcomes.filter(o => wanted.has(o.criterionId)), allPass:true};
+  };
   const persist = () => {
     ensureRunning(io.signal, root.deadlineAt, io.nowMs); host.persist();
     io.onProgress?.({phase:state.phase,stage:state.slices.map(s => `${s.id} ${s.status}`).join(', ')});
   };
   const evaluate = async (cwd, ids) => {
-    const result = await host.evaluate(cwd, ids);
+    const proof = coveredProof({digest:candidateIdentity(cwd, io)}, ids ?? contract.criteria.map(c => c.id));
+    if (proof) return proof;
+    const started = performance.now();
+    let result;
+    try { result = await host.evaluate(cwd, ids); }
+    finally { recordExecutionEvaluation(state, result ?? {outcomes:[]}, performance.now() - started); }
+    rememberProof(result);
     if (result.outcomes.some(o => o.status === 'ERROR')) throw operationError(result.outcomes.find(o => o.status === 'ERROR').errorCode ?? 'RUNNER_ERROR', 'candidate evaluation was inconclusive');
     return result;
   };
@@ -219,9 +268,18 @@ export async function runExecution(io, root, bundle, host) {
   };
   const start = async (record, spec, feedback) => {
     let handle = handles.get(record.id);
-    if (!handle) { handle = await backend.start({ id: record.id, cwd: record.cwd, ...spec, signal: io.signal }); handles.set(record.id, handle); }
+    if (!handle) {
+      const started = performance.now();
+      try { handle = await backend.start({ id: record.id, cwd: record.cwd, ...spec, signal: io.signal }); handles.set(record.id, handle); metrics.workerStarts++; }
+      finally { metrics.workerMs += performance.now() - started; }
+    }
     record.status = 'RUNNING'; state.phase = spec.kind === 'reconciliation' ? 'RECONCILING' : 'RUNNING'; persist();
-    const work = Promise.resolve().then(() => backend.send(handle, feedback)).then(() => ({ id: record.id }), error => ({ id: record.id, error }));
+    const work = Promise.resolve().then(async () => {
+      const started = performance.now(); metrics.workerTurns++;
+      if (spec.kind === 'reconciliation') metrics.reconciliationTurns++;
+      try { return await backend.send(handle, feedback); }
+      finally { metrics.workerMs += performance.now() - started; }
+    }).then(() => ({ id: record.id }), error => ({ id: record.id, error }));
     running.set(record.id, work);
   };
   const reconcile = async (candidate, ids, context) => {
@@ -270,12 +328,15 @@ export async function runExecution(io, root, bundle, host) {
     while (state.slices.some(s => s.status !== 'INTEGRATED')) {
       ensureRunning(io.signal, root.deadlineAt, io.nowMs);
       const integratedIds = new Set(state.slices.filter(s => s.status === 'INTEGRATED').flatMap(s => contract.execution.find(x => x.id === s.id).verify));
-      const integratedHorizon = [...integratedIds, ...contract.criteria.filter(c => c.type === 'regression').map(c => c.id)];
+      const integratedHorizon = integrationHorizon(contract, integratedIds);
       // Readiness is established on this exact integration tree, never baseline or worker evidence.
       if (integratedIds.size) {
-        const checkDir = path.join(state.directory, `proof-${randomUUID()}`);
-        try { await materialize(state.repo, state.integrated, checkDir, io); state.evidence = await evaluate(checkDir, integratedHorizon); }
-        finally { fs.rmSync(checkDir, { recursive: true, force: true }); }
+        state.evidence = coveredProof(state.integrated, integratedHorizon);
+        if (!state.evidence) {
+          const checkDir = path.join(state.directory, `proof-${randomUUID()}`);
+          try { await materialize(state.repo, state.integrated, checkDir, io); state.evidence = await evaluate(checkDir, integratedHorizon); }
+          finally { fs.rmSync(checkDir, { recursive: true, force: true }); }
+        }
         if (!state.evidence.allPass) throw operationError('INTEGRATION_INVALID', 'accepted integration candidate no longer passes');
       }
       if (state.reconciliation) {
@@ -302,7 +363,7 @@ export async function runExecution(io, root, bundle, host) {
         }
         if (record.recoverCandidate) {
           charge(record, candidateIdentity(record.cwd, io));
-          const proof = await evaluate(record.cwd, executionHorizon(contract, slice.id));
+          const proof = await evaluate(record.cwd, workerBehaviorHorizon(contract, slice.id));
           delete record.recoverCandidate;
           if (proof.allPass) {
             record.artifact = await captureCandidate(state.repo, record.cwd, [record.base.tip], io);
@@ -322,7 +383,7 @@ export async function runExecution(io, root, bundle, host) {
         const record = state.slices.find(s => s.id === settled.id), slice = contract.execution.find(s => s.id === record.id);
         const digest = candidateIdentity(record.cwd, io), unchanged = digest === record.lastAttemptDigest;
         charge(record, digest); record.status = 'VERIFYING'; state.phase = 'WORKER_VERIFICATION'; persist();
-        const result = await evaluate(record.cwd, executionHorizon(contract, slice.id));
+        const result = await evaluate(record.cwd, workerBehaviorHorizon(contract, slice.id));
         record.failures = result.outcomes;
         if (!result.allPass) {
           if (unchanged) throw operationError('NO_PROGRESS', `worker ${record.id} settled without changing its failing candidate`);
@@ -334,8 +395,8 @@ export async function runExecution(io, root, bundle, host) {
       }
       state.phase = 'INTEGRATING'; persist();
       if (handles.has(verified.id)) { await backend.dispose(handles.get(verified.id)); handles.delete(verified.id); }
-      const merged = await merge(state.repo, verified.base, state.integrated, verified.artifact, io);
-      const slice = contract.execution.find(s => s.id === verified.id), ids = [...new Set([...integratedHorizon, ...executionHorizon(contract, slice.id)])];
+      const merged = await merge(state.repo, verified.base, state.integrated, verified.artifact, io); metrics.mergeCount++;
+      const slice = contract.execution.find(s => s.id === verified.id), ids = integrationHorizon(contract, [...integratedIds, ...workerBehaviorHorizon(contract, slice.id)]);
       const repaired = await reconcile(merged.artifact, ids, { sliceId: slice.id, objectives: contract.execution.filter(s => state.slices.some(r => r.id === s.id && r.status === 'INTEGRATED') || s.id === slice.id).map(s => s.objective),
         base: verified.base.tip, ours: state.integrated.tip, theirs: verified.artifact.tip, conflicts: merged.conflicts, conflictPaths:merged.conflictPaths });
       state.integrated = repaired.artifact; state.evidence = repaired.evidence; verified.status = 'INTEGRATED';
@@ -349,19 +410,26 @@ export async function runExecution(io, root, bundle, host) {
       persist();
     }
     // Prove the entire integration tree before attempting canonical publication.
-    const full = await reconcile(state.integrated, null, { fullRoot: true, objectives: contract.execution.map(s => s.objective) });
-    state.integrated = full.artifact; state.evidence = full.evidence; persist();
+    state.evidence = coveredProof(state.integrated, contract.criteria.map(c => c.id));
+    if (!state.evidence) {
+      const full = await reconcile(state.integrated, null, { fullRoot: true, objectives: contract.execution.map(s => s.objective) });
+      state.integrated = full.artifact; state.evidence = full.evidence;
+    }
+    persist();
     state.phase = 'FINAL_RECONCILIATION'; persist();
     const publicationBase = state.publicationBase ?? state.base;
     const canonical = await captureCandidate(state.repo, io.cwd, [publicationBase.tip], io);
-    const merged = await merge(state.repo, publicationBase, canonical, state.integrated, io);
-    const final = await reconcile(merged.artifact, null, { canonical: true, canonicalArtifact: canonical, base: publicationBase.tip, ours: canonical.tip, theirs: state.integrated.tip, conflicts: merged.conflicts, conflictPaths:merged.conflictPaths });
-    state.integrated = final.artifact; state.publicationBase = canonical; persist();
+    if (canonical.digest !== publicationBase.digest) {
+      const merged = await merge(state.repo, publicationBase, canonical, state.integrated, io); metrics.mergeCount++;
+      const final = await reconcile(merged.artifact, null, { canonical: true, canonicalArtifact: canonical, base: publicationBase.tip, ours: canonical.tip, theirs: state.integrated.tip, conflicts: merged.conflicts, conflictPaths:merged.conflictPaths });
+      state.integrated = final.artifact; state.evidence = final.evidence;
+    }
+    state.publicationBase = canonical; persist();
     // Concurrent canonical edits are another reconciliation input, never overwritten.
     if (candidateIdentity(io.cwd, io) !== canonical.digest) throw operationError('CANDIDATE_MUTATED', 'canonical workspace changed during final reconciliation; retry against its latest tree');
     const finalDir = path.join(state.directory, `final-${randomUUID()}`);
     try {
-      await materialize(state.repo, final.artifact, finalDir, io);
+      await materialize(state.repo, state.integrated, finalDir, io);
       await host.apply(finalDir, canonical.digest);
     } finally { fs.rmSync(finalDir, { recursive: true, force: true }); }
     state.phase = 'CANONICAL_EVALUATION'; persist();
@@ -370,5 +438,7 @@ export async function runExecution(io, root, bundle, host) {
     await Promise.allSettled([...handles.values()].map(h => backend.cancel(h)));
     await Promise.allSettled([...running.values()]);
     await Promise.allSettled([...handles.values()].map(h => backend.dispose(h)));
+    metrics.totalMs += performance.now() - startedAt;
+    host.persist();
   }
 }

@@ -6,7 +6,8 @@ import * as path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { test, baseline } from './test/suite.mjs';
 import * as core from './exitcode-core.mjs';
-import { executionHorizon, captureCandidate, materialize, preflightExecution } from './exitcode-parallel.mjs';
+import { workerBehaviorHorizon, integrationHorizon, captureCandidate, materialize, preflightExecution, createExecution, runExecution } from './exitcode-parallel.mjs';
+import { evaluatorEnvironment, digest } from './exitcode-evaluator.mjs';
 import { releasePreparation } from './exitcode-preparation.mjs';
 import { structuralReview } from './test/structural-review.mjs';
 
@@ -157,7 +158,7 @@ baseline('parallel: Git preflight accepts supported option forms and rejects mis
   await ready;elapsed=10_000;t.mock.timers.tick(10_000);await rejected;
 });
 
-baseline('parallel: DAG ownership and cycles are structural; horizons include transitive prerequisites and regressions', t => {
+baseline('parallel: DAG ownership and cycles are structural; worker horizons include transitive behavior prerequisites without regressions', t => {
   for (const [name, execution, error] of [
     ['forward references',graph,null],
     ['cycle',graph.map(s => s.id === 'S1' ? {...s,after:['C3']} : s),/cycle/],
@@ -170,8 +171,9 @@ baseline('parallel: DAG ownership and cycles are structural; horizons include tr
     const f=fixture(t,{execution}); assert.equal(f.drafted.ok,!error,name);
     if (error) assert.match(f.drafted.errors.join(' '),error);
     else {
-      assert.deepEqual(executionHorizon(f.drafted.draft,'S1'),['C1','R1']);
-      assert.deepEqual(executionHorizon(f.drafted.draft,'S3'),['C1','C2','C3','R1']);
+      assert.deepEqual(workerBehaviorHorizon(f.drafted.draft,'S1'),['C1']);
+      assert.deepEqual(workerBehaviorHorizon(f.drafted.draft,'S3'),['C1','C2','C3']);
+      assert.deepEqual(integrationHorizon(f.drafted.draft,['C1']),['C1','R1']);
     }
   }
   const f=fixture(t,{policy:{maxParallelWorkers:1.5}}); assert.equal(f.drafted.ok,false);
@@ -184,6 +186,7 @@ baseline('parallel: independent workers overlap; only integrated fresh evidence 
   const gate=new Promise(resolve=>{release=resolve;});
   const workers=backend(f,async h=>{
     if(h.id==='S1'||h.id==='S2'){if(++entered===2)release();await gate;}
+    if(h.id==='S3')assert.deepEqual(h.criteria.map(c=>c.id),['C1','C2','C3']);
     await implement(h);
   });
   const result=await core.evaluateNode(f.io);
@@ -315,4 +318,130 @@ test('parallel: the last charged candidate can retry inconclusive proof without 
   const result=await core.evaluateNode(f.io);
   assert.equal(result.status,'PASS',JSON.stringify(result));
   assert.equal(core.loadRoot(f.io,'G1').consumedAttempts,1);
+});
+
+const twoSlices = [
+  {id:'S1',objective:'Finish the first artifact',verify:['C1']},
+  {id:'S2',objective:'Finish the remaining artifacts',verify:['C2','C3']},
+];
+const finishTwo = async h => {
+  if (h.kind === 'reconciliation') return implement(h);
+  write(h.cwd,h.id === 'S1' ? 'first' : 'second','done');
+  if (h.id === 'S2') write(h.cwd,'last','done');
+};
+
+baseline('parallel: focused workers, exact integration reuse, and unchanged publication need only three regression runs', async t => {
+  const f=fixture(t,{execution:twoSlices}); await seal(f);
+  const specs=[];
+  backend(f,async h=>{specs.push(h);await finishTwo(h);});
+  const result=await core.evaluateNode(f.io);
+  assert.equal(result.status,'PASS',JSON.stringify(result));
+  for (const h of specs) {
+    assert.equal(h.kind,'slice');
+    assert.deepEqual(h.criteria.map(c=>c.id),h.id==='S1'?['C1']:['C2','C3']);
+    assert.deepEqual(h.regressions,[{id:'R1',requirement:'Existing artifacts remain compatible'}]);
+    assert.equal(JSON.stringify(h.regressions).includes('preserve'),false,'no regression recipe reaches workers');
+  }
+  const counts=Object.fromEntries(['observe:first','observe:second','observe:last','preserve'].map(command=>[command,f.calls.filter(c=>c.command===command).length]));
+  assert.deepEqual(counts,{'observe:first':4,'observe:second':3,'observe:last':3,preserve:3});
+  const root=core.loadRoot(f.io,'G1'), metrics=root.execution.metrics;
+  assert.equal(metrics.evaluationRuns,5,'two worker, two integration, one canonical evaluation');
+  assert.equal(metrics.proofReuseHits,2,'loop readiness and full integration reuse exact evidence');
+  assert.equal(metrics.criteria.R1.runs,3);
+  assert.equal(metrics.workerStarts,2); assert.equal(metrics.workerTurns,2);
+  assert.equal(metrics.mergeCount,2); assert.equal(metrics.reconciliationTurns,0);
+  assert.ok(metrics.totalMs>0); assert.ok(metrics.evaluationMs>0);
+  assert.equal(root.outcome.runId,core.loadNodeState(f.io,'G1').lastResult.runId,'completion uses canonical evidence');
+  assert.doesNotMatch(core.statusText(f.io),/execution metrics/);
+  assert.match(core.statusText(f.io,{detail:'evidence'}),/G1 execution metrics/);
+});
+
+baseline('parallel: resumed invocations earn fresh integration proof instead of trusting persisted evidence', async t => {
+  const f=fixture(t,{execution:twoSlices,policy:{maxParallelWorkers:1}}); await seal(f);
+  let interrupt=true;
+  backend(f,async h=>{
+    await finishTwo(h);
+    if(h.id==='S2'&&interrupt)throw Object.assign(Error('stop after first integration'),{code:'CANCELLED'});
+  });
+  const interrupted=await core.evaluateNode(f.io);
+  assert.equal(interrupted.status,'ACTIVE',JSON.stringify(interrupted));
+  const before=core.loadRoot(f.io,'G1');
+  assert.equal(before.execution.slices.find(s=>s.id==='S1').status,'INTEGRATED');
+  const runs=before.execution.metrics.criteria.R1.runs;
+  // Retain the exact digest and its persisted passing evidence across recovery.
+  interrupt=false; f.calls.length=0;
+  const result=await core.evaluateNode(f.io);
+  assert.equal(result.status,'PASS',JSON.stringify(result));
+  assert.equal(f.calls.filter(c=>c.command==='preserve'&&c.first==='done'&&c.second==='pending').length,1,'unchanged accepted integration receives fresh proof on resume');
+  assert.equal(core.loadRoot(f.io,'G1').execution.metrics.criteria.R1.runs,runs+3);
+});
+
+baseline('parallel: a worker regression passes focused proof but must be repaired before integration or canonical PASS', async t => {
+  const f=fixture(t,{execution:twoSlices}); await seal(f);
+  let repairs=0;
+  backend(f,async h=>{
+    if(h.kind==='reconciliation') {
+      repairs++; assert.ok(h.criteria.some(c=>c.id==='R1'));
+      assert.equal(read(f.cwd,'stable'),'steady','unproved regression never reaches canonical');
+      write(h.cwd,'stable','steady'); return;
+    }
+    await finishTwo(h); if(h.id==='S1')write(h.cwd,'stable','broken');
+  });
+  const result=await core.evaluateNode(f.io);
+  assert.equal(result.status,'PASS',JSON.stringify(result)); assert.equal(repairs,1);
+  assert.equal(read(f.cwd,'stable'),'steady');
+  assert.equal(core.loadRoot(f.io,'G1').execution.metrics.reconciliationTurns,1);
+});
+
+baseline('parallel: concurrent canonical edits require an additional merged full proof before the one canonical evaluation', async t => {
+  const f=fixture(t,{execution:twoSlices}); await seal(f);
+  backend(f,async h=>{await finishTwo(h);if(h.id==='S1')write(f.cwd,'user-note','concurrent');});
+  const result=await core.evaluateNode(f.io);
+  assert.equal(result.status,'PASS',JSON.stringify(result));
+  const metrics=core.loadRoot(f.io,'G1').execution.metrics;
+  assert.equal(metrics.mergeCount,3); assert.equal(metrics.evaluationRuns,6);
+  assert.equal(metrics.criteria.R1.runs,4); assert.equal(read(f.cwd,'user-note'),'concurrent');
+});
+
+baseline('parallel: mutable dependencies retain fresh evaluations and execution metrics stay out of normal status', async t => {
+  const f=fixture(t,{execution:twoSlices,files:{'package.json':'{"name":"fixture"}'}});
+  f.args.mutableDependencies=true;
+  assert.equal(core.draftNode(f.io,{...f.args,revise:'G1'}).ok,true);await seal(f);
+  assert.doesNotMatch(core.statusText(f.io),/execution metrics/);
+  assert.match(core.statusText(f.io,{detail:'evidence'}),/execution metrics/);
+  backend(f,finishTwo);
+  const result=await core.evaluateNode(f.io);
+  assert.equal(result.status,'PASS',JSON.stringify(result));
+  const metrics=core.loadRoot(f.io,'G1').execution.metrics;
+  assert.equal(metrics.proofReuseHits,0); assert.equal(metrics.evaluationRuns,7);
+  assert.equal(metrics.criteria.R1.runs,5,'loop and full integration prove fresh when reuse is disabled');
+});
+
+
+baseline('parallel: reuse requires exact bundle and environment identity plus all requested passing criteria', async t => {
+  for (const identity of ['exact','different-bundle','different-environment']) await t.test(identity,async t=>{
+    const f=fixture(t,{execution:twoSlices}), contract=f.drafted.draft;
+    const environment=evaluatorEnvironment(f.cwd,f.io);
+    const bundle={contract,env:environment,digest:'sealed-bundle',candidateDigest:core.digestTree(f.cwd)};
+    const root={id:'G1',policy:core.DEFAULT_POLICY,consumedAttempts:0,deadlineAt:Date.now()+60000};
+    root.execution=await createExecution(f.io,root,bundle);
+    backend(f,finishTwo);
+    const evaluations=[];let publications=0,completions=0;
+    const result=await runExecution(f.io,root,bundle,{
+      persist(){},
+      async evaluate(cwd,ids){
+        const wanted=ids??contract.criteria.map(c=>c.id);evaluations.push([...wanted]);
+        return {candidateDigest:core.digestTree(cwd),bundleDigest:identity==='different-bundle'?'other-bundle':bundle.digest,
+          environmentIdentity:identity==='different-environment'?'other-environment':digest(environment),
+          outcomes:wanted.map(criterionId=>({criterionId,status:'PASS',durationMs:1})),allPass:true};
+      },
+      async apply(cwd,expected){publications++;assert.equal(expected,core.digestTree(f.cwd));assert.equal(read(cwd,'first'),'done');assert.equal(read(cwd,'second'),'done');},
+      async complete(){completions++;return 'canonical completion';},
+    });
+    assert.equal(result,'canonical completion');assert.equal(publications,1);assert.equal(completions,1);
+    assert.equal(root.execution.metrics.evaluationRuns,identity==='exact'?4:6);
+    assert.equal(root.execution.metrics.proofReuseHits,identity==='exact'?2:0);
+    assert.ok(evaluations.some(ids=>ids.includes('C1')&&ids.includes('R1')),'worker behavior coverage cannot replace integration regression proof');
+    assert.ok(evaluations.some(ids=>['C1','C2','C3','R1'].every(id=>ids.includes(id))),'final integrated proof covers the full root');
+  });
 });

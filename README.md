@@ -119,6 +119,8 @@ Sealing releases the baseline, and the agent then implements normally.
 
 ### Parallel execution
 
+Use an execution DAG only when independent slices are substantial enough to amortize separate worker startup, Git integration, and proof. Keep small or closely related edits serial even when technically independent. Avoid adding `run scripts/verify` to every slice objective when the sealed root already checks it as a regression.
+
 A root contract can declare `execution` as a proof DAG. Every behavior criterion belongs to exactly one slice; `after` names prerequisite behavior criteria. Array order has no scheduling meaning. ExitCode rejects unknown references, duplicate ownership, self dependencies, and cycles before approval.
 
 ```json
@@ -136,11 +138,19 @@ After sealing, `exitcode_evaluate` runs the graph autonomously. One supervisor l
 
 At seal, Git plumbing captures the exact approved candidate, including uncommitted, untracked, and ignored files that participate in candidate identity. It neither requires a clean repository nor changes the user's Git index, branches, or commits. Worker history is internal state under `.exitcode/parallel/`. Private repositories isolate Git metadata; they do not sandbox trusted worker shell tools from the host.
 
-The worker horizon contains its own criteria, all transitive prerequisites, and every regression criterion. A worker's fresh PASS records `WORKER_VERIFIED`. It becomes `INTEGRATED` only after Git reconciliation and fresh evaluation of the combined candidate. Only that integrated evidence unlocks dependent slices. Clean passing merges need no agent; textual conflicts and behavioral failures use an isolated reconciliation session with the exact candidate tips and evaluator feedback.
+The worker horizon contains its own behavior criteria and all transitive prerequisite behavior criteria. Regression requirements reach workers as lightweight guardrails; the supervisor proves cumulative behavior and global regressions after each merge. A worker's fresh PASS records `WORKER_VERIFIED`. It becomes `INTEGRATED` only after Git reconciliation and fresh evaluation of the combined candidate. Only that integrated evidence unlocks dependent slices. Clean passing merges need no agent; textual conflicts and behavioral failures use an isolated reconciliation session with the exact candidate tips and evaluator feedback.
 
-Root completion requires every slice integrated, no outstanding workers or reconciliation, a fresh full integration PASS, reconciliation with the latest canonical workspace, and a fresh full PASS there. Concurrent canonical edits enter a three-way merge; edits detected during publication record a retry fault on the ACTIVE root. Changed worker candidates and agent reconciliation consume shared attempts; unchanged reruns and mechanical integration do not. Recovery preserves candidate artifacts, charged attempts, and the original deadline while requiring fresh proof. `/exitcode exit` aborts and disposes worker sessions and preserves their saved work.
+Root completion requires every slice integrated, no outstanding workers or reconciliation, fresh full integration evidence, publication to the latest canonical workspace, and a fresh full PASS there.
+
+Exact integration proofs may be reused within one evaluation invocation when the sealed bundle and immutable environment still match. Recovery starts with an empty proof cache, and mutable dependencies disable reuse.
+
+An unchanged canonical workspace is published mechanically; concurrent canonical edits enter a three-way merge and full reconciliation proof; edits detected during publication record a retry fault on the ACTIVE root.
+
+Changed worker candidates and agent reconciliation consume shared attempts; unchanged reruns and mechanical integration do not. Recovery preserves candidate artifacts, charged attempts, and the original deadline while requiring fresh proof. `/exitcode exit` aborts and disposes worker sessions and preserves their saved work.
 
 Contracts without `execution` retain serial repair and focused recursion. Legacy `sequence` retains its cumulative ordered proof behavior and cannot be combined with `execution`. Before approval, `WORKER_UNAVAILABLE` and `GIT_UNAVAILABLE` preparation diagnostics recommend revising to a serial draft without `execution` (optionally an ordered `sequence`), with no evaluator-quality charge; the draft stays editable and requires fresh preparation and user approval, never an automatic graph rewrite or a runtime switch of a sealed graph to serial execution.
+
+Diagnostic execution metrics (worker time, evaluation time, criterion runs, proof reuse, merges, and reconciliation turns) appear only in `/exitcode status evidence`, including for completed roots. `node scripts/benchmark-sealed.mjs` measures the two-slice path with injected checks and workers plus real Git integration. A returned root PASS ends verification unless the user requested an additional check.
 
 `node scripts/smoke-workers.mjs /path/to/pi-coding-agent/dist/index.js` checks the installed SDK offline using a scripted local provider, native file writing, feedback, and cancellation.
 

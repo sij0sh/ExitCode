@@ -17,7 +17,7 @@ export { RECIPE_KINDS, MUTATION_KINDS } from "./exitcode-evaluator.mjs";
 import { sandboxCommand, evaluatorCommand, candidateIdentity, evaluatorEnvironment, normalizeEvaluator, runRecipe, diagnostic, fileDigest, inventory, fixtureDirectory, captureEvaluatorAssets, verifyEvaluatorAssets, installEvaluatorAssets, restoreEvaluatorAssets, compatibleEnvironment, digest, safePath, criterionRequirement, validateEvaluatorAssetDefinitions } from "./exitcode-evaluator.mjs";
 import { prepareGate, emptyMetrics, addMetrics, copyCandidate, releasePreparation } from "./exitcode-preparation.mjs";
 import { ensureRunning, operationSignal, operationError } from "./exitcode-operation.mjs";
-import { validateExecution, preflightExecution, createExecution, runExecution } from "./exitcode-parallel.mjs";
+import { validateExecution, preflightExecution, createExecution, runExecution, executionMetrics, recordExecutionEvaluation } from "./exitcode-parallel.mjs";
 export { createPiWorkerBackend } from "./exitcode-workers.mjs";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -131,7 +131,7 @@ export const PROTOCOL_PROMPT =
   "Before implementation, submit the smallest acceptance contract that observes outcomes to ExitCode; ask the user only when ambiguity materially changes success. " +
   "Keep product files unchanged until ExitCode validates the evaluator and the user approves the plan; submit contract-specific tests as assets with test_asset recipes, and follow diagnostics to repair the evaluator. " +
   "After sealing, implement toward failing criteria, evaluate after meaningful changes, and use a child only when a smaller goal helps one failing parent criterion. " +
-  "For independent root work, declare an execution DAG with slice ids, verify, and after; exitcode_evaluate runs isolated workers and reconciles their fresh proofs. " +
+  "Use an execution DAG only when independent slices are substantial enough to amortize separate worker startup, Git integration, and proof. Keep small or closely related edits serial even when technically independent. " +
   "Only a fresh root PASS completes the goal; pauses, errors, and child PASS do not.";
 
 /** Upper bound on supervisor state injected into every agent turn. */
@@ -2356,7 +2356,7 @@ async function evaluateExecution(io, root, index) {
     evaluate: async (cwd, ids) => {
       const candidateIo = {...io, cwd};
       const result = await freshEvaluate(candidateIo, bundle, digestTree(cwd, candidateIo), root.deadlineAt - io.nowMs(), ids);
-      requireConclusive(result); ensureBudget(io, root);
+      ensureBudget(io, root);
       return result;
     },
     apply: async (cwd, expected) => {
@@ -2371,7 +2371,9 @@ async function evaluateExecution(io, root, index) {
     },
     complete: async () => {
       if (root.execution.reconciliation || root.execution.slices.some(s => s.status !== "INTEGRATED")) throw operationError("INTEGRATION_INVALID", "outstanding candidates prevent root completion");
+      const started = performance.now();
       const result = await freshEvaluate(io, bundle, digestTree(io.cwd), root.deadlineAt - io.nowMs());
+      recordExecutionEvaluation(root.execution, result, performance.now() - started);
       requireIdentity(io, root, result);
       node.lastResult = result; node.lastCandidateDigest = result.candidateDigest;
       node.lastEnvironmentIdentity = result.environmentIdentity;
@@ -2836,7 +2838,14 @@ function inactiveStatusText(snap) {
 /** Operational status. detail "evidence" adds the full contract, E0 evidence, and metrics. */
 export function statusText(io, { detail = "normal" } = {}) {
   const snap = statusSnapshot(io);
-  if (!snap.active) return inactiveStatusText(snap);
+  if (!snap.active) {
+    const lines = [inactiveStatusText(snap)];
+    if (detail === "evidence") for (const id of snap.roots) {
+      const root = loadRoot(io, id);
+      if (root?.execution) lines.push(`  ${id} execution metrics: ${JSON.stringify(executionMetrics(root.execution))}`);
+    }
+    return lines.join("\n");
+  }
   const lines = [`exitcode root ${snap.root} [${snap.status}] stack: ${snap.stack.join(" > ") || "(empty)"}`];
   for (const [id, node] of Object.entries(snap.nodes)) {
     lines.push(`  ${id} ${node.status} attempts=${node.attempts} :: ${node.vector}`);
@@ -2861,6 +2870,8 @@ export function statusText(io, { detail = "normal" } = {}) {
       lines.push(`  ${c.id} acceptance asset: ${path.relative(io.cwd,evidence?.assetsDirectory ?? path.join(storePaths(io.cwd).assetsDir,`${nodeId}.prepared`))}/.exitcode-evaluator/${r.asset}`,
         `    command: ${r.command} ${(r.args ?? []).join(' ')} .exitcode-evaluator/${r.asset}`);
     }
+    const execution = loadRoot(io, snap.root)?.execution;
+    if (execution) lines.push(`  execution metrics: ${JSON.stringify(executionMetrics(execution))}`);
     lines.push(`  evaluator metrics: ${JSON.stringify(snap.evaluatorMetrics)}`, `  intent digest: ${snap.intentDigest}`, `  evaluator digest: ${snap.evaluatorDigest}`,
       `  diagnostics: ${JSON.stringify(snap.diagnostics)}`, `  evaluator evidence: ${JSON.stringify(snap.evaluatorEvidence)}`, `  contract: ${JSON.stringify(snap.contract)}`);
   } else {

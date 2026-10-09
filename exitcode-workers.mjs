@@ -3,7 +3,7 @@ import { ensureRunning, operationError } from './exitcode-operation.mjs';
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 
-const SYSTEM = 'You are an ExitCode implementation worker in a private Git workspace. Implement the assigned objective, preserve the stated prerequisites and regression behavior, and stop when your candidate is ready for supervisor evaluation. Repair evaluator failures in this same session. Repository tests are product files and may change; the supervisor evaluates sealed acceptance copies. Do not access supervisor storage or evaluator assets, create recursive workers, or claim the root is complete. Git commits are unnecessary; the supervisor captures your working tree.';
+const SYSTEM = 'You are an ExitCode implementation worker in a private Git workspace. Implement the assigned objective, preserve the stated prerequisites and regression behavior, and stop when your candidate is ready for supervisor evaluation. Use focused local checks when useful for implementation feedback. Do not run broad repository verification solely to certify completion; authoritative sealed verification belongs to the supervisor. Repair evaluator failures in this same session. Repository tests are product files and may change; the supervisor evaluates sealed acceptance copies. Do not access supervisor storage or evaluator assets, create recursive workers, or claim the root is complete. Git commits are unnecessary; the supervisor captures your working tree.';
 
 function workerBoundary(cwd) {
   return pi => pi.on('tool_call', event => {

@@ -101,7 +101,7 @@ const ExecutionSchema = Type.Array(Type.Object({
   objective: Type.String({minLength:1,maxLength:200}),
   verify: Type.Array(Type.String({minLength:1}), {minItems:1,description:"Every behavior criterion belongs to exactly one slice"}),
   after: Type.Optional(Type.Array(Type.String({minLength:1}), {description:"Prerequisite behavior criteria; fresh integrated PASS unlocks this slice regardless of array order"})),
-}), {minItems:1,maxItems:12,description:"Root proof DAG. Independent ready slices run concurrently in private Git repositories; cannot combine with legacy sequence"});
+}), {minItems:1,maxItems:12,description:"Use an execution DAG only when independent slices are substantial enough to amortize separate worker startup, Git integration, and proof. Keep small or closely related edits serial even when technically independent. Cannot combine with legacy sequence"});
 
 const CriterionFields = {
   id: Type.Optional(Type.String({ description: "Suggested id (supervisor assigns C1..Cn when omitted)" })),
@@ -353,7 +353,7 @@ export default function (pi: ExtensionAPI) {
       description:
         "Submit the smallest observable acceptance contract: explicit outcomes plus one criterion per outcome. Prefer discovered existing tests; never invent an existing_test selector. " +
         "For new behavior, a baseline-failing test_asset check is sufficient; positive witnesses are optional. Use one only when known-good state is cheaper than implementing the feature. Prefer input/state over source changes; keep exhaustive cases in product regression tests. " +
-        "For independent root slices, supply execution as a complete acyclic proof graph; dependencies name behavior criteria. " +
+        "Use an execution DAG only when independent slices are substantial enough to amortize separate worker startup, Git integration, and proof. Keep small or closely related edits serial even when technically independent. Dependencies name behavior criteria. Avoid repeating broad verification in slice objectives when it is already a sealed root regression. " +
         "ExitCode validates it before user review; repair returned diagnostics, then present the returned plan and wait for the user's reply.",
       promptSnippet: "exitcode_draft: submit the root contract (goal + outcomes + observable criteria + checks)",
       parameters: Type.Object({
@@ -422,7 +422,7 @@ export default function (pi: ExtensionAPI) {
     {
       name: "exitcode_evaluate",
       label: "Exitcode Evaluate",
-      description: "Run the sealed criteria fresh. For an execution DAG, run ready private workers, reconcile their verified candidates, and evaluate the canonical root. Follow failures and the returned next action; only fresh canonical root ALL PASS completes the goal.",
+      description: "Run the sealed criteria fresh. For an execution DAG, run ready private workers, reconcile their verified candidates, and evaluate the canonical root. Follow failures and the returned next action; only fresh canonical root ALL PASS completes the goal. A returned root PASS is authoritative completion; do not rerun the same repository verification solely for confidence unless the user explicitly requested an additional check.",
       promptSnippet: "exitcode_evaluate: run the sealed checks fresh",
       parameters: Type.Object({
         node: Type.Optional(Type.String({ description: "Node id (defaults to the active leaf)" })),
