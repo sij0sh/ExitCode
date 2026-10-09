@@ -1,0 +1,13 @@
+{
+  "protocol": 1,
+  "name": "ExitCode snapshot and Pi lifecycle regression driver",
+  "command": {
+    "program": "node",
+    "args": [
+      "driver.mjs"
+    ]
+  },
+  "timeoutSeconds": 600,
+  "environment": [],
+  "isolation": "workspace"
+}
