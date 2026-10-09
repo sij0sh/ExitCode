@@ -1,39 +1,35 @@
 # ExitCode invariants
 
-Each rule lives in one authoritative place: the protocol explains the loop, tools explain how to act, the supervisor enforces invariants, and tests verify invariants.
-A test belongs in the suite only if a failure would violate one of these rows or a security boundary.
-Add variants as table rows inside the canonical test, not as new tests.
-Mark a representative invariant with `baseline()` for `npm test` and normal verification.
-Keep exhaustive fault permutations under `test()` or the full side of `variants()` for `npm run test:full` and `scripts/verify-full`.
-Use direct prepared fixtures for state transitions; preparation, isolation, and proof-quality tests must exercise real E0.
+ExitCode owns fixed acceptance, evidence identity, and fresh completion.
+Pi owns implementation planning, native tools, project instructions, and session state.
+Run the complete replacement suite with `npm test`.
+Run runtime syntax checks with `npm run check`.
+The old baseline/full split and proof-DAG tests are not part of this release.
+
+Test names below refer to `test/core.test.mjs`, `test/adapter.test.mjs`,
+`test/runner.test.mjs`, and `test/pi-driver.test.mjs`.
 
 | Invariant | Why it exists | Canonical tests |
 | --- | --- | --- |
-| Pre-seal product is immutable; sealed acceptance copies are supervisor-owned; live repository tests are product files | Author acceptance evidence without changing the candidate; product tests can change after sealing without changing evaluator copies | `core: baseline: pre-seal changes …`, `core: baseline: review-time changes …`, `core: baseline: changes that cannot be saved …`, `adapter: settle restores pre-seal changes …`, `assets: authored files are confined …`, `assets: the exact approved tests run fresh …` |
-| Supervisor state is private | Agents cannot forge contracts, approvals, or evidence | `core: guard: supervisor state is private …` |
-| Evaluator is validated before approval | The user never approves an evaluator E0 has not passed | `core: prepare: failures spend only the evaluator budget …`, `adapter: a draft returns a compact validated plan only after E0 …`, `parallel: execution capability failures …`, `parallel: Git preflight …`, `workers: preflight rejects …` |
-| Approval binds the exact validated bundle | Prevent post-review weakening of criteria, checks, policy, or clock | `core: approval: …` (five tests), `core: prepare: candidate, policy, or concurrent changes …` |
-| Weak evaluators are rejected | Every behavior outcome has one discriminating check; baseline failures, built-in negatives, and explicit rejects prove discrimination | `evaluator: semantic: …`, `evaluator: discrimination: …` |
-| Semantic criticism is advisory | A bounded critic call can warn about intent, but only mechanical diagnostics block preparation | `evaluator: semantic: critic concerns …`, `evaluator: review: cancellation aborts reviewers …`, `adapter: best-effort critic …` |
-| Behavior text has one authority | Behavior criteria display their mapped outcome text; only regression criteria carry a requirement | `core: structure: …`, `adapter: a draft returns a compact validated plan …`, `adapter: approval comes from a plain-English reply …` |
-| An unsealed root DRAFT stays repairable | Preparation faults retain editability; legacy recovery and resume never replay preparation or reset budgets | `core: prepare: failures spend only the evaluator budget …`, `recovery: legacy unsealed pauses …`, `adapter: best-effort critic …`, `adapter: /exitcode resume …` |
-| Evaluators are thin | A pre-seal evaluator validates observable evidence; inline assets stay within 16 files and 128 KiB | `evaluator: witnesses: built-in recipes need no controls …`, `evaluator: witnesses: prospective test assets …`, `evaluator: witnesses: controls that resemble a reference implementation …`, `assets: inline limits …` |
-| Evaluation is isolated and identity-bound | Probes cannot reach the host or certify a different candidate; without bubblewrap they degrade to sanitized disposable host processes with a warning unless strict isolation is set | `evaluator: isolation: …`, `evaluator: identity: …`, `core: snapshots: …`, `core: identity: …` |
-| Sealed proof is immutable | Acceptance tests, helpers, and evaluator dependencies cannot drift after approval; live runtime drift is re-overlaid from sealed copies, while damaged sealed copies pause | `evaluator: assets: …`, `assets: existing_test and test_suite …`, `core: evaluate: an own-vector regression restores …` |
-| Only fresh root PASS completes | Baselines, seals, child PASS, and stale PASS never close a goal | `core: lifecycle: an approved, validated draft seals exactly …`, `adapter: only a fresh root PASS exits mode …` |
-| DAG dependencies use integrated proof | Worker PASS never unlocks a dependent; complete acyclic ownership and transitive horizons are deterministic | `parallel: DAG ownership and cycles …`, `parallel: independent workers overlap …` |
-| Exact proof reuse is invocation-local | Unchanged integration bytes can reuse fresh proof only with matching bundle, environment, and passing coverage; recovery and mutable dependencies require fresh evaluation | `parallel: focused workers …`, `parallel: resumed invocations …`, `parallel: mutable dependencies retain …` |
-| Integration proves global regressions | Focused worker proof cannot authorize integration or completion; publication always ends with a full fresh canonical proof | `parallel: a worker regression …`, `parallel: concurrent canonical edits require …`, `parallel: focused workers …` |
-| Git candidates are private and transactional | Approved dirty trees are captured exactly; worker metadata, canonical edits, and the user's index remain independent | `parallel: independent workers overlap …`, `parallel: semantic reconciliation …`, `parallel: textual conflicts …`, `parallel: synthetic Git candidates …`, `parallel: interrupted canonical reconciliation …` |
-| Parallel attempts and recovery remain root-wide | Interrupted workers and reconciliation cannot reset budgets, bypass fresh proof, or grant branch-only completion | `parallel: interruption, budget exhaustion, and worker failure …`, `parallel: the last charged candidate …` |
-| Worker sessions have bounded ownership | Cwd and conversation are independent; model failure carries no success, and cancellation disposes sessions | `workers: sessions isolate cwd …`, `workers: model errors …`, `adapter: an approved execution DAG …` |
-| Recursion is focused | One child targets one failing parent criterion; parent proof stays authoritative | `core: child: …` (three tests), `core: policy: children inherit …` |
-| Budgets are monotonic | Retries, children, and resumes never reset time or attempts; grants are explicit | `core: policy: …`, `core: evaluate: only changed trees spend attempts …`, `recovery: deadline crossings never yield PASS …` |
-| Default budgets are soft | Unchosen defaults warn about strategy instead of stopping; explicit policy limits and a safety ceiling stop work | `core: budget: default budgets are soft …` |
-| Only intervention pauses | Runner, Git, worker, and identity faults stay ACTIVE as the next action; the agent can request only user or external input, and stale operation locks self-heal | `core: fault: only user or external intervention pauses …`, `recovery: inconclusive evaluation …`, `parallel: interruption, budget exhaustion, and worker failure …`, `adapter: infrastructure faults stay ACTIVE …` |
-| Inconclusive is not FAIL or PASS | Infrastructure faults carry no verdict or quality charge; unsealed preparation remains editable, sealed execution records a retry fault | `core: verdict: …`, `recovery: infrastructure faults …`, `recovery: inconclusive evaluation …`, `recovery: cancellation …` |
-| One owner per workspace | Concurrent sessions cannot interleave supervisor operations or adopt a root implicitly; explicit user intent detaches the owner without deleting it, and a reattached root reconciles with the current tree instead of rewinding it | `recovery: live operations and transcript root ownership …`, `adapter: reload, restart, and resume reconnect …`, `adapter: one root owns the workspace …` |
-| Crash recovery fails closed | Interrupted preparation, verdict commits, and lost checkpoints never grant approval or PASS | `recovery: interrupted preparation …`, `recovery: reload recovers an interrupted provisional verdict …`, `recovery: an inconclusive ancestor or a missing pre-child checkpoint …`, `recovery: checkpoint metadata …` |
-| One store generation | State from another generation is archived whole, never migrated or partially interpreted | `recovery: other store generations are archived untouched …` |
-| Agent context is bounded | Every turn gets the loop, not the evidence; reviews are compact judgments | `core: protocol: …`, `core: status: injected state is bounded …`, `adapter: each turn receives the short protocol …`, `evaluator: review: …` (three tests) |
-| The user's environment is untouched | ExitCode never changes the tool loadout, and only the user cancels | `adapter: mode exposes ExitCode tools …`, `adapter: approval comes from a plain-English reply …`, `adapter: best-effort critic …` |
+| The user approves actual prepared acceptance before product changes are authorized | Preparation reproduces declared baselines and presents the exact scenarios for review | `core: problem-first lifecycle...`, `adapter: review waits...`, `adapter: pre-approval product writes...` |
+| Pre-approval product changes invalidate preparation without discarding edits | Explicit resume adopts the current candidate instead of rewinding useful work | `core: pre-approval edits are preserved...`, `core: canonical edits during validation...` |
+| Acceptance and captured driver bytes stay fixed after approval | Live project definitions cannot replace the sealed observer | `core: problem-first lifecycle...`, `core: project drift during review...`, `core: sealed-byte and evaluator-runtime tampering...` |
+| An observer must reject an empty target | Preparation checks wiring without building a passing reference implementation | `core: an always-passing observer...`, `core: problem-first lifecycle...` |
+| Validation runs in independent candidate copies | Setup and trials do not change the canonical product or Git metadata | `core: environment construction is reused...`, `core: problem-first lifecycle...` |
+| Only fresh acceptance PASS on the current candidate completes a task | Baselines, approval, historical runs, stale results, and agent claims cannot complete it | `core: problem-first lifecycle...`, `core: canonical edits during validation...`, `adapter: review waits...`, `Pi driver: Pi scenario observer reads the outcome independently...` |
+| Every scheduled acceptance trial must pass | Failed samples remain evidence instead of being retried until favorable | `core: every trial contributes to acceptance...` |
+| Infrastructure errors and cancellation are inconclusive | Missing measurements, unavailable targets, timeouts, malformed reports, and failed cleanup never count as valid reproduction or completion | `core: schema failures, unavailable real targets...`, `core: cancellation during cleanup...`, `runner: timeout and cancellation...`, `runner: nonzero exit, prose output...`, `runner: assertions distinguish...` |
+| Evaluator environment identity stays fixed and is checked after each scenario | Runtime drift cannot certify a candidate | `core: sealed-byte and evaluator-runtime tampering...` |
+| Refresh retains environment instances needed by earlier seals | New tasks can rebuild infrastructure without changing an existing task's evaluator | `core: refresh preserves the old sealed environment...`, `core: environment construction is reused...` |
+| One task owns the workspace and one supervisor operation runs at a time | Concurrent sessions and cancellation windows cannot interleave state changes | `core: ownership, durable resume...`, `core: only one workspace operation runs...` |
+| Supervisor state stays separate from editable project definitions | Native access guards protect acceptance and evidence while allowing bootstrap maintenance | `adapter: pre-approval product writes...`, `core: single format rejects legacy stores...` |
+| Isolation is explicit and bubblewrap fails closed | Workspace execution is trusted host execution, not a silent sandbox fallback | `runner: bubblewrap never silently falls back...`, `runner: runner accepts JSON protocol...` |
+| Only the replacement format and schemas are supported | Legacy stores remain untouched and require an explicit operator backup | `core: single format rejects legacy stores...` |
+| Native tools, project instructions, and session persistence remain Pi responsibilities | ExitCode adds a compact summary and evidence inspection without replacing the harness | `adapter: factory is inert...`, `adapter: session reload retains ownership...`, `adapter: review waits...`, `Pi driver: Pi scenario observer reads the outcome independently...` |
+| Work notes separate hypotheses from observations | Notes reference known evidence and record decisions without rolling files back | `core: ownership, durable resume...`, `adapter: session reload retains ownership...` |
+| External waits stop continuation and unchanged progress gets at most two nudges | The extension does not introduce a scheduler, forced decomposition, or an unbounded strategy loop | `adapter: session reload retains ownership...`, `adapter: continuation is bounded...` |
+
+Workspace mode and native tools are not an adversarial permissions boundary.
+Structured observations do not prove complete intent coverage or observer correctness.
+The Pi observer test uses an SDK fixture, not a live provider.
+Local test success does not establish the live example's twenty-minute latency target.

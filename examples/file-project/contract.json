@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "problem": "The feature file still contains pending",
+  "happyPath": "The feature file contains done",
+  "constraints": [],
+  "scenarios": [{
+    "id": "feature",
+    "description": "Observe the feature in a fresh candidate copy",
+    "instructions": "Read feature.txt and report its exact contents",
+    "input": { "file": "feature.txt" },
+    "baseline": "FAIL",
+    "trials": 1,
+    "timeoutSeconds": 10,
+    "assertions": [{ "path": "/content", "op": "eq", "value": "done\n" }]
+  }]
+}

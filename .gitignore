@@ -1,5 +1,4 @@
 node_modules/
-.agents/
+.exitcode/state/
 
-# Local supervisor contracts, state, and checkpoints
-.exitcode/
+.agents/

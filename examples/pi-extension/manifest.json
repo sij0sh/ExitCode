@@ -1,0 +1,8 @@
+{
+  "protocol": 1,
+  "name": "Pi extension live task observations",
+  "command": { "program": "node", "args": ["driver.mjs"] },
+  "timeoutSeconds": 300,
+  "environment": ["EXITCODE_PI_INSTALLATION", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"],
+  "isolation": "workspace"
+}

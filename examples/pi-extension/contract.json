@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "problem": "A small well specified task takes too long through the ExitCode extension",
+  "happyPath": "The task completes correctly through the extension within twenty minutes",
+  "constraints": [
+    "Exercise the candidate extension with an identified Pi installation and fixed model",
+    "Measure from task submission through verified completion including discovery and preparation",
+    "The fixture supplies immediate simulated user approval after acceptance is ready",
+    "The scheduled live trial must pass and an incomplete trial remains a failure"
+  ],
+  "scenarios": [{
+    "id": "small-task",
+    "description": "Complete a concrete small artifact task in a fresh Pi fixture",
+    "instructions": "Use Pi with the candidate ExitCode extension to solve the supplied goal. Report observed completion and independently read the resulting file. Do not modify the fixture outside the Pi session.",
+    "input": {
+      "extension": "exitcode.ts",
+      "model": { "provider": "SELECT_PROVIDER_BEFORE_DRAFTING", "id": "SELECT_MODEL_BEFORE_DRAFTING" },
+      "goal": "The result.txt file says pending. It should say done followed by a newline. Keep settings.json unchanged.",
+      "fixtureFiles": { "result.txt": "pending\n", "settings.json": "{\"enabled\":true}\n", "AGENTS.md": "Make the smallest change that solves the requested task. Preserve unrelated files.\n" },
+      "expectedFiles": { "result.txt": "done\n", "settings.json": "{\"enabled\":true}\n" },
+      "taskDeadlineMs": 1200000
+    },
+    "baseline": "FAIL",
+    "trials": 1,
+    "timeoutSeconds": 1230,
+    "assertions": [
+      { "path": "/completed", "op": "eq", "value": true },
+      { "path": "/correct", "op": "eq", "value": true },
+      { "path": "/approvalCount", "op": "eq", "value": 1 },
+      { "path": "/elapsedMs", "op": "lte", "value": 1200000 }
+    ]
+  }]
+}

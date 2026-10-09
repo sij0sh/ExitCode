@@ -1,0 +1,8 @@
+{
+  "protocol": 1,
+  "name": "File observation example",
+  "command": { "program": "node", "args": ["driver.mjs"] },
+  "timeoutSeconds": 10,
+  "environment": [],
+  "isolation": "workspace"
+}
