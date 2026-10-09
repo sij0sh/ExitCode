@@ -75,16 +75,29 @@ const implement = async handle => {
   write(handle.cwd,file,'done');
 };
 
+function assertUnavailableDraft(f, failed, code) {
+  assert.equal(failed.ok,false,JSON.stringify(failed));
+  const d=failed.diagnostics.find(d=>d.code===code);
+  assert.equal(d?.repairability,'supervisor');
+  assert.match(d.recommendedRepair,/without `execution`.*ordered `sequence`.*serially/);
+  const snapshot=core.statusSnapshot(f.io);
+  assert.deepEqual([failed.metrics.e0Attempts,snapshot.evaluatorMetrics.e0Attempts],[0,0]);
+  assert.deepEqual([snapshot.status,snapshot.nodes.G1.status,snapshot.phase,snapshot.approval,snapshot.awaitingApproval],
+    ['ACTIVE','DRAFT','EVALUATOR_PREPARATION',null,false]);
+  assert.deepEqual(snapshot.contract.execution,f.drafted.draft.execution,'diagnostics never rewrite the graph');
+  assert.equal(snapshot.contract.sequence,undefined);
+  assert.equal(core.approveRoot(f.io).ok,false);
+  assert.equal(fs.existsSync(core.sealedFile(f.cwd,'G1')),false);
+  assert.equal(core.draftNode(f.io,{...f.args,revise:'G1'}).ok,true,'preflight failure keeps the draft editable');
+}
+
 baseline('parallel: execution capability failures prevent approval and preflight starts no workers or Git candidates', async t=>{
   const f=fixture(t),before=core.digestTree(f.cwd);
   delete f.io.workerBackend;
-  const failed=await core.prepareNode(f.io);
-  assert.equal(failed.ok,false);assert.ok(failed.diagnostics.some(d=>d.code==='WORKER_UNAVAILABLE'));
-  assert.equal(core.approveRoot(f.io).ok,false);
+  assertUnavailableDraft(f,await core.prepareNode(f.io),'WORKER_UNAVAILABLE');
   backend(f,implement);
   f.io.workerBackend.preflight=async()=>{throw Object.assign(Error('selected model unavailable'),{code:'WORKER_UNAVAILABLE'});};
-  assert.equal((await core.prepareNode(f.io)).ok,false);
-  assert.equal(core.approveRoot(f.io).ok,false);
+  assertUnavailableDraft(f,await core.prepareNode(f.io),'WORKER_UNAVAILABLE');
   backend(f,implement);
   const passed=await core.prepareNode(f.io);
   assert.equal(passed.ok,true,JSON.stringify(passed));
@@ -96,7 +109,20 @@ baseline('parallel: execution capability failures prevent approval and preflight
   assert.equal(core.loadRoot(f.io,'G1').deadlineAt,null);
 });
 
-test('parallel: Git preflight accepts supported option forms and rejects missing or outdated Git', async t=>{
+baseline('parallel: injected execution preflight faults are deterministic without Git initialization', async t=>{
+  for(const code of ['WORKER_UNAVAILABLE','GIT_UNAVAILABLE'])await t.test(code,async t=>{
+    const f=fixture(t);let calls=0;
+    f.io.executionPreflight=async()=>{calls++;throw Object.assign(Error('injected unavailable capability'),{code});};
+    assertUnavailableDraft(f,await core.prepareNode(f.io),code);
+    assert.equal(calls,1);
+    assert.equal(f.lifecycle.length,0,'real worker preflight is bypassed');
+    assert.equal(f.calls.length,0,'no evaluator probes execute');
+    assert.equal(fs.existsSync(path.join(f.cwd,'.git')),false);
+    assert.equal(fs.existsSync(path.join(f.cwd,'.exitcode/parallel')),false);
+  });
+});
+
+baseline('parallel: Git preflight accepts supported option forms and rejects missing or outdated Git', async t=>{
   let workers=0;
   const backend={preflight:async()=>{workers++;},start(){},send(){},cancel(){},dispose(){}};
   for(const help of ['--write-tree --merge-base','--write-tree --[no-]merge-base']) {
@@ -106,8 +132,20 @@ test('parallel: Git preflight accepts supported option forms and rejects missing
     });
   }
   assert.equal(workers,2);
-  for(const failure of [Object.assign(Error('not installed'),{code:'ENOENT'}),Object.assign(Error('usage'),{code:129,stderr:'--write-tree'})])
+  for(const failure of [Object.assign(Error('not installed'),{code:'ENOENT'}),Object.assign(Error('usage'),{code:129,stderr:'--write-tree'})]) {
     await assert.rejects(()=>preflightExecution({workerBackend:backend},async()=>{throw failure;}),e=>e.code==='GIT_UNAVAILABLE');
+    const outdated=failure.code===129;
+    const f=fixture(t,{files:outdated?{git:'#!/bin/sh\nprintf "%s\\n" "--write-tree"\nexit 129\n'}:{},fileModes:outdated?{git:0o755}:{}});
+    const originalPath=process.env.PATH;
+    try {
+      process.env.PATH=f.cwd; // Only a missing or unsupported Git in this disposable candidate.
+      assertUnavailableDraft(f,await core.prepareNode(f.io),'GIT_UNAVAILABLE');
+      assert.equal(f.lifecycle.length,0,'Git failure prevents even worker capability preflight');
+      assert.equal(fs.existsSync(path.join(f.cwd,'.exitcode/parallel')),false);
+    } finally {
+      if(originalPath===undefined)delete process.env.PATH;else process.env.PATH=originalPath;
+    }
+  }
   assert.equal(workers,2,'Git failure prevents worker runtime construction');
   t.mock.timers.enable({apis:['setTimeout']});
   let elapsed=0,entered;
@@ -202,27 +240,33 @@ test('parallel: textual conflicts use an isolated reconciler and reject unresolv
   });
 });
 
-baseline('parallel: interruption, budget exhaustion, and worker failure cannot grant PASS or reset charged work', async t => {
+baseline('parallel: interruption, budget exhaustion, and worker failure preserve fresh proof, charged work, and the deadline', async t => {
   for(const mode of ['runner-error','worker-error','budget'])await t.test(mode,async t=>{
     const f=fixture(t,{policy:mode==='budget'?{maxTotalAttempts:1}:undefined}); await seal(f);
+    const approved=core.loadRoot(f.io,'G1');
     let fail=true;
     const ordinary=f.io.exec;
+    f.io.exec=async(command,options)=>{
+      if(mode==='runner-error'&&fail){fail=false;return {exit:null,error:'runtime missing',errorCode:'RUNNER_ERROR'};}
+      return ordinary(command,options);
+    };
     backend(f,async h=>{
       await implement(h);
-      if(mode==='runner-error'&&fail){fail=false;f.fault.run=true;}
       if(mode==='worker-error'&&fail){fail=false;throw Object.assign(new Error('worker unavailable'),{code:'WORKER_FAILED'});}
     });
-    const result=await core.evaluateNode(f.io);
-    // Only an explicit budget needs the user; runner and worker faults stay ACTIVE for a plain retry.
-    assert.equal(result.status,mode==='budget'?'PAUSED':'ACTIVE',JSON.stringify(result));
-    const paused=core.loadRoot(f.io,'G1'); assert.equal(paused.outcome,undefined);
-    assert.equal(read(f.cwd,'first'),'pending','canonical candidate remains unchanged during speculative work');
-    f.io.exec=ordinary; f.fault.run=false;
-    if(mode==='budget')assert.equal(core.resumeRoot(f.io,{maxTotalAttempts:3}).ok,true);
-    const resumed=await core.evaluateNode(f.io);
-    assert.equal(resumed.status,'PASS',JSON.stringify(resumed));
+    let result=await core.evaluateNode(f.io);
+    // Only an explicit budget needs the user; transient runner and worker faults retry once in place.
+    if(mode==='budget') {
+      assert.equal(result.status,'PAUSED',JSON.stringify(result));
+      assert.equal(core.loadRoot(f.io,'G1').outcome,undefined);
+      assert.equal(read(f.cwd,'first'),'pending','canonical candidate remains unchanged during speculative work');
+      assert.equal(core.resumeRoot(f.io,{maxTotalAttempts:3}).ok,true);
+      result=await core.evaluateNode(f.io);
+    } else assert.match(result.warnings?.[0]??'',new RegExp(`^retried once after ${mode==='runner-error'?'RUNNER_ERROR':'WORKER_FAILED'}:`));
+    assert.equal(result.status,'PASS',JSON.stringify(result));
     const root=core.loadRoot(f.io,'G1'); assert.equal(root.consumedAttempts,3);
-    assert.equal(root.executionStartedAt,paused.executionStartedAt); assert.equal(root.deadlineAt,paused.deadlineAt);
+    assert.equal(root.outcome.candidateDigest,core.digestTree(f.cwd));
+    assert.equal(root.executionStartedAt,approved.executionStartedAt); assert.equal(root.deadlineAt,approved.deadlineAt);
   });
 });
 

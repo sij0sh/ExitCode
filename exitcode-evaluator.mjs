@@ -423,7 +423,7 @@ export function auditCriteria(criteria = [], outcomes = []) {
 
 /**
  * A minimal positive witness: authored, supervisor-generated for built-in
- * recipes, or else the unmodified candidate (null control).
+ * recipes, or else the unmodified candidate when its baseline passes.
  */
 export function positiveWitness(criterion) {
   if (criterion.controls?.accept) return {source:'author',control:criterion.controls.accept};
@@ -464,7 +464,7 @@ export function lintEvaluators(draft, cwd, capabilities) {
       const code=e.message.split(':')[0];
       const lintCode=['RUNNER_NOT_FOUND','CHECK_TARGET_MISSING','TEST_SELECTOR_NOT_FOUND'].includes(code)?code:/^(command_exit|test_asset) requires/.test(e.message)?'INVALID_SPEC':'UNSAFE_COMMAND';
       const repair = recipe?.kind === 'existing_test' && ['TEST_SELECTOR_NOT_FOUND','CHECK_TARGET_MISSING'].includes(lintCode)
-        ? 'Copy a literal selector from discovery; never invent a future name. For new acceptance evidence, supply assets and a test_asset recipe, or use command_exit/custom_command with a minimal positive witness; use test_suite for regression. Repository tests may change after sealing.'
+        ? 'Copy a literal selector from discovery; never invent a future name. For new acceptance evidence, supply assets and a test_asset recipe, or use command_exit/custom_command; positive witnesses are optional; use test_suite for regression. Repository tests may change after sealing.'
         : lintCode === 'INVALID_SPEC'
           ? recipe.kind === 'test_asset'
             ? 'test_asset takes an authored asset name, a runtime basename, and arguments before its appended path: {"kind":"test_asset","asset":"C1.test.mjs","command":"node","args":["--test"]}.'

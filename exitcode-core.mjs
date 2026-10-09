@@ -100,6 +100,9 @@ const RETRY_CODES = new Set([
   "ENVIRONMENT_CHANGED", "CHECKPOINT_UNAVAILABLE", "OPERATION_BUSY", "INTERRUPTED", "REVIEW_TIMEOUT",
 ]);
 
+/** One immediate evaluation retry for plausibly transient infrastructure, not waits or concurrent edits. */
+const AUTO_RETRY_CODES = new Set(["RUNNER_ERROR", "IO_ERROR", "GIT_FAILED", "WORKER_FAILED"]);
+
 export function faultDisposition(code) {
   if (INTERVENTION_CODES.has(code)) return Disposition.INTERVENTION;
   return RETRY_CODES.has(code) ? Disposition.RETRY : Disposition.REPAIR;
@@ -125,7 +128,7 @@ export const EXITCODE_TOOL_NAMES = Object.freeze([
 /** The loop only. Tools explain how to act; the supervisor enforces invariants. */
 export const PROTOCOL_PROMPT =
   "EXITCODE MODE. Understand the user's goal and inspect the project before changing it. " +
-  "Before implementation, submit the smallest observable acceptance contract to ExitCode; ask the user only when ambiguity materially changes success. " +
+  "Before implementation, submit the smallest acceptance contract that observes outcomes to ExitCode; ask the user only when ambiguity materially changes success. " +
   "Keep product files unchanged until ExitCode validates the evaluator and the user approves the plan; submit contract-specific tests as assets with test_asset recipes, and follow diagnostics to repair the evaluator. " +
   "After sealing, implement toward failing criteria, evaluate after meaningful changes, and use a child only when a smaller goal helps one failing parent criterion. " +
   "For independent root work, declare an execution DAG with slice ids, verify, and after; exitcode_evaluate runs isolated workers and reconciles their fresh proofs. " +
@@ -2007,6 +2010,8 @@ function verificationSummary(draft, prepared) {
     if (baseline?.outcome) evidence.push(`baseline ${baseline.outcome.status}`);
     const accept = probesOf(["discrimination"], c.id).find(p => p.label === "accept");
     if (accept?.outcome?.status === "PASS") evidence.push("witness PASS");
+    else if ((c.type ?? "behavior") === "behavior" && baseline?.outcome?.status === "FAIL" && !accept)
+      evidence.push("implementation will establish success post-seal");
     const negatives = probesOf(["discrimination", "adversarial"], c.id).filter(p => p.expected === "FAIL" && p.outcome?.status === "FAIL").length;
     if (negatives) evidence.push(`rejected ${negatives} negative${negatives === 1 ? "" : "s"}`);
     return `- ${c.id}: ${how}${evidence.length ? `; ${evidence.join(", ")}` : ""}.`;
@@ -2104,7 +2109,7 @@ async function prepareDraft(io, nodeId) {
       result=await prepareGate({...draft,...(parentBundle?{parentRequirement:criterionRequirement(parentBundle.contract,parentBundle.contract.criteria.find(c=>c.id===node.target))}:{})},
         {cwd:io.cwd,exec:io.exec,runCheck:(c,exec,cwd,timeout,opts)=>runCheck(c,exec,cwd,timeout,{...opts,deadlineAt:root.deadlineAt,nowMs:io.nowMs}),
           defaultTimeoutMs:defaultTimeoutMs(root),environment,maxBytes:SNAPSHOT_MAX_BYTES,candidateDigest,review:io.review,signal:operation.signal,
-          reviewTimeoutMs:io.reviewTimeoutMs,executionPreflight:()=>preflightExecution(operation),assets,assetsDirectory:directory,onProgress:io.onProgress,deadlineAt:root.deadlineAt,nowMs:io.nowMs});
+          reviewTimeoutMs:io.reviewTimeoutMs,executionPreflight:io.executionPreflight ?? (()=>preflightExecution(operation)),assets,assetsDirectory:directory,onProgress:io.onProgress,deadlineAt:root.deadlineAt,nowMs:io.nowMs});
       ensureBudget(operation,root);
       if(stableStringify(environment)!==stableStringify(evaluatorEnvironment(io.cwd)))throw operationError("ENVIRONMENT_CHANGED","Environment changed during preparation");
       verifyEvaluatorAssets(io.cwd,directory,assets);
@@ -2319,15 +2324,23 @@ export async function evaluateNode(io, nodeId = null) {
     const index=loadIndex(io.cwd),root=index.activeRootId?loadRoot(io,index.activeRootId):null;
     if(!root || root.status!==NodeState.ACTIVE)return {ok:false,errors:["no ACTIVE root; resume any infrastructure pause first"]};
     const owned=operationIo(io,root);
-    try {
-      overlayStack(owned.io,root);
-      if (root.execution) {
-        if (nodeId && nodeId !== root.id) return {ok:false,errors:["execution DAG workers are supervised at the root"]};
-        return await evaluateExecution(owned.io, root, index);
+    const run=()=>{
+      const current=loadRoot(io,root.id);
+      overlayStack(owned.io,current);
+      if (current.execution) {
+        if (nodeId && nodeId !== current.id) return {ok:false,errors:["execution DAG workers are supervised at the root"]};
+        return evaluateExecution(owned.io,current,loadIndex(io.cwd));
       }
-      return await evaluateActive(owned.io,nodeId);
-    }
+      return evaluateActive(owned.io,nodeId);
+    };
+    try {return await run();}
     catch(e) {
+      if(AUTO_RETRY_CODES.has(e.code)) {
+        try {
+          const result=await run();
+          return {...result,warnings:[`retried once after ${e.code}: ${e.message}`,...(result.warnings??[])]};
+        } catch(retryError) {e=retryError;}
+      }
       const current=loadRoot(io,root.id);
       return failRoot(io,current,{code:e.code??"IO_ERROR",reason:e.message,nodeId:nodeId??leafOf(current),operation:"evaluate"});
     } finally {owned.dispose();}

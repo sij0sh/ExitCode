@@ -85,7 +85,7 @@ function scenario(t, mode = 'strong') {
 }
 
 baseline('semantic: adequate behavioral, structural, and new-feature evaluators reach approval with the candidate unchanged', async t => {
-  for (const mode of variants(['strong', 'structural', 'new-feature'], ['strong'])) await t.test(mode, async t => {
+  for (const mode of variants(['strong', 'structural', 'new-feature', 'thin-new-feature'], ['strong', 'thin-new-feature'])) await t.test(mode, async t => {
     const { cwd, io, calls } = scenario(t, mode), before = core.digestTree(cwd), r = await core.prepareNode(io);
     assert.equal(r.ok, true, JSON.stringify(r.diagnostics));
     assert.equal(core.digestTree(cwd), before);
@@ -125,9 +125,9 @@ test('semantic: critic concerns are visible warnings and never veto mechanical e
 
 baseline('semantic: uncovered, unchallenged, or contradictory evaluators never reach approval', async t => {
   const expected = { 'missing-outcome': 'OUTCOME_MISSING', 'unknown-outcome': 'OUTCOME_UNKNOWN', 'uncovered-outcome': 'OUTCOME_UNCOVERED',
-    thin: 'NEGATIVE_EVIDENCE_MISSING', 'thin-new-feature': 'POSITIVE_WITNESS_REQUIRED', 'setup-error': 'CONTROL_SETUP_FAILED',
+    thin: 'NEGATIVE_EVIDENCE_MISSING', 'setup-error': 'CONTROL_SETUP_FAILED',
     'witness-regression': 'REGRESSION_ON_WITNESS', 'runner-error': 'RUNNER_ERROR' };
-  for (const mode of variants(Object.keys(expected), ['uncovered-outcome', 'thin', 'thin-new-feature'])) await t.test(mode, async t => {
+  for (const mode of variants(Object.keys(expected), ['uncovered-outcome', 'thin'])) await t.test(mode, async t => {
     const { cwd, io } = scenario(t, mode), before = core.digestTree(cwd), r = await core.prepareNode(io);
     assert.equal(r.ok, false, JSON.stringify(r));
     assert.ok(r.diagnostics.length);
@@ -152,7 +152,7 @@ baseline('semantic: uncovered, unchallenged, or contradictory evaluators never r
 // Thin evaluator drafts
 // ---------------------------------------------------------------------------
 
-test('witnesses: built-in recipes need no controls; other checks need a passing baseline or an authored witness', async t => {
+baseline('witnesses: built-in recipes need no controls; baseline-failing checks need no positive witness', async t => {
   const thin = workspace(t);
   const { result } = await prepare(thin, literal());
   assert.equal(result.ok, true, JSON.stringify(result.diagnostics));
@@ -164,14 +164,18 @@ test('witnesses: built-in recipes need no controls; other checks need a passing 
     const { result } = await prepare(workspace(t), [{ id: 'C1', outcome: 'O1', check: { recipe: value } }, literal()[1]]);
     assert.equal(result.ok, true, `${label}: ${JSON.stringify(result.diagnostics)}`);
   }
-  // A custom check that already passes uses the candidate as its witness; one that cannot pass needs an authored witness.
+  // Passing baselines supply positive evidence; failing baselines need no authored witness.
   const command = (cmd, extra = {}) => [{ id: 'C1', outcome: 'O1', check: custom(cmd), controls: { reject: [{ mutations: [{ kind: 'write_file', path: 'feature', content: 'broken' }] }] }, ...extra }, literal()[1]];
   const exec = async (cmd, { cwd }) => ({ exit: read(cwd, 'feature') === (cmd === 'observe-done' ? 'done' : 'pending') ? 0 : 1, stdout: '', stderr: '', timedOut: false });
-  assert.equal((await prepare(workspace(t), command('observe-pending'), { exec })).result.ok, true);
+  const existing = (await prepare(workspace(t), command('observe-pending'), { exec })).result;
+  assert.equal(existing.ok, true, JSON.stringify(existing.diagnostics));
+  assert.match(existing.review, /baseline PASS, rejected 1 negative/);
+  assert.equal(existing.stages.find(s => s.stage === 'discrimination').probes.filter(p => p.label === 'accept').length, 0);
+  assert.equal(existing.stages.find(s => s.stage === 'determinism').probes.length, 1);
   const missing = (await prepare(workspace(t), command('observe-done'), { exec })).result;
-  assert.ok(codes(missing).includes('POSITIVE_WITNESS_REQUIRED'));
-  assert.ok(!codes(missing).includes('NONDETERMINISTIC'), 'consequential repeat failures are not reported');
-  assert.match(missing.diagnostics.find(d => d.code === 'POSITIVE_WITNESS_REQUIRED').recommendedRepair, /controls\.accept/);
+  assert.equal(missing.ok, true, JSON.stringify(missing.diagnostics));
+  assert.equal(missing.stages.find(s => s.stage === 'determinism').probes.length, 0);
+  assert.equal(missing.stages.find(s => s.stage === 'discrimination').probes.some(p => p.label === 'accept'), false);
   const authored = command('observe-done', { controls: { accept: { mutations: [{ kind: 'write_file', path: 'feature', content: 'done' }] }, reject: [{ mutations: [{ kind: 'write_file', path: 'feature', content: 'broken' }] }] } });
   assert.equal((await prepare(workspace(t), authored, { exec })).result.ok, true);
   // A new behavior whose baseline already fails needs no explicit reject; one the baseline satisfies does.
@@ -179,10 +183,34 @@ test('witnesses: built-in recipes need no controls; other checks need a passing 
     controls: { accept: { mutations: [{ kind: 'write_file', path: 'feature', content: 'done' }] } } }, literal()[1]];
   assert.equal((await prepare(workspace(t), witnessOnly, { exec })).result.ok, true, 'baseline FAIL plus witness PASS proves discrimination');
   const baselineFail = [{ id: 'C1', outcome: 'O1', check: custom('observe-done') }, literal()[1]];
-  assert.equal((await prepare(workspace(t), baselineFail, { exec })).result.ok, false, 'baseline failure is negative evidence but still needs a positive witness');
-  assert.ok(codes((await prepare(workspace(t), baselineFail, { exec })).result).includes('POSITIVE_WITNESS_REQUIRED'));
+  const prospective = await prepare(workspace(t), baselineFail, { exec });
+  assert.equal(prospective.result.ok, true, JSON.stringify(prospective.result.diagnostics));
+  assert.equal(prospective.result.metrics.probeExecutions, 4, 'only baseline and wiring for behavior and regression');
+  assert.equal(prospective.result.stages.find(s => s.stage === 'regression-witness').probes.length, 0);
+  assert.match(prospective.result.review, /baseline FAIL, implementation will establish success post-seal/);
+  assert.ok(!prospective.result.warnings.some(w => /SATISFIABILITY|positive witness/i.test(w)));
+  assert.equal(core.statusSnapshot(prospective.io).awaitingApproval, true);
+  assert.equal((await core.sealNode(prospective.io, 'G1', { userApproval: 'Approve' })).ok, true);
+  assert.equal((await core.evaluateNode(prospective.io, 'G1')).status, 'ACTIVE', 'approval does not establish implementation success');
   const unchallenged = (await prepare(workspace(t), [{ id: 'C1', outcome: 'O1', check: custom('observe-pending') }, literal()[1]], { exec })).result;
   assert.ok(codes(unchallenged).includes('NEGATIVE_EVIDENCE_MISSING'));
+});
+
+baseline('witnesses: prospective test assets reach approval and require fresh implementation success after sealing', async t => {
+  const cwd = workspace(t, { 'src/value.mjs': "export const value = 'pending';" });
+  const before = core.digestTree(cwd);
+  const { io, result } = await prepare(cwd, [{ id: 'C1', outcome: 'O1',
+    check: { recipe: { kind: 'test_asset', asset: 'value.test.mjs', command: 'node', args: ['--test'] } } }], {}, {
+    assets: { 'value.test.mjs': "import {test} from 'node:test';import assert from 'node:assert/strict';import {value} from '../src/value.mjs';test('reports done',()=>assert.equal(value,'done'));" }
+  });
+  assert.equal(result.ok, true, JSON.stringify(result.diagnostics));
+  assert.equal(result.metrics.probeExecutions, 2, 'only baseline and empty-target probes');
+  assert.equal(core.digestTree(cwd), before, 'preparation leaves product source unchanged');
+  assert.match(result.review, /baseline FAIL, implementation will establish success post-seal/);
+  assert.equal((await core.sealNode(io, 'G1', { userApproval: 'Approve' })).ok, true);
+  assert.equal((await core.evaluateNode(io)).status, 'ACTIVE');
+  fs.writeFileSync(path.join(cwd, 'src/value.mjs'), "export const value = 'done';");
+  assert.equal((await core.evaluateNode(io)).status, 'PASS');
 });
 
 baseline('witnesses: controls that resemble a reference implementation are rejected before review', async t => {

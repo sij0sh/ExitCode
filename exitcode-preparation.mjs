@@ -58,7 +58,10 @@ export async function prepareGate(draft, {cwd,exec,runCheck,defaultTimeoutMs,env
   const report = (stage) => {ensureRunning(signal);onProgress?.({phase:'EVALUATOR_PREPARATION',stage,elapsedMs:Date.now()-start});};
   const boundaryDiagnostic = (e,stage) => {
     const code=e.code ?? 'IO_ERROR';
-    return diagnostic(code,stage,null,e.message,'Repair the draft assets or authorized environment, or retry preparation',code==='CONTROL_SETUP_FAILED'?'agent':'supervisor');
+    const recommendedRepair=['WORKER_UNAVAILABLE','GIT_UNAVAILABLE'].includes(code)
+      ? 'Parallel execution is unavailable here; revise the draft without `execution` (optionally as an ordered `sequence`) to run serially'
+      : 'Repair the draft assets or authorized environment, or retry preparation';
+    return diagnostic(code,stage,null,e.message,recommendedRepair,code==='CONTROL_SETUP_FAILED'?'agent':'supervisor');
   };
   const execute = async (command,runOptions) => {
     ensureRunning(signal,deadlineAt,nowMs);
@@ -128,32 +131,41 @@ export async function prepareGate(draft, {cwd,exec,runCheck,defaultTimeoutMs,env
       return result;
     });
   };
+  const completed=[];
+  const runQueued=async()=>{
+    const pending=jobs.splice(0);let next=0;
+    const results=new Array(pending.length);
+    await Promise.all(Array.from({length:Math.min(4,pending.length)},async()=>{while(next<pending.length){if(signal?.aborted)break;const i=next++;results[i]=await pending[i]();}}));
+    completed.push(...results.filter(Boolean));
+  };
+  // Establish the baseline and wiring before deciding whether positive probes help.
   for(const c of draft.criteria){
-    if((c.type??'behavior')==='behavior'){
-      const accept=witnesses.get(c.id).control;
-      queue(c,'discrimination',accept,'PASS','accept');
-      for(const [i,control]of (c.controls?.reject??[]).entries())queue(c,'discrimination',control,'FAIL',`reject:${i}`);
-      // Repeat the valid fixture independently. This includes custom commands.
-      queue(c,'determinism',accept,'PASS','accept-repeat');
-      // Supervisor-generated negatives for built-in recipes.
-      const r=c.check.recipe;
-      if(r.path&&BUILTIN_RECIPES.includes(r.kind)){
-        queue(c,'adversarial',{mutations:[{kind:'delete_file',path:r.path}]},'FAIL','delete-target');
-        if(r.kind==='file_contains')queue(c,'adversarial',{mutations:[{kind:'write_file',path:r.path,content:`unrelated-${digest(r.value).slice(0,8)}`}]},'FAIL','unrelated-content');
-        if(r.kind==='file_not_contains')queue(c,'adversarial',{mutations:[{kind:'write_file',path:r.path,content:r.value}]},'FAIL','forbidden-content');
-        if(r.kind==='json_value')queue(c,'adversarial',{mutations:[{kind:'write_file',path:r.path,content:'{invalid'}]},'FAIL','invalid-json');
-      }
-      // Regression-on-witness: the behavior witness must not inherently violate protected behavior.
-      if(accept?.mutations)for(const reg of regressions)queue(reg,'regression-witness',accept,'PASS',`witness:${c.id}`);
-    }
-    queue(c,'wiring',null,'NOT_PASS','empty-target');
     queue(c,'baseline',null,'ANY','candidate');
+    queue(c,'wiring',null,'NOT_PASS','empty-target');
   }
-  const results=new Array(jobs.length);let next=0;
-  await Promise.all(Array.from({length:Math.min(4,jobs.length)},async()=>{while(next<jobs.length){if(signal?.aborted)break;const i=next++;results[i]=await jobs[i]();}}));
+  await runQueued();
+  for(const c of behaviors){
+    const baseline=completed.find(r=>r.criterionId===c.id&&r.stage==='baseline');
+    const wiring=completed.find(r=>r.criterionId===c.id&&r.stage==='wiring');
+    if(baseline?.error || !['PASS','FAIL'].includes(baseline?.outcome?.status) || wiring?.error || wiring?.outcome?.status!=='FAIL')continue;
+    const witness=witnesses.get(c.id),accept=witness.control;
+    const hasWitness=witness.source!=='baseline';
+    if(hasWitness)queue(c,'discrimination',accept,'PASS','accept');
+    for(const [i,control]of (c.controls?.reject??[]).entries())queue(c,'discrimination',control,'FAIL',`reject:${i}`);
+    // Repeat positive evidence only when it exists; the baseline itself can supply it.
+    if(hasWitness || baseline.outcome.status==='PASS')queue(c,'determinism',accept,'PASS','accept-repeat');
+    const r=c.check.recipe;
+    if(r.path&&BUILTIN_RECIPES.includes(r.kind)){
+      queue(c,'adversarial',{mutations:[{kind:'delete_file',path:r.path}]},'FAIL','delete-target');
+      if(r.kind==='file_contains')queue(c,'adversarial',{mutations:[{kind:'write_file',path:r.path,content:`unrelated-${digest(r.value).slice(0,8)}`}]},'FAIL','unrelated-content');
+      if(r.kind==='file_not_contains')queue(c,'adversarial',{mutations:[{kind:'write_file',path:r.path,content:r.value}]},'FAIL','forbidden-content');
+      if(r.kind==='json_value')queue(c,'adversarial',{mutations:[{kind:'write_file',path:r.path,content:'{invalid'}]},'FAIL','invalid-json');
+    }
+    if(accept?.mutations)for(const reg of regressions)queue(reg,'regression-witness',accept,'PASS',`witness:${c.id}`);
+  }
+  await runQueued();
   if(signal?.aborted)diagnostics.push(diagnostic(signal.reason?.code??'CANCELLED','preparation',null,'Operation stopped during preparation','Resume with authorized remaining budget','supervisor'));
   else report('probes-complete');
-  const completed=results.filter(Boolean);
   // Without a passing positive witness, repeat failures are consequences, not separate defects.
   const unwitnessed=new Set(completed.filter(r=>r.label==='accept'&&r.outcome?.status!=='PASS').map(r=>r.criterionId));
   for(const stage of ['discrimination','adversarial','determinism','wiring','regression-witness','baseline']){
@@ -164,18 +176,17 @@ export async function prepareGate(draft, {cwd,exec,runCheck,defaultTimeoutMs,env
       else if(r.outcome.status==='ERROR')diagnostics.push(diagnostic(r.outcome.errorCode ?? 'RUNNER_ERROR',stage,r.criterionId,r.outcome.reasons.join('; '),'Restore isolated execution and resume', 'supervisor'));
       else if(stage==='baseline'){}
       else if((r.expected==='NOT_PASS'&&r.outcome.status==='PASS')||(r.expected!=='NOT_PASS'&&r.outcome.status!==r.expected)){
-        const baselineWitness=r.label==='accept'&&witnesses.get(r.criterionId)?.source==='baseline';
-        const code=stage==='wiring'?'EMPTY_TARGET_PASS':stage==='determinism'?'NONDETERMINISTIC':stage==='regression-witness'?'REGRESSION_ON_WITNESS':baselineWitness?'POSITIVE_WITNESS_REQUIRED':r.label==='accept'?'ACCEPT_NOT_DISCRIMINATED':'REJECT_NOT_DISCRIMINATED';
+        const code=stage==='wiring'?'EMPTY_TARGET_PASS':stage==='determinism'?'NONDETERMINISTIC':stage==='regression-witness'?'REGRESSION_ON_WITNESS':r.label==='accept'?'ACCEPT_NOT_DISCRIMINATED':'REJECT_NOT_DISCRIMINATED';
         diagnostics.push(diagnostic(code,stage,r.criterionId,`${r.label}: ${r.outcome.status}, expected ${r.expected}; ${r.outcome.reasons.join('; ')}`,
-          baselineWitness?'The check does not pass on the current candidate; supply controls.accept as a minimal positive witness'
-          :code==='REGRESSION_ON_WITNESS'?'The behavior witness inherently violates protected existing behavior; narrow the witness or the regression scope'
+          code==='REGRESSION_ON_WITNESS'?'The behavior witness inherently violates protected existing behavior; narrow the witness or the regression scope'
           :'Repair the evaluator or fixture, not the real candidate'));
       }
     }
     stages.push({stage,ok:!diagnostics.some(d=>d.stage===stage),probes});
   }
   for(const c of draft.criteria){
-    const accept=completed.find(r=>r.criterionId===c.id&&r.stage==='discrimination'&&r.label==='accept');
+    const accept=completed.find(r=>r.criterionId===c.id&&r.stage==='discrimination'&&r.label==='accept')
+      ?? (witnesses.get(c.id)?.source==='baseline'?completed.find(r=>r.criterionId===c.id&&r.stage==='baseline'&&r.outcome?.status==='PASS'):undefined);
     for(const reject of completed.filter(r=>r.criterionId===c.id&&r.stage==='discrimination'&&r.label.startsWith('reject:')))
       if(accept?.fixtureDigest&&accept.fixtureDigest===reject.fixtureDigest&&!diagnostics.some(d=>d.criterionId===c.id&&d.code==='REJECT_NOT_DISCRIMINATED'))diagnostics.push(diagnostic('REJECT_NOT_DISCRIMINATED','discrimination',c.id,'Accept and reject fixtures have identical content','Make fixture mutations meaningful'));
     const repeat=completed.find(r=>r.criterionId===c.id&&r.stage==='determinism');

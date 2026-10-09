@@ -249,9 +249,14 @@ baseline('recovery: inconclusive evaluation preserves work, approval, stack, and
   await seal(f);
   const bytes = fs.readFileSync(core.sealedFile(f.cwd, 'G1'), 'utf8'), approval = core.loadRoot(f.io, 'G1').approval;
   done(f);
-  f.io.exec = async (command, options) => command === 'preserve' ? run(null, { error: 'isolated runner unavailable' }) : f.exec(command, options);
-  // Infrastructure faults stay ACTIVE: the fault is the next action, not a user pause.
+  const calls = [];
+  f.io.exec = async (command, options) => {
+    calls.push(command);
+    return command === 'preserve' ? run(null, { error: 'isolated runner unavailable' }) : f.exec(command, options);
+  };
+  // Persistent infrastructure faults stay ACTIVE after exactly one automatic retry.
   const faulted = await core.evaluateNode(f.io);
+  assert.deepEqual(calls, ['observe:feature', 'preserve', 'observe:feature', 'preserve']);
   assert.deepEqual([faulted.status, faulted.fault.code, faulted.fault.disposition], ['ACTIVE', 'RUNNER_ERROR', 'retry']);
   assert.match(faulted.next, /exitcode_evaluate/);
   const kept = core.loadRoot(f.io, 'G1');

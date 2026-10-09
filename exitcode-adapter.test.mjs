@@ -133,10 +133,18 @@ baseline('adapter: an approved execution DAG runs SDK workers through evaluation
   assert.deepEqual(h.getActiveTools(),h.loadout);
 });
 
+baseline("adapter: drafting guidance makes positive witnesses optional", () => {
+  const text = fs.readFileSync(new URL("./exitcode.ts", import.meta.url), "utf8");
+  assert.match(text, /baseline-failing test_asset check is sufficient; positive witnesses are optional/);
+  assert.match(text, /known-good state is cheaper than implementing the feature/);
+  assert.doesNotMatch(text, /supply accept only when the check cannot pass|minimal positive witness/);
+});
+
 test("adapter: each turn receives the short protocol and bounded status, never evaluator evidence", async (t) => {
   const h = harness(t, "todo\n", ["read", "write", "bash", "git_commit_plan"]);
   await h.command("Complete all five phases");
   assert.match(promptText(h), /EXITCODE MODE/);
+  assert.match(promptText(h), /acceptance contract that observes outcomes/);
   assert.match(promptText(h), /Root goal: Complete all five phases/);
   // Extension housekeeping can neither replace the retained objective nor switch enforcement off.
   await h.events.get("input")({ text: "Record a commit", source: "extension" }, h.ctx);

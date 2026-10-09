@@ -60,8 +60,8 @@ const FixtureSchema = Type.Object({
 const ControlsSchema = Type.Object({
   accept: Type.Optional(FixtureSchema),
   reject: Type.Optional(Type.Array(FixtureSchema, {minItems:1})),
-}, {description:"Usually omit. A control is a minimal witness that the check can discriminate, not a reference implementation. " +
-  "Built-in file recipes and checks that already pass need none; supply accept only when the check cannot pass on the current candidate. " +
+}, {description:"Usually omit. Positive witnesses are optional; use accept only when known-good state is cheaper to create than the feature. " +
+  "Prefer fixture/input/dependency state over production-source changes. " +
   "Supply reject for behavior the baseline already satisfies; a baseline failure already counts as negative evidence."});
 
 const ReviewCriticSchema = Type.Object({
@@ -352,7 +352,7 @@ export default function (pi: ExtensionAPI) {
       label: "Exitcode Draft",
       description:
         "Submit the smallest observable acceptance contract: explicit outcomes plus one criterion per outcome. Prefer discovered existing tests; never invent an existing_test selector. " +
-        "For new behavior supply contract-owned assets with a test_asset recipe and a minimal positive witness; use the project's runtime and test_suite for regression. " +
+        "For new behavior, a baseline-failing test_asset check is sufficient; positive witnesses are optional. Use one only when known-good state is cheaper than implementing the feature. Prefer input/state over source changes; keep exhaustive cases in product regression tests. " +
         "For independent root slices, supply execution as a complete acyclic proof graph; dependencies name behavior criteria. " +
         "ExitCode validates it before user review; repair returned diagnostics, then present the returned plan and wait for the user's reply.",
       promptSnippet: "exitcode_draft: submit the root contract (goal + outcomes + observable criteria + checks)",
