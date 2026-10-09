@@ -2,18 +2,21 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { ExitCode } from '../exitcode-core.mjs';
-import { readJson, locked, treeDigest, DEFAULT_STORE_DIR } from '../exitcode-files.mjs';
+import { ExitCode, review } from '../exitcode-core.mjs';
+import { readJson, writeJson, digest, locked, treeDigest, DEFAULT_STORE_DIR } from '../exitcode-files.mjs';
 import { ready, workspace, driver, manifest, contract, ok } from './helpers.mjs';
 
 test('problem-first lifecycle reproduces failure, freezes acceptance, and requires fresh real success', async t => {
   const { cwd, supervisor, id, prepared } = await ready(t);
   assert.equal(fs.readFileSync(path.join(cwd, 'feature.txt'), 'utf8'), 'pending\n');
   assert.equal(prepared.phase, 'READY');
+  assert.match(prepared.review, /Happy path claims:\n  H1: The feature file contains done/);
+  assert.match(prepared.review, /Scenario feature:[^\n]*\nCovers: H1\n/);
   assert.equal(prepared.preparation.results[0].status, 'FAIL');
   assert.equal(prepared.preparation.results[1].status, 'UNAVAILABLE');
   assert.equal((await supervisor.evaluate()).code, 'NOT_SEALED');
   ok(await supervisor.approve());
+  assert.deepEqual(JSON.parse(supervisor.inspect('contract').inspection.text), contract());
   assert.equal((await supervisor.draft(contract())).code, 'SEALED');
   assert.equal((await supervisor.configure({ manifest, files: { 'driver.mjs': driver } })).code, 'SEALED');
   const failing = ok(await supervisor.evaluate());
@@ -33,6 +36,70 @@ test('problem-first lifecycle reproduces failure, freezes acceptance, and requir
   assert.ok(!fs.existsSync(path.join(runRoot, 'candidate')));
   fs.writeFileSync(path.join(cwd, 'feature.txt'), 'a later edit');
   assert.equal(supervisor.freshPass(id), false);
+});
+
+test('approval review shows every claim and many-to-many scenario coverage, including unmapped guardrails', () => {
+  const spec = contract();
+  spec.happyPath.push({ id: 'H2', claim: 'Existing behavior remains valid' });
+  spec.scenarios[0].covers.push('H2');
+  spec.scenarios.push({ ...structuredClone(spec.scenarios[0]), id: 'existing', baseline: 'PASS', covers: ['H2'] },
+    { ...structuredClone(spec.scenarios[0]), id: 'guardrail', baseline: 'PASS', covers: [] });
+  const text = review({ problem: spec.problem, prepared: { contract: spec, project: { manifest }, run: { id: 'Rfixture', warmEnvironment: true }, digest: 'fixture' } });
+  assert.match(text, /H1: The feature file contains done/);
+  assert.match(text, /H2: Existing behavior remains valid/);
+  assert.match(text, /Scenario feature:[^\n]*\nCovers: H1, H2\n/);
+  assert.match(text, /Scenario existing:[^\n]*\nCovers: H2\n/);
+  assert.match(text, /Scenario guardrail:[^\n]*\nCovers: none\n/);
+  assert.match(text, /Coverage is declared/);
+});
+
+test('invalid coverage fails before driver preparation or approval', async t => {
+  const cwd = workspace(t), supervisor = new ExitCode(cwd, { runner: async () => assert.fail('Invalid contracts must not execute a driver') });
+  const id = ok(await supervisor.start('Finish feature')).task;
+  ok(await supervisor.configure({ manifest, files: { 'driver.mjs': driver } }));
+  for (const covers of [undefined, [], ['H1', 'unknown']]) {
+    const spec = contract(); spec.scenarios[0].covers = covers;
+    const result = await supervisor.draft(spec);
+    assert.equal(result.code, 'INVALID_SPEC');
+    assert.equal(result.runId, undefined);
+    assert.equal(supervisor.status().phase, 'DISCOVERY');
+  }
+  assert.ok(!fs.existsSync(path.join(cwd, DEFAULT_STORE_DIR, 'state', 'environments')));
+  assert.ok(!fs.existsSync(path.join(cwd, DEFAULT_STORE_DIR, 'state', 'tasks', id, 'runs')));
+  assert.equal((await supervisor.approve()).code, 'NOT_READY');
+});
+
+test('persisted prose happy paths cannot bypass claim validation at approval or evaluation', async t => {
+  for (const phase of ['READY', 'SEALED']) {
+    const { cwd, supervisor, id } = await ready(t);
+    if (phase === 'SEALED') ok(await supervisor.approve());
+    const taskFile = supervisor.taskFile(id), task = readJson(taskFile);
+    const legacy = contract(); legacy.happyPath = legacy.happyPath[0].claim;
+    for (const scenario of legacy.scenarios) delete scenario.covers;
+    task.contract = legacy;
+    const sealed = path.join(cwd, DEFAULT_STORE_DIR, 'state', 'tasks', id, 'sealed.json');
+    if (phase === 'READY') {
+      task.prepared.contract = legacy;
+      task.prepared.digest = digest({ contract: legacy, project: task.prepared.project, candidateDigest: task.prepared.run.candidateDigest, environment: task.prepared.run.environment });
+    } else {
+      const bundle = readJson(sealed); bundle.contract = legacy;
+      fs.chmodSync(sealed, 0o600); writeJson(sealed, bundle);
+      task.sealedDigest = digest(bundle); // Simulate a seal produced by the previous schema, not damaged bytes.
+    }
+    writeJson(taskFile, task);
+    const restored = new ExitCode(cwd, { runner: async () => assert.fail('Legacy contracts must not execute a driver') });
+    const result = phase === 'READY' ? await restored.approve() : await restored.evaluate();
+    assert.equal(result.code, 'INVALID_SPEC');
+    assert.equal(restored.status().phase, phase);
+    assert.equal(restored.status().runCount, 0);
+    assert.deepEqual(readJson(taskFile).contract, legacy);
+    if (phase === 'READY') {
+      assert.ok(!fs.existsSync(sealed));
+      ok(await supervisor.resume(id));
+      ok(await supervisor.draft(contract()));
+      ok(await supervisor.approve());
+    } else assert.equal((await restored.resume(id)).code, 'INVALID_SPEC');
+  }
 });
 
 test('pre-approval edits are preserved, invalidate review, and require explicit adoption', async t => {
@@ -59,10 +126,16 @@ test('sealed-byte and evaluator-runtime tampering never produce passing evidence
   const { cwd, supervisor, id } = await ready(t);
   ok(await supervisor.approve());
   const sealed = path.join(cwd, DEFAULT_STORE_DIR, 'state', 'tasks', id, 'sealed.json');
-  const original = fs.readFileSync(sealed, 'utf8'), modified = JSON.parse(original);
-  modified.contract.scenarios[0].assertions[0].value = 'pending\n';
-  fs.chmodSync(sealed, 0o600); fs.writeFileSync(sealed, JSON.stringify(modified));
-  assert.equal((await supervisor.evaluate()).code, 'SEALED_CHANGED');
+  const original = fs.readFileSync(sealed, 'utf8');
+  for (const change of [
+    bundle => { bundle.contract.scenarios[0].assertions[0].value = 'pending\n'; },
+    bundle => { bundle.contract.happyPath[0].claim = 'A different outcome'; },
+    bundle => { bundle.contract.scenarios[0].covers = []; },
+  ]) {
+    const modified = JSON.parse(original); change(modified);
+    fs.chmodSync(sealed, 0o600); fs.writeFileSync(sealed, JSON.stringify(modified));
+    assert.equal((await supervisor.evaluate()).code, 'SEALED_CHANGED');
+  }
   fs.writeFileSync(sealed, original);
   const environments = path.join(cwd, DEFAULT_STORE_DIR, 'state', 'environments');
   const environment = fs.readdirSync(environments)[0];
@@ -204,6 +277,7 @@ test('single format rejects legacy stores and schemas; confined snapshots reject
   const supervisor = new ExitCode(cwd); ok(await supervisor.start('Problem')); ok(await supervisor.configure({ manifest, files: { 'driver.mjs': driver } }));
   assert.equal((await supervisor.draft({ ...contract(), execution: [] })).code, 'INVALID_SPEC');
   assert.equal((await supervisor.draft({ ...contract(), version: 2 })).code, 'UNSUPPORTED_FORMAT');
+  assert.equal((await supervisor.draft({ ...contract(), happyPath: 'A prose happy path' })).code, 'INVALID_SPEC');
   assert.equal((await supervisor.configure({ manifest, files: { '../escape': 'x' } })).code, 'UNSAFE_PATH');
   fs.symlinkSync('/etc/hosts', path.join(cwd, 'outside'));
   assert.throws(() => treeDigest(cwd, { candidate: true }), error => error.code === 'UNSAFE_PATH');

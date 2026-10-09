@@ -170,9 +170,45 @@ Choose the execution boundary explicitly in the manifest. ExitCode never silentl
 
 ## Scenarios and observations
 
-`exitcode_contract` accepts `version: 1`, `problem`, `happyPath`, `constraints`, and `scenarios`. It does not accept an implementation plan, worker graph, validation sequence, controls, or source patches.
+`exitcode_contract` accepts `version: 1`, `problem`, `happyPath`, `constraints`, and `scenarios`.
+It does not accept an implementation plan, worker graph, validation sequence, controls, or source patches.
 
-Each scenario declares its initial-state input, action instructions, expected baseline, number of trials, watchdog, and assertions. `baseline: "FAIL"` reproduces a defect or missing behavior. `baseline: "PASS"` protects existing behavior. All scheduled trials must match that baseline during preparation. Each scenario also receives an empty target; a passing empty target rejects the observer. Neither preparation PASS nor a passing baseline completes the task.
+`happyPath` contains 1 to 8 observable claims shaped as `{ "id": "H1", "claim": "A user-visible outcome" }`.
+Each claim needs a unique identifier of 1 to 64 letters, digits, underscores, or hyphens.
+Split only independently observable user outcomes, not implementation steps.
+Each scenario must declare `covers`, an array of claim IDs.
+Every claim must be covered by at least one scenario.
+Every referenced ID must identify a declared claim.
+One scenario can cover several claims, and several scenarios can cover the same claim.
+A guardrail-only scenario can use `covers: []`.
+Coverage does not depend on the scenario's baseline.
+
+For example, this password-reset acceptance fragment maps three claims to two scenarios:
+
+```json
+{
+  "happyPath": [
+    { "id": "H1", "claim": "The user receives a usable reset link" },
+    { "id": "H2", "claim": "The link changes the password exactly once" },
+    { "id": "H3", "claim": "Existing sessions are invalidated" }
+  ],
+  "scenarios": [
+    { "id": "reset-flow", "covers": ["H1", "H2"] },
+    { "id": "session-revocation", "covers": ["H3"] }
+  ]
+}
+```
+
+The approval review shows each claim and each scenario's mapping.
+Validation checks the references and coverage, not whether a scenario truly observes its claims.
+The user reviews that judgment before approval.
+There is no semantic model call or criteria layer.
+New drafts must use this shape; prose `happyPath` values are rejected.
+Existing prepared or sealed contracts with the prose shape cannot be approved or evaluated.
+Resume an unsealed task to prepare new acceptance, or start a new task to supersede an old seal.
+No automatic conversion changes approved acceptance.
+
+Each scenario also declares its initial-state input, action instructions, expected baseline, number of trials, watchdog, and assertions. `baseline: "FAIL"` reproduces a defect or missing behavior. `baseline: "PASS"` protects existing behavior. All scheduled trials must match that baseline during preparation. Each scenario also receives an empty target; a passing empty target rejects the observer. Neither preparation PASS nor a passing baseline completes the task.
 
 Assertions use JSON pointers into observations:
 
@@ -228,4 +264,4 @@ npm test
 npm run check
 ```
 
-The tests execute real local drivers and the Pi adapter against a host fixture. They cover default and nested stores, path safety, candidate drift, configuration trust and precedence, reload retention, and optional native UX. The SDK observer test uses an explicitly labeled SDK fixture, not a live provider. Live Pi/provider behavior and the twenty-minute latency target require a separately configured integration run. A successful local test suite is not evidence of that latency claim.
+The tests execute real local drivers and the Pi adapter against a host fixture. They cover happy-path claim validation and review mappings, default and nested stores, path safety, candidate drift, configuration trust and precedence, reload retention, and optional native UX. The SDK observer test uses an explicitly labeled SDK fixture, not a live provider. Live Pi/provider behavior and the twenty-minute latency target require a separately configured integration run. A successful local test suite is not evidence of that latency claim.

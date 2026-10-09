@@ -18,7 +18,7 @@ export async function harness(t, { user, project, trusted = true, mode = 'tui' }
   if (user !== undefined) settings('user', user);
   if (project !== undefined) settings('project', project);
   const sdk = dataUrl(`export const getAgentDir = () => ${JSON.stringify(agentDir)};`);
-  const schema = dataUrl('export const Type = new Proxy({}, { get: () => () => ({}) });');
+  const schema = dataUrl('export const Type = new Proxy({}, { get: (_target, name) => (...args) => ({ name, args }) });');
   const source = stripTypeScriptTypes(fs.readFileSync(new URL('../exitcode.ts', import.meta.url), 'utf8'))
     .replace(/(from\s+["'])([^"']+)(["'])/g, (_all, before, name, after) => {
       const target = name === '@earendil-works/pi-coding-agent' ? sdk : name === 'typebox' ? schema

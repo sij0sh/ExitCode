@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as core from '../exitcode-core.mjs';
+import { MAX_HAPPY_PATH_CLAIMS } from '../exitcode-spec.mjs';
 import { manifest, driver, contract } from './helpers.mjs';
 import { harness } from './adapter-helpers.mjs';
 
@@ -25,15 +26,37 @@ test('factory is inert, tool exposure follows mode, and native tools and project
   h.events.get('before_agent_start')(event, h.ctx);
   assert.equal(event.systemPromptOptions.sections.project, 'AGENTS.md instructions');
   assert.match(event.systemPromptOptions.sections.exitcode, /Problem: The feature is pending/);
+  assert.match(event.systemPromptOptions.sections.exitcode, /Split only independently observable user outcomes, not implementation steps/);
+  assert.match(event.systemPromptOptions.sections.exitcode, /Map every claim to at least one scenario using covers/);
   await h.command('exit');
   assert.deepEqual(h.active(), ['read', 'write', 'bash', 'other']);
   h.events.get('before_agent_start')(event, h.ctx);
   assert.equal(event.systemPromptOptions.sections.exitcode, undefined);
 });
 
+test('contract tool declares bounded claim records and required scenario coverage', async t => {
+  const h = await harness(t), tool = h.tools.get('exitcode_contract');
+  // The TypeBox fixture records constructor calls without replacing local validation.
+  const fields = tool.parameters.args[0], happyPath = fields.happyPath;
+  assert.equal(happyPath.name, 'Array');
+  assert.deepEqual(happyPath.args[1], { minItems: 1, maxItems: MAX_HAPPY_PATH_CLAIMS });
+  assert.equal(happyPath.args[0].name, 'Object');
+  assert.deepEqual(Object.keys(happyPath.args[0].args[0]), ['id', 'claim']);
+  assert.ok(Object.values(happyPath.args[0].args[0]).every(field => field.name === 'String'));
+  assert.deepEqual(happyPath.args[0].args[1], { additionalProperties: false });
+  const covers = fields.scenarios.args[0].args[0].covers;
+  assert.equal(covers.name, 'Array');
+  assert.equal(covers.args[0].name, 'String');
+  assert.deepEqual(covers.args[1], { maxItems: MAX_HAPPY_PATH_CLAIMS });
+  assert.match(tool.description, /Split only independently observable user outcomes, not implementation steps/);
+  assert.match(tool.description, /One scenario may cover several claims/);
+});
+
 test('review waits, user command approves, failed observations reach the agent, and only fresh PASS exits', async t => {
   const h = await prepared(t);
-  assert.match(h.prepared.content[0].text, /Happy path/);
+  assert.match(h.prepared.content[0].text, /Happy path claims:\n  H1: The feature file contains done/);
+  assert.match(h.prepared.content[0].text, /Scenario feature:[^\n]*\nCovers: H1\n/);
+  assert.match(h.prepared.content[0].text, /Review whether each scenario observes the claims it covers/);
   assert.match(h.prepared.content[0].text, /No passing implementation witness/);
   assert.equal(await h.events.get('agent_before_settle')({}, h.ctx), undefined);
   assert.equal((await h.call('exitcode_evaluate')).details.code, 'NOT_SEALED');

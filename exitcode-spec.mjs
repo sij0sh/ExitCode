@@ -1,6 +1,7 @@
 import { fail, relative, stable } from './exitcode-files.mjs';
 
 export const OPS = ['eq', 'lte', 'gte', 'contains', 'present'];
+export const MAX_HAPPY_PATH_CLAIMS = 8;
 const record = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const text = (value, label, max = 8192) => {
   if (typeof value !== 'string' || !value.trim() || value.length > max) fail('INVALID_SPEC', `${label} must be nonempty text, at most ${max} characters`);
@@ -49,15 +50,29 @@ export function validateContract(contract) {
   keys(contract, ['version', 'problem', 'happyPath', 'constraints', 'scenarios'], 'contract');
   if (Buffer.byteLength(stable(contract)) > 64 * 1024) fail('INVALID_SPEC', 'Contract exceeds 64 KiB; keep fixtures in the reusable project driver');
   if (contract.version !== 1) fail('UNSUPPORTED_FORMAT', 'Only contract version 1 is supported');
-  text(contract.problem, 'problem'); text(contract.happyPath, 'happyPath');
+  text(contract.problem, 'problem');
+  if (!Array.isArray(contract.happyPath) || !contract.happyPath.length || contract.happyPath.length > MAX_HAPPY_PATH_CLAIMS) fail('INVALID_SPEC', `Provide 1 to ${MAX_HAPPY_PATH_CLAIMS} happy-path claims`);
+  const claims = new Set(), covered = new Set();
+  for (const claim of contract.happyPath) {
+    keys(claim, ['id', 'claim'], 'happy-path claim');
+    id(claim.id, 'happy-path claim id'); text(claim.claim, 'happy-path claim');
+    if (claims.has(claim.id)) fail('INVALID_SPEC', `Duplicate happy-path claim ${claim.id}`);
+    claims.add(claim.id);
+  }
   if (!Array.isArray(contract.constraints) || contract.constraints.length > 16 || contract.constraints.some(c => typeof c !== 'string' || !c.trim() || c.length > 2048)) fail('INVALID_SPEC', 'constraints must be at most 16 nonempty strings');
   if (!Array.isArray(contract.scenarios) || !contract.scenarios.length || contract.scenarios.length > 16) fail('INVALID_SPEC', 'Provide 1 to 16 scenarios');
   const seen = new Set();
   for (const scenario of contract.scenarios) {
-    keys(scenario, ['id', 'description', 'instructions', 'input', 'baseline', 'trials', 'timeoutSeconds', 'assertions'], 'scenario');
+    keys(scenario, ['id', 'covers', 'description', 'instructions', 'input', 'baseline', 'trials', 'timeoutSeconds', 'assertions'], 'scenario');
     id(scenario.id, 'scenario id');
     if (seen.has(scenario.id)) fail('INVALID_SPEC', `Duplicate scenario ${scenario.id}`);
     seen.add(scenario.id);
+    if (!Array.isArray(scenario.covers) || scenario.covers.length > MAX_HAPPY_PATH_CLAIMS) fail('INVALID_SPEC', `Scenario ${scenario.id}: covers must be an array of at most ${MAX_HAPPY_PATH_CLAIMS} claim IDs`);
+    for (const claimId of scenario.covers) {
+      id(claimId, `Scenario ${scenario.id} covers`);
+      if (!claims.has(claimId)) fail('INVALID_SPEC', `Scenario ${scenario.id}: unknown happy-path claim ${claimId}`);
+      covered.add(claimId);
+    }
     text(scenario.description, 'scenario description'); text(scenario.instructions, 'scenario instructions'); json(scenario.input, 'scenario input');
     if (!['FAIL', 'PASS'].includes(scenario.baseline)) fail('INVALID_SPEC', 'baseline must declare FAIL for reproduction or PASS for an existing guardrail');
     if (!Number.isInteger(scenario.trials) || scenario.trials < 1 || scenario.trials > 20) fail('INVALID_SPEC', 'trials must be between 1 and 20; every scheduled trial must pass');
@@ -74,6 +89,7 @@ export function validateContract(contract) {
       if (assertion.op === 'contains' && (typeof assertion.value !== 'string' || !assertion.value)) fail('INVALID_SPEC', 'contains requires a nonempty string');
     }
   }
+  for (const claimId of claims) if (!covered.has(claimId)) fail('INVALID_SPEC', `Happy-path claim ${claimId} is not covered by any scenario`);
   return structuredClone(contract);
 }
 

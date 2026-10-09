@@ -4,12 +4,12 @@ import * as os from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import { FORMAT, DEFAULT_STORE_DIR, fail, digest, sha, stable, confined, readJson, writeJson, inventory, treeDigest, copyTree, writeFiles, ensureStore, locked, resolveProgram } from './exitcode-files.mjs';
-import { validateProject, validateContract, compare } from './exitcode-spec.mjs';
+import { validateProject, validateContract, compare, MAX_HAPPY_PATH_CLAIMS } from './exitcode-spec.mjs';
 import { invoke } from './exitcode-runner.mjs';
 
 export const TOOL_NAMES = ['exitcode_project', 'exitcode_contract', 'exitcode_evaluate', 'exitcode_note'];
 export const MODE_ENTRY = 'exitcode-scenarios';
-export const PROTOCOL = 'EXITCODE. Describe the current problem and observable happy path. Before approval, investigate and build the smallest reusable project driver; do not change product files. Submit scenarios and observations, with no implementation plan or solution witness. Once the user approves, follow project instructions and choose your own implementation approach. Use focused checks while developing, delegate independent work only when worthwhile, and record useful discoveries or regressions in a short note. Evaluate a plausible candidate against the sealed scenarios. Only fresh PASS completes the task. Ask for missing external input in conversation; approval, infrastructure errors, and agent reports alone are not completion.';
+export const PROTOCOL = `EXITCODE. Describe the current problem and 1 to ${MAX_HAPPY_PATH_CLAIMS} observable happy-path claims. Split only independently observable user outcomes, not implementation steps. Map every claim to at least one scenario using covers; reference only declared claim IDs. Before approval, investigate and build the smallest reusable project driver; do not change product files. Submit scenarios and observations, with no implementation plan or solution witness. Once the user approves, follow project instructions and choose your own implementation approach. Use focused checks while developing, delegate independent work only when worthwhile, and record useful discoveries or regressions in a short note. Evaluate a plausible candidate against the sealed scenarios. Only fresh PASS completes the task. Ask for missing external input in conversation; approval, infrastructure errors, and agent reports alone are not completion.`;
 
 const timestamp = () => new Date().toISOString();
 const errorResult = error => ({ ok: false, status: 'ERROR', code: error.code ?? 'IO_ERROR', message: error.message, ...(error.runId ? { runId: error.runId } : {}) });
@@ -279,7 +279,9 @@ export class ExitCode {
     return this.operation('approve', async () => {
       const task = this.owned(); this.unsealed(task);
       if (task.phase !== 'READY' || !task.prepared) fail('NOT_READY', 'Prepare and review a contract before approval');
-      const prepared = task.prepared, environment = await this.environment(prepared.project, task);
+      const prepared = task.prepared;
+      validateContract(prepared.contract);
+      const environment = await this.environment(prepared.project, task);
       if (this.signal?.aborted) fail('CANCELLED', 'Approval operation cancelled');
       if (digest(this.project()) !== digest(prepared.project) || candidateDigest(this.cwd, this.storeDir) !== prepared.run.candidateDigest
         || environment.digest !== prepared.run.environment.digest || stable(environment.runtimeIdentity) !== stable(prepared.run.environment.runtimeIdentity)) fail('STALE_PREPARATION', 'Candidate, project, or environment changed. Prepare and review again.');
@@ -294,6 +296,7 @@ export class ExitCode {
   sealed(task) {
     const bundle = readJson(confined(this.store().state, `tasks/${task.id}/sealed.json`));
     if (bundle.format !== FORMAT || digest(bundle) !== task.sealedDigest) fail('SEALED_CHANGED', 'Sealed acceptance changed; do not edit it. Start a superseding task if acceptance is wrong.');
+    validateContract(bundle.contract);
     return bundle;
   }
   async evaluate() {
@@ -397,14 +400,16 @@ export class ExitCode {
 export function review(task) {
   const { contract, project, run } = task.prepared;
   return [
-    `Problem: ${task.problem}`, `Contract problem: ${contract.problem}`, `Happy path: ${contract.happyPath}`,
+    `Problem: ${task.problem}`, `Contract problem: ${contract.problem}`, 'Happy path claims:',
+    ...contract.happyPath.map(value => `  ${value.id}: ${value.claim}`),
     ...contract.constraints.map(value => `Constraint: ${value}`),
     `Project: ${project.manifest.name}; ${project.manifest.isolation} isolation; runner ${project.manifest.command.program} ${project.manifest.command.args.join(' ')}`,
     `Environment variables made available by name: ${project.manifest.environment.join(', ') || 'none'}`,
-    ...contract.scenarios.flatMap(s => [`Scenario ${s.id}: ${s.description}`, `Instructions: ${s.instructions}`, `Input: ${stable(s.input)}`,
+    ...contract.scenarios.flatMap(s => [`Scenario ${s.id}: ${s.description}`, `Covers: ${s.covers.join(', ') || 'none'}`, `Instructions: ${s.instructions}`, `Input: ${stable(s.input)}`,
       `Baseline ${s.baseline}; ${s.trials} fresh trial(s); all must pass after implementation; watchdog ${s.timeoutSeconds}s`,
       ...s.assertions.map(a => `  ${a.path} ${a.op}${a.op === 'present' ? '' : ` ${stable(a.value)}`}`)]),
     `Preparation ${run.id}: reproduced declared baselines and rejected an empty target; ${run.warmEnvironment ? 'reused' : 'built'} environment`,
+    'Coverage is declared. Review whether each scenario observes the claims it covers.',
     'No passing implementation witness was built. These finite checks do not prove complete intent coverage.',
     `Bundle: ${task.prepared.digest}`, 'Approve the acceptance conditions with /exitcode approve. Implementation approach remains adaptive.',
   ].join('\n');

@@ -1,10 +1,11 @@
 {
   "version": 1,
   "problem": "The feature file still contains pending",
-  "happyPath": "The feature file contains done",
+  "happyPath": [{ "id": "H1", "claim": "The feature file contains done" }],
   "constraints": [],
   "scenarios": [{
     "id": "feature",
+    "covers": ["H1"],
     "description": "Observe the feature in a fresh candidate copy",
     "instructions": "Read feature.txt and report its exact contents",
     "input": { "file": "feature.txt" },

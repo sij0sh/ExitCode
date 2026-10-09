@@ -1,7 +1,10 @@
 {
   "version": 1,
   "problem": "A small well specified task takes too long through the ExitCode extension",
-  "happyPath": "The task completes correctly through the extension within twenty minutes",
+  "happyPath": [
+    { "id": "H1", "claim": "The task completes correctly through the extension" },
+    { "id": "H2", "claim": "Verified completion takes at most twenty minutes from task submission" }
+  ],
   "constraints": [
     "Exercise the candidate extension with an identified Pi installation and fixed model",
     "Measure from task submission through verified completion including discovery and preparation",
@@ -10,6 +13,7 @@
   ],
   "scenarios": [{
     "id": "small-task",
+    "covers": ["H1", "H2"],
     "description": "Complete a concrete small artifact task in a fresh Pi fixture",
     "instructions": "Use Pi with the candidate ExitCode extension to solve the supplied goal. Report observed completion and independently read the resulting file. Do not modify the fixture outside the Pi session.",
     "input": {

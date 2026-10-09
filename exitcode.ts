@@ -6,11 +6,14 @@ import * as path from "node:path";
 import * as core from "./exitcode-core.mjs";
 import { DEFAULT_CONFIG, loadConfig } from "./exitcode-config.mjs";
 import { resolveStoreDir } from "./exitcode-files.mjs";
+import { MAX_HAPPY_PATH_CLAIMS } from "./exitcode-spec.mjs";
 
 const Namespace = { name: "exitcode", description: "Reusable project validation and sealed scenario acceptance" };
 const Assertion = Type.Object({ path: Type.String(), op: Type.Union(["eq", "lte", "gte", "contains", "present"].map(value => Type.Literal(value))), value: Type.Optional(Type.Unknown()) }, { additionalProperties: false });
+const HappyPathClaim = Type.Object({ id: Type.String(), claim: Type.String() }, { additionalProperties: false });
 const Scenario = Type.Object({
-  id: Type.String(), description: Type.String(), instructions: Type.String(), input: Type.Unknown(),
+  id: Type.String(), covers: Type.Array(Type.String(), { maxItems: MAX_HAPPY_PATH_CLAIMS }),
+  description: Type.String(), instructions: Type.String(), input: Type.Unknown(),
   baseline: Type.Union([Type.Literal("FAIL"), Type.Literal("PASS")]), trials: Type.Integer({ minimum: 1, maximum: 20 }),
   timeoutSeconds: Type.Number({ exclusiveMinimum: 0, maximum: 86400 }), assertions: Type.Array(Assertion, { minItems: 1, maxItems: 32 }),
 }, { additionalProperties: false });
@@ -102,8 +105,8 @@ export default function (pi: ExtensionAPI) {
     },
     {
       name: "exitcode_contract", label: "ExitCode contract",
-      description: "Define the current problem, happy path, constraints, and scenario observations. Do not prescribe implementation or construct a passing solution witness. Baseline FAIL reproduces the issue; baseline PASS protects existing behavior. Every requested trial must pass after sealing. This prepares actual baseline and empty-target evidence and presents the exact acceptance for user approval.",
-      parameters: Type.Object({ version: Type.Literal(1), problem: Type.String(), happyPath: Type.String(), constraints: Type.Array(Type.String()),
+      description: `Define the current problem, 1 to ${MAX_HAPPY_PATH_CLAIMS} happy-path claims, constraints, and scenario observations. Split only independently observable user outcomes, not implementation steps. Give each claim a unique id and map it to at least one scenario using covers; reference only declared claim IDs. One scenario may cover several claims. Guardrail-only scenarios may use covers: []. Do not prescribe implementation or construct a passing solution witness. Baseline FAIL reproduces the issue; baseline PASS protects existing behavior. Every requested trial must pass after sealing. This prepares actual baseline and empty-target evidence and presents the exact acceptance for user approval.`,
+      parameters: Type.Object({ version: Type.Literal(1), problem: Type.String(), happyPath: Type.Array(HappyPathClaim, { minItems: 1, maxItems: MAX_HAPPY_PATH_CLAIMS }), constraints: Type.Array(Type.String()),
         scenarios: Type.Array(Scenario, { minItems: 1, maxItems: 16 }) }, { additionalProperties: false }),
       execute: async (_id: string, params: any, signal: AbortSignal, update: any, ctx: ExtensionContext) => execute(ctx, signal, update, supervisor => supervisor.draft(params)),
     },
