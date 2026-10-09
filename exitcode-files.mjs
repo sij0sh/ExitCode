@@ -4,12 +4,30 @@ import { createHash, randomUUID } from 'node:crypto';
 
 export const FORMAT = 'exitcode-scenarios-1';
 export const DEFAULT_STORE_DIR = '.agents/.exitcode';
+// Evaluator trees stay bounded; product snapshots honor only explicit budgets.
 export const MAX_TREE_BYTES = 512 * 1024 * 1024;
+const defaultMaxBytes = candidate => candidate ? Infinity : MAX_TREE_BYTES;
+const HASH_CHUNK_BYTES = 1024 * 1024;
 export const fail = (code, message) => { throw Object.assign(new Error(message), { code }); };
 export const sha = value => createHash('sha256').update(value).digest('hex');
 export const stable = value => JSON.stringify(value, (_key, item) => item && !Array.isArray(item) && typeof item === 'object'
   ? Object.fromEntries(Object.keys(item).sort().map(key => [key, item[key]])) : item);
 export const digest = value => sha(stable(value));
+
+function hashFile(file, buffer, signal) {
+  if (signal?.aborted) fail('CANCELLED', 'Operation cancelled');
+  const descriptor = fs.openSync(file, 'r'), hash = createHash('sha256');
+  try {
+    while (true) {
+      if (signal?.aborted) fail('CANCELLED', 'Operation cancelled');
+      const bytes = fs.readSync(descriptor, buffer, 0, buffer.length, null);
+      if (!bytes) return hash.digest('hex');
+      hash.update(buffer.subarray(0, bytes));
+    }
+  } finally { fs.closeSync(descriptor); }
+}
+
+export const fileSha = (file, { signal } = {}) => hashFile(file, Buffer.allocUnsafe(HASH_CHUNK_BYTES), signal);
 
 export function resolveProgram(program) {
   const requested = program === 'node' ? process.execPath : program;
@@ -64,7 +82,7 @@ export function writeJson(file, value) {
 }
 
 // No Git index, ignore rules, or live-file aliases. Modes and link targets participate.
-export function inventory(root, { candidate = false, storeDir = DEFAULT_STORE_DIR, signal, maxBytes = MAX_TREE_BYTES } = {}) {
+export function inventory(root, { candidate = false, storeDir = DEFAULT_STORE_DIR, signal, maxBytes = defaultMaxBytes(candidate) } = {}) {
   if (candidate) resolveStoreDir(root, storeDir);
   const excluded = candidate ? ['.git', storeDir] : [];
   const excludes = name => excluded.some(directory => name === directory || name.startsWith(directory + '/'));
@@ -84,27 +102,31 @@ export function inventory(root, { candidate = false, storeDir = DEFAULT_STORE_DI
       } else if (stat.isFile()) {
         bytes += stat.size;
         if (bytes > maxBytes) fail('TREE_TOO_LARGE', `Snapshot exceeds ${maxBytes} bytes; use a focused project workspace`);
-        entries.push({ path: rel, kind: 'file', mode: stat.mode & 0o777, bytes: stat.size, sha: sha(fs.readFileSync(full)) });
+        entries.push({ path: rel, kind: 'file', mode: stat.mode & 0o777, bytes: stat.size });
       } else fail('UNSAFE_PATH', `Unsupported filesystem object: ${rel}`);
     }
   };
   walk(root);
+  // Reject explicit budgets before reading content; reuse one buffer for the tree.
+  const buffer = Buffer.allocUnsafe(HASH_CHUNK_BYTES);
+  for (const entry of entries) if (entry.kind === 'file') entry.sha = hashFile(path.join(root, entry.path), buffer, signal);
   return entries;
 }
 
 export const treeDigest = (root, options) => digest(inventory(root, options));
 
-export function copyTree(source, destination, options) {
-  const before = inventory(source, options);
+export function copyTree(source, destination, { candidate = false, storeDir = DEFAULT_STORE_DIR, signal, maxBytes = defaultMaxBytes(candidate) } = {}) {
+  const options = { candidate, storeDir, signal, maxBytes }, before = inventory(source, options);
   fs.mkdirSync(destination, { recursive: true });
   for (const entry of before) {
+    if (signal?.aborted) fail('CANCELLED', 'Operation cancelled');
     const target = path.join(destination, entry.path);
     if (entry.kind === 'directory') fs.mkdirSync(target, { recursive: true });
     else if (entry.kind === 'link') fs.symlinkSync(entry.target, target);
-    else { fs.copyFileSync(path.join(source, entry.path), target); fs.chmodSync(target, entry.mode); }
+    else { fs.copyFileSync(path.join(source, entry.path), target, fs.constants.COPYFILE_FICLONE); fs.chmodSync(target, entry.mode); }
   }
   for (const entry of [...before].reverse()) if (entry.kind === 'directory') fs.chmodSync(path.join(destination, entry.path), entry.mode);
-  if (digest(inventory(source, options)) !== digest(before) || treeDigest(destination, { signal: options?.signal }) !== digest(before))
+  if (digest(inventory(source, options)) !== digest(before) || treeDigest(destination, { signal, maxBytes }) !== digest(before))
     fail('CANDIDATE_CHANGED', 'Files changed while capturing the candidate');
   return digest(before);
 }

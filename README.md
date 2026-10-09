@@ -91,6 +91,13 @@ Review the actual observations before approving.
 Drivers run as trusted host processes or in explicitly selected offline Linux bubblewrap isolation.
 Native Pi tools retain their normal permissions.
 
+Product snapshots have no default byte limit.
+Ignored files, including build artifacts, remain validation inputs.
+Only Git metadata and the selected ExitCode store are excluded.
+ExitCode hashes full content in fixed-size chunks.
+Copies use independent copy-on-write files where supported, with ordinary copying as the fallback.
+Large workspaces still require time and storage for disposable inputs.
+
 ## Configuration
 
 ```json

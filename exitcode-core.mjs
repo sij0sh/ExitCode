@@ -3,7 +3,7 @@ import * as path from 'node:path';
 import * as os from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
-import { FORMAT, DEFAULT_STORE_DIR, fail, digest, sha, stable, confined, readJson, writeJson, inventory, treeDigest, copyTree, writeFiles, ensureStore, locked, resolveProgram } from './exitcode-files.mjs';
+import { FORMAT, DEFAULT_STORE_DIR, fail, digest, sha, fileSha, stable, confined, readJson, writeJson, inventory, treeDigest, copyTree, writeFiles, ensureStore, locked, resolveProgram } from './exitcode-files.mjs';
 import { validateProject, validateContract, compare, MAX_HAPPY_PATH_CLAIMS } from './exitcode-spec.mjs';
 import { invoke } from './exitcode-runner.mjs';
 
@@ -18,10 +18,10 @@ const short = (text, max = 240) => typeof text === 'string' ? text.slice(0, max)
 
 function runtimeIdentity(manifest) {
   const file = resolveProgram(manifest.command.program);
-  const result = { platform: process.platform, arch: process.arch, release: os.release(), program: fs.realpathSync(file), sha: sha(fs.readFileSync(file)) };
+  const result = { platform: process.platform, arch: process.arch, release: os.release(), program: fs.realpathSync(file), sha: fileSha(file) };
   if (manifest.isolation === 'bubblewrap') {
     if (!fs.existsSync('/usr/bin/bwrap')) fail('ISOLATION_UNAVAILABLE', 'bubblewrap is unavailable; no fallback is permitted');
-    result.bubblewrap = sha(fs.readFileSync('/usr/bin/bwrap'));
+    result.bubblewrap = fileSha('/usr/bin/bwrap');
   }
   return result;
 }
