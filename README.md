@@ -2,7 +2,7 @@
 
 ExitCode keeps long-running coding agents tied to a fixed definition of done.
 It validates acceptance checks before asking you to approve the plan.
-It then enforces that exact plan through fresh evaluation, bounded repair, and focused recursion.
+It then enforces that exact plan through fresh evaluation, bounded repair, isolated parallel workers, and focused recursion.
 
 ## Workflow
 
@@ -47,6 +47,7 @@ For persistent loading, run `pi install .` in this repository.
 Pi supplies `typebox` and its extension API.
 No production npm dependency is added.
 A compatible Pi installation and Node runtime are required.
+Parallel execution also requires Git with `merge-tree --write-tree --merge-base` support.
 
 **Executable evaluation requires Linux bubblewrap and usable unprivileged namespaces.**
 Install bubblewrap with your system package manager before using executable recipes.
@@ -139,6 +140,35 @@ Git metadata and supervisor directories are excluded.
 These checks are not an operating-system boundary against compromised trusted host tools.
 
 ## Recipes and discovery
+
+### Parallel execution
+
+A root contract can declare `execution` as a proof DAG. Every behavior criterion belongs to exactly one slice; `after` names prerequisite behavior criteria. Array order has no scheduling meaning. ExitCode rejects unknown references, duplicate ownership, self dependencies, and cycles before approval.
+
+```json
+{
+  "execution": [
+    { "id": "S1", "objective": "Implement token issuance", "verify": ["C1"], "after": [] },
+    { "id": "S2", "objective": "Implement request UI", "verify": ["C2"], "after": [] },
+    { "id": "S3", "objective": "Connect confirmation", "verify": ["C3"], "after": ["C1", "C2"] }
+  ],
+  "policy": { "maxParallelWorkers": 2 }
+}
+```
+
+After sealing, `exitcode_evaluate` runs the graph autonomously. One supervisor launches independent Pi SDK sessions in private Git repositories with separate metadata and object files. The default concurrency limit is two; deadline and implementation attempts remain shared across all workers and reconciliation. Workers use the selected model and native coding tools, with no ExitCode tools or recursive children. Repository bytes provide context; workers do not load project extensions or execute project configuration as session resources.
+
+At seal, Git plumbing captures the exact approved candidate, including uncommitted, untracked, and ignored files that participate in candidate identity. It neither requires a clean repository nor changes the user's Git index, branches, or commits. Worker history is internal state under `.exitcode/parallel/`. Private repositories isolate Git metadata; they do not sandbox trusted worker shell tools from the host.
+
+The worker horizon contains its own criteria, all transitive prerequisites, and every regression criterion. A worker's fresh PASS records `WORKER_VERIFIED`. It becomes `INTEGRATED` only after Git reconciliation and fresh evaluation of the combined candidate. Only that integrated evidence unlocks dependent slices. Clean passing merges need no agent; textual conflicts and behavioral failures use an isolated reconciliation session with the exact candidate tips and evaluator feedback.
+
+Root completion requires every slice integrated, no outstanding workers or reconciliation, a fresh full integration PASS, reconciliation with the latest canonical workspace, and a fresh full PASS there. Concurrent canonical edits enter a three-way merge; edits detected during publication cause a resumable pause. Changed worker candidates and agent reconciliation consume shared attempts; unchanged reruns and mechanical integration do not. Recovery preserves candidate artifacts, charged attempts, and the original deadline while requiring fresh proof. `/exitcode exit` aborts and disposes worker sessions and preserves their saved work.
+
+Contracts without `execution` retain serial repair and focused recursion. Legacy `sequence` retains its cumulative ordered proof behavior and cannot be combined with `execution`.
+
+`node scripts/smoke-workers.mjs /path/to/pi-coding-agent/dist/index.js` checks the installed SDK offline using a scripted local provider, native file writing, feedback, and cancellation.
+
+### Check recipes
 
 The bounded initial recipe set is:
 

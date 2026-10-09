@@ -1,7 +1,7 @@
 {
   "name": "exitcode",
   "version": "0.1.0",
-  "description": "Contract-first recursive execution for Pi: sealed acceptance contracts, bounded repair, one smaller child at a time. Enter with /exitcode.",
+  "description": "Contract-supervised execution for Pi: sealed acceptance contracts, isolated Git workers, proof DAGs, bounded repair, and focused recursion. Enter with /exitcode.",
   "keywords": ["pi-package"],
   "license": "MIT",
   "private": true,

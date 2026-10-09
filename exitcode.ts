@@ -96,6 +96,13 @@ const SequenceSchema = Type.Array(Type.Object({
   after: Type.Optional(Type.Array(Type.String({minLength:1}), {description:"Optional prerequisite behavior criterion ids that must appear in earlier slices"})),
 }), {minItems:1, maxItems:12, description:"Optional ordered proof slices; array order is the dependency"});
 
+const ExecutionSchema = Type.Array(Type.Object({
+  id: Type.String({minLength:1,maxLength:64,description:"Unique slice id, e.g. S1"}),
+  objective: Type.String({minLength:1,maxLength:200}),
+  verify: Type.Array(Type.String({minLength:1}), {minItems:1,description:"Every behavior criterion belongs to exactly one slice"}),
+  after: Type.Optional(Type.Array(Type.String({minLength:1}), {description:"Prerequisite behavior criteria; fresh integrated PASS unlocks this slice regardless of array order"})),
+}), {minItems:1,maxItems:12,description:"Root proof DAG. Independent ready slices run concurrently in private Git repositories; cannot combine with legacy sequence"});
+
 const CriterionSchema = Type.Object({
   id: Type.Optional(Type.String({ description: "Suggested id (supervisor assigns C1..Cn when omitted)" })),
   requirement: Type.String({ description: "One independently observable outcome in plain language; split unrelated behaviors into separate criteria" }),
@@ -112,6 +119,7 @@ const PolicySchema = Type.Object({
   deadlineMinutes: Type.Optional(Type.Number({ description: "Shared execution minutes from successful root seal (default 60); preparation and human review do not start it" })),
   evalTimeoutSeconds: Type.Optional(Type.Number({ description: "Initial executable preparation watchdog (default 900); execution otherwise uses remaining global time" })),
   evaluatorAttempts: Type.Optional(Type.Number({description:"Substantive construction proposals per node (default 6); infrastructure errors do not spend them"})),
+  maxParallelWorkers: Type.Optional(Type.Integer({minimum:1,maximum:12,description:"Root-wide independent worker limit (default 2); time and implementation attempts stay shared"})),
 });
 
 const EXITCODE_NAMESPACE = {
@@ -178,7 +186,7 @@ function cascadeLines(cascade: { events?: string[]; terminal?: { root: string; s
 function reviewIo(ctx: ExtensionContext, signal?: AbortSignal, onProgress?: (progress: any) => void, expectedRootId?: string | null) {
   const usage = { available:false,input:0,output:0,cacheRead:0,cacheWrite:0,totalTokens:0,
     cost:{input:0,output:0,cacheRead:0,cacheWrite:0,total:0} };
-  return core.makeIo(ctx.cwd, { signal: signal ?? ctx.signal, reviewUsage:usage,onProgress,expectedRootId,
+  return core.makeIo(ctx.cwd, { signal: signal ?? ctx.signal, reviewUsage:usage,onProgress,expectedRootId,workerBackend:core.createPiWorkerBackend(ctx),
     review: async (input: any, options: {signal:AbortSignal}) => {
       if (!ctx.model || !ctx.modelRegistry?.streamSimple) throw new Error("selected review model unavailable");
       const encoded=JSON.stringify(input);
@@ -344,6 +352,7 @@ export default function (pi: ExtensionAPI) {
       description:
         "Submit the smallest observable acceptance contract: explicit outcomes plus one criterion per outcome. Prefer discovered existing tests; never invent an existing_test selector. " +
         "For new behavior supply contract-owned assets with a test_asset recipe and a minimal positive witness; use the project's runtime and test_suite for regression. testStaging is only for explicitly requested durable product test edits. " +
+        "For independent root slices, supply execution as a complete acyclic proof graph; dependencies name behavior criteria. " +
         "ExitCode validates it before user review; repair returned diagnostics, then present the returned plan and wait for the user's reply.",
       promptSnippet: "exitcode_draft: submit the root contract (goal + outcomes + observable criteria + checks)",
       parameters: Type.Object({
@@ -353,6 +362,7 @@ export default function (pi: ExtensionAPI) {
         criteria: Type.Array(CriterionSchema),
         assets: Type.Optional(AssetsSchema),
         sequence: Type.Optional(SequenceSchema),
+        execution: Type.Optional(ExecutionSchema),
         assumptions: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { description: "Resolved product assumptions to show in user review" })),
         exclusions: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { description: "Out-of-scope work to show in user review" })),
         revise: Type.Optional(Type.String({ description: "Existing DRAFT root id to revise (e.g. G1)" })),
@@ -376,6 +386,7 @@ export default function (pi: ExtensionAPI) {
           criteria: params.criteria,
           assets: params.assets,
           sequence: params.sequence,
+          execution: params.execution,
           specificationPaths: params.specificationPaths,
           mutableDependencies: params.mutableDependencies,
           policy: params.policy,
@@ -420,7 +431,7 @@ export default function (pi: ExtensionAPI) {
     {
       name: "exitcode_evaluate",
       label: "Exitcode Evaluate",
-      description: "Run the sealed criteria fresh. Follow failures and the returned next action; only root ALL PASS completes the goal.",
+      description: "Run the sealed criteria fresh. For an execution DAG, run ready private workers, reconcile their verified candidates, and evaluate the canonical root. Follow failures and the returned next action; only fresh canonical root ALL PASS completes the goal.",
       promptSnippet: "exitcode_evaluate: run the sealed checks fresh",
       parameters: Type.Object({
         node: Type.Optional(Type.String({ description: "Node id (defaults to the active leaf)" })),

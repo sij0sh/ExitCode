@@ -17,6 +17,8 @@ export { RECIPE_KINDS, MUTATION_KINDS } from "./exitcode-evaluator.mjs";
 import { sandboxCommand, candidateIdentity, evaluatorEnvironment, normalizeEvaluator, runRecipe, diagnostic, fileDigest, inventory, fixtureDirectory, captureEvaluatorAssets, verifyEvaluatorAssets, installEvaluatorAssets, restoreEvaluatorAssets, compatibleEnvironment, digest, safePath, isTestPath, validateEvaluatorAssetDefinitions } from "./exitcode-evaluator.mjs";
 import { prepareGate, emptyMetrics, addMetrics, copyCandidate, releasePreparation } from "./exitcode-preparation.mjs";
 import { ensureRunning, operationSignal, operationError } from "./exitcode-operation.mjs";
+import { validateExecution, createExecution, runExecution } from "./exitcode-parallel.mjs";
+export { createPiWorkerBackend } from "./exitcode-workers.mjs";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
@@ -52,6 +54,7 @@ export const DEFAULT_POLICY = Object.freeze({
   deadlineMinutes: 60,
   evalTimeoutSeconds: 900,
   evaluatorAttempts: 6,
+  maxParallelWorkers: 2,
 });
 
 /** Consecutive no-progress nudges before an explicit resumable pause. */
@@ -94,6 +97,7 @@ export const PROTOCOL_PROMPT =
   "Before implementation, submit the smallest observable acceptance contract to ExitCode; ask the user only when ambiguity materially changes success. " +
   "Keep product files unchanged until ExitCode validates the evaluator and the user approves the plan; submit contract-specific tests as assets with test_asset recipes, and follow diagnostics to repair the evaluator. " +
   "After sealing, implement toward failing criteria, evaluate after meaningful changes, and use a child only when a smaller goal helps one failing parent criterion. " +
+  "For independent root work, declare an execution DAG with slice ids, verify, and after; exitcode_evaluate runs isolated workers and reconciles their fresh proofs. " +
   "Only a fresh root PASS completes the goal; pauses, errors, and child PASS do not.";
 
 /** Upper bound on supervisor state injected into every agent turn. */
@@ -431,6 +435,7 @@ export function validateStructure(draft, opts = {}) {
     }
   }
 
+  errors.push(...validateExecution(draft));
   return { ok: errors.length === 0, errors };
 }
 
@@ -1143,6 +1148,7 @@ function budgetsOk(root, nowMs) {
  */
 export function childGates({ root, parentState, parentResult, target, goal, siblings, nowMs, environmentIdentity }) {
   const errors = [];
+  if (root?.execution) errors.push("recursive children are unavailable during root DAG execution; workers repair within their own sessions");
   if (!parentState || parentState.status !== NodeState.ACTIVE) {
     errors.push("parent must be sealed and ACTIVE before it can have a child");
   }
@@ -1574,7 +1580,8 @@ function mergePolicy(overrides, base = DEFAULT_POLICY) {
     if (!Object.hasOwn(DEFAULT_POLICY, key)) return { ok: false, error: `unknown policy key ${key}` };
     if (!Number.isFinite(value) || !(value > 0)) return { ok: false, error: `policy.${key} must be a positive finite number` };
     if(key==="evalTimeoutSeconds"&&!Number.isFinite(value*1000))return {ok:false,error:"policy.evalTimeoutSeconds exceeds supported timeout range"};
-    if (["evaluatorAttempts", "maxTotalAttempts", "maxDepth", "localRepairs"].includes(key) && !Number.isInteger(value)) return {ok:false,error:`policy.${key} must be an integer`};
+    if (["evaluatorAttempts", "maxTotalAttempts", "maxDepth", "localRepairs", "maxParallelWorkers"].includes(key) && !Number.isInteger(value)) return {ok:false,error:`policy.${key} must be an integer`};
+    if (key === "maxParallelWorkers" && value > 12) return {ok:false,error:"policy.maxParallelWorkers must be at most 12"};
     policy[key] = value;
   }
   return { ok: true, policy };
@@ -1704,6 +1711,7 @@ function createDraft(io, args) {
       criteria: withIds,
       ...(args.assets !== undefined ? {assets:args.assets} : {}),
       ...(args.sequence !== undefined ? { sequence: args.sequence } : {}),
+      ...(args.execution !== undefined ? { execution: args.execution } : {}),
       ...(args.specificationPaths !== undefined ? {specificationPaths:args.specificationPaths} : {}),
       mutableDependencies:parentBundle.contract.mutableDependencies===true,
     };
@@ -1776,6 +1784,7 @@ function createDraft(io, args) {
     criteria: withIds,
     ...(args.assets !== undefined ? {assets:args.assets} : {}),
     ...(args.sequence !== undefined ? { sequence: args.sequence } : {}),
+    ...(args.execution !== undefined ? { execution: args.execution } : {}),
     ...(args.specificationPaths !== undefined ? {specificationPaths:args.specificationPaths} : {}),
     ...(args.mutableDependencies !== undefined ? {mutableDependencies:args.mutableDependencies} : {}),
     ...(args.assumptions !== undefined ? { assumptions: args.assumptions } : {}),
@@ -1884,6 +1893,7 @@ function reviseDraft(io, index, args) {
       criteria: withIds,
       ...((args.assets !== undefined ? args.assets : previous?.assets) !== undefined ? {assets:args.assets !== undefined ? args.assets : previous.assets} : {}),
       ...(args.sequence !== undefined ? { sequence: args.sequence } : {}),
+      ...(args.execution !== undefined ? { execution: args.execution } : {}),
       ...(args.specificationPaths !== undefined ? {specificationPaths:args.specificationPaths} : {}),
       mutableDependencies:parentBundle?.contract.mutableDependencies===true,
     };
@@ -1904,7 +1914,7 @@ function reviseDraft(io, index, args) {
       criteria: withIds,
     ...((args.assets !== undefined ? args.assets : previous?.assets) !== undefined ? {assets:args.assets !== undefined ? args.assets : previous.assets} : {}),
     };
-    for (const key of ["assumptions", "exclusions", "specificationPaths", "mutableDependencies", "sequence"]) {
+    for (const key of ["assumptions", "exclusions", "specificationPaths", "mutableDependencies", "sequence", "execution"]) {
       const value = args[key] !== undefined ? args[key] : previous?.[key];
       if (value !== undefined) draft[key] = value;
     }
@@ -2022,6 +2032,10 @@ export function rootReviewText(draft, root, nowMs = Date.now(), prepared = null)
       lines.push(`   Proves: ${slice.verify.join(", ")}`);
     });
   }
+  if (draft.execution?.length) {
+    lines.push("", `Execution graph (up to ${root.policy.maxParallelWorkers ?? DEFAULT_POLICY.maxParallelWorkers} workers)`);
+    for (const slice of draft.execution) lines.push(`${slice.id}: ${slice.objective}; proves ${slice.verify.join(", ")}; after ${(slice.after ?? []).join(", ") || "none"}`);
+  }
   for (const key of ["assumptions", "exclusions"]) {
     lines.push("", key === "assumptions" ? "Assumptions" : "Exclusions");
     lines.push(...(draft[key]?.length ? draft[key].map(x=>`- ${x}`) : ["- None stated."]));
@@ -2039,7 +2053,7 @@ function intentDigestOf(draft) {
   return sha256Hex(stableStringify({goal:draft.goal,originalRequest:draft.originalRequest,
     outcomes:(draft.outcomes ?? []).map(o=>({id:o.id,requirement:o.requirement})),
     criteria:draft.criteria.map(c=>({id:c.id,outcome:c.outcome,requirement:c.requirement,type:c.type??'behavior'})),
-    sequence:draft.sequence,assumptions:draft.assumptions,exclusions:draft.exclusions}));
+    sequence:draft.sequence,execution:draft.execution,assumptions:draft.assumptions,exclusions:draft.exclusions}));
 }
 function evaluatorDigestOf(draft) { return sha256Hex(stableStringify({criteria:draft.criteria.map(c=>({id:c.id,check:c.check,controls:c.controls})),assets:draft.assets ?? {}})); }
 function preparationMatches(io,node) {
@@ -2211,6 +2225,7 @@ async function sealPrepared(io, nodeId, { userApproval } = {}) {
     sealedAt:new Date(io.nowMs()).toISOString(),baseline:prepared.baseline,intentDigest:prepared.intentDigest,evaluatorDigest:prepared.evaluatorDigest,
     validation:prepared.stages,assets:prepared.assets,assetsDirectory:directory};
   bundle.integrityDigest=sha256Hex(stableStringify({contractDigest:bundle.digest,assets:bundle.assets,env:bundle.env,candidateDigest:bundle.candidateDigest}));
+  if (bundle.contract.execution && !node.parentId) root.execution = await createExecution(io, root, bundle);
   ensureBudget(io,root);
   root.policyLocked=true;
   writeJsonAtomic(sealedFile(io.cwd,nodeId),bundle);
@@ -2301,11 +2316,56 @@ export async function evaluateNode(io, nodeId = null) {
     const index=loadIndex(io.cwd),root=index.activeRootId?loadRoot(io,index.activeRootId):null;
     if(!root || root.status!==NodeState.ACTIVE)return {ok:false,errors:["no ACTIVE root; resume any infrastructure pause first"]};
     const owned=operationIo(io,root);
-    try {return await evaluateActive(owned.io,nodeId);}
+    try {
+      if (root.execution) {
+        if (nodeId && nodeId !== root.id) return {ok:false,errors:["execution DAG workers are supervised at the root"]};
+        return await evaluateExecution(owned.io, root, index);
+      }
+      return await evaluateActive(owned.io,nodeId);
+    }
     catch(e) {
       const current=loadRoot(io,root.id);
       return pauseRoot(io,current,{code:e.code??"IO_ERROR",reason:e.message,nodeId:nodeId??leafOf(current),operation:"evaluate"});
     } finally {owned.dispose();}
+  });
+}
+
+async function evaluateExecution(io, root, index) {
+  const bundle = loadBundle(io, root.id), node = loadNodeState(io, root.id);
+  const verified = verifyBundle(bundle, node);
+  if (!verified.ok) throw operationError("EVALUATOR_DRIFT", verified.reason);
+  return runExecution(io, root, bundle, {
+    persist: () => saveRoot(io, root),
+    evaluate: async (cwd, ids) => {
+      const candidateIo = {...io, cwd};
+      const result = await freshEvaluate(candidateIo, bundle, digestTree(cwd, candidateIo), root.deadlineAt - io.nowMs(), ids);
+      requireConclusive(result); ensureBudget(io, root);
+      return result;
+    },
+    apply: async (cwd, expected) => {
+      const snapshot = path.join(storePaths(io.cwd).tmpDir, `integration-${randomUUID()}`);
+      try {
+        const snap = snapshotTree(cwd, snapshot, io);
+        if (!snap.ok) throw operationError(snap.errorCode, snap.reason);
+        if (digestTree(io.cwd) !== expected) throw operationError("CANDIDATE_MUTATED", "canonical workspace changed before integration");
+        restoreTree(io.cwd, snapshot, snap.manifest, io);
+        if (digestTree(io.cwd) !== digestTree(cwd)) throw operationError("CANDIDATE_MUTATED", "canonical tree differs after integration");
+      } finally {fs.rmSync(snapshot, {recursive:true, force:true});}
+    },
+    complete: async () => {
+      if (root.execution.reconciliation || root.execution.slices.some(s => s.status !== "INTEGRATED")) throw operationError("INTEGRATION_INVALID", "outstanding candidates prevent root completion");
+      const result = await freshEvaluate(io, bundle, digestTree(io.cwd), root.deadlineAt - io.nowMs());
+      requireIdentity(io, root, result);
+      node.lastResult = result; node.lastCandidateDigest = result.candidateDigest;
+      node.lastEnvironmentIdentity = result.environmentIdentity;
+      const snap = takeCheckpoint(io, node, "eval");
+      if (!snap.ok) throw operationError("CHECKPOINT_UNAVAILABLE", snap.warning);
+      requireIdentity(io, root, result);
+      saveNodeState(io, node); saveRoot(io, root);
+      if (!result.allPass) throw operationError("INTEGRATION_INVALID", "canonical workspace failed fresh root evaluation");
+      const cascade = await closePassCascade(io, index, root, root.id, {[root.id]:result});
+      return {ok:true,node:root.id,status:loadNodeState(io,root.id).status,vector:formatVector(result.outcomes),cascade};
+    },
   });
 }
 
@@ -2620,6 +2680,7 @@ export function nextAction(root, node, draft = null, nowMs = Date.now()) {
     return `seal ${node.id} with exitcode_seal`;
   }
   if (node.status !== NodeState.ACTIVE) return `${node.id} is ${node.status}`;
+  if (root.execution) return `exitcode_evaluate ${root.id}: run ready DAG workers, integrate fresh proofs, and reverify the canonical workspace (attempts ${root.consumedAttempts}/${root.attemptLimit ?? root.policy.maxTotalAttempts})`;
   const failing = (node.lastResult?.outcomes ?? []).filter((o) => o.status === "FAIL").map((o) => o.criterionId);
   const pending = (node.lastResult?.outcomes ?? []).filter((o) => o.status === "PENDING").map((o) => o.criterionId);
   const repairs = root.policy.localRepairs ?? DEFAULT_POLICY.localRepairs;
@@ -2662,6 +2723,7 @@ export function statusSnapshot(io) {
     root: root.id,
     status: root.status,
     stack: root.stack,
+    execution: root.execution ? { phase: root.execution.phase, slices: root.execution.slices.map(s => ({id:s.id,status:s.status})), reconciliation: root.execution.reconciliation?.id ?? null } : null,
     nodes,
     staging,
     consumedAttempts: root.consumedAttempts,
@@ -2699,6 +2761,8 @@ function leafContract(io, snap) {
 }
 
 function sliceLines(io, snap) {
+  if (snap.execution) return [`execution: ${snap.execution.phase}`, `slices: ${snap.execution.slices.map(s => `${s.id}=${s.status}`).join(" ")}`,
+    ...(snap.execution.reconciliation ? ["reconciliation: outstanding"] : [])];
   const leafId = snap.stack.at(-1);
   if (!leafId) return [];
   const node = loadNodeState(io, leafId);

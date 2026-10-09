@@ -28,7 +28,8 @@ const criteria = [
 ];
 const broken = () => { const c = structuredClone(criteria); c[0].controls.reject[0] = writes("feature.txt", "done\n"); return c; };
 
-function harness(t, content = "todo\n", initialTools = ["read", "write", "bash"]) {
+function harness(t, content = "todo\n", initialTools = ["read", "write", "bash"], coreApi = core) {
+  const install = new Function("Type", "core", source)(Type, coreApi);
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "exitcode-adapter-test-"));
   t.after(() => fs.rmSync(cwd, { recursive: true, force: true }));
   fs.writeFileSync(path.join(cwd, "feature.txt"), content);
@@ -112,6 +113,24 @@ test("adapter: mode exposes ExitCode tools without ever changing the user's load
   await h.command("exit");
   assert.deepEqual(h.getActiveTools(), ["bash", "write", "codemode", "custom_tool"]);
   assert.equal(h.tools.get("exitcode_draft").exposure, "hidden");
+});
+
+test('adapter: an approved execution DAG runs SDK workers through evaluation and exits only after canonical root PASS', async t => {
+  const launches=[];
+  const workers={async start(spec){launches.push(spec);return spec;},async send(spec){fs.writeFileSync(path.join(spec.cwd,'feature.txt'),'done\n');},async cancel(){},async dispose(){}};
+  const h=harness(t,'todo\n',['read','write','bash'],{...core,createPiWorkerBackend:()=>workers});
+  const plan=await draft(h,{execution:[{id:'S1',objective:'Finish the feature',verify:['C1']} ]});
+  assert.equal(plan.details.ok,true);
+  assert.match(plan.content[0].text,/Execution graph/);
+  await h.command('approve');
+  assert.equal(core.resolveModeFromBranch(h.entries).on,true);
+  assert.match(promptText(h),/S1=PENDING/);
+  const result=await h.tool('exitcode_evaluate',{});
+  assert.equal(result.details.status,'PASS',JSON.stringify(result.details));
+  assert.equal(launches.length,1); assert.notEqual(launches[0].cwd,h.cwd);
+  assert.equal(feature(h),'done\n');
+  assert.equal(core.resolveModeFromBranch(h.entries).on,false);
+  assert.deepEqual(h.getActiveTools(),h.loadout);
 });
 
 test("adapter: each turn receives the short protocol and bounded status, never evaluator evidence", async (t) => {
