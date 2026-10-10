@@ -29,10 +29,11 @@ function patch(t, method, replace) {
   return restore;
 }
 function noWork(directory) {
-  for (const name of ['candidate', 'project', 'home']) assert.ok(!fs.existsSync(path.join(directory, name)), name);
+  for (const name of ['candidate', 'project', 'home', 'work', 'runtime']) assert.ok(!fs.existsSync(path.join(directory, name)), name);
 }
 function noPreparing(cwd) {
   const root = path.join(cwd, DEFAULT_STORE_DIR, 'state', 'environments');
+  if (!fs.existsSync(root)) return;
   for (const environment of fs.readdirSync(root)) {
     assert.ok(!fs.readdirSync(path.join(root, environment)).some(name => name.startsWith('preparing-')));
   }
@@ -54,7 +55,9 @@ test('oversized prepared runtime retains accurate ERROR evidence, its ID and tre
   assert.equal(evidence.stage, 'runtime-capture');
   assert.deepEqual(evidence.diagnostics.tree, { kind: 'prepared runtime', directory: result.diagnostics.tree.directory,
     path: 'large.bin', observedBytes: MAX_TREE_BYTES + 1, maxBytes: MAX_TREE_BYTES });
-  assert.match(evidence.diagnostics.tree.directory, /environments\/.*\/preparing-/);
+  assert.equal(path.basename(evidence.diagnostics.tree.directory), 'runtime');
+  assert.ok(!evidence.diagnostics.tree.directory.startsWith(cwd + path.sep));
+  assert.ok(!fs.existsSync(path.dirname(evidence.diagnostics.tree.directory)));
   assert.equal(evidence.diagnostics.process.operation, 'prepare');
   assert.equal(evidence.diagnostics.process.exit, 0);
   assert.equal(supervisor.status().phase, 'DISCOVERY');
@@ -91,7 +94,7 @@ test('setup copy mismatch is attributable, inspectable and cleaned before any dr
   const calls = [], { cwd, supervisor, taskRoot } = await configured(t, { runner: async (...args) => { calls.push(args[1].operation); return invoke(...args); } });
   patch(t, 'copyFileSync', original => (source, destination, ...args) => {
     original(source, destination, ...args);
-    if (destination.startsWith(taskRoot) && destination.includes('/environment-setup-') && destination.endsWith('/candidate/feature.txt')) {
+    if (destination.endsWith('/candidate/feature.txt')) {
       fs.writeFileSync(destination, 'changed\n');
     }
   });
@@ -104,6 +107,7 @@ test('setup copy mismatch is attributable, inspectable and cleaned before any dr
   assert.equal(evidence.status, 'ERROR');
   assert.equal(evidence.diagnostics.capture.comparison, 'source/copy');
   assert.equal(evidence.diagnostics.capture.totalDifferences, 1);
+  assert.ok(!fs.existsSync(path.dirname(evidence.diagnostics.capture.destination)));
   assert.equal(evidence.diagnostics.capture.differences[0].path, 'feature.txt');
   assert.deepEqual(evidence.diagnostics.capture.differences[0].fields, ['sha']);
   assert.match(result.message, /feature\.txt/);
@@ -119,9 +123,12 @@ test('trial copy failure retains earlier results and the failed trial; default i
   assert.equal(previous.status, 'FAIL');
   fs.writeFileSync(path.join(cwd, 'feature.txt'), 'done\n');
   calls.length = 0;
+  let copies = 0, failedScratch;
   patch(t, 'copyFileSync', original => (source, destination, ...args) => {
     original(source, destination, ...args);
-    if (destination.startsWith(taskRoot) && destination.endsWith('/feature-2/candidate/feature.txt')) fs.writeFileSync(destination, 'nope\n');
+    if (destination.endsWith('/candidate/feature.txt') && ++copies === 2) {
+      failedScratch = path.dirname(path.dirname(destination)); fs.writeFileSync(destination, 'nope\n');
+    }
   });
   const result = await supervisor.evaluate();
   assert.equal(result.status, 'ERROR');
@@ -138,7 +145,7 @@ test('trial copy failure retains earlier results and the failed trial; default i
   assert.deepEqual(calls, ['run', 'dispose'], 'Do not invoke a driver on an incomplete copy');
   const failed = path.join(taskRoot, 'runs', result.runId, 'feature-2');
   assert.equal(readJson(path.join(failed, 'result.json')).status, 'ERROR');
-  noWork(failed);
+  noWork(failed); assert.ok(!fs.existsSync(failedScratch));
   assert.equal(inspected(supervisor, previous.id).status, 'FAIL');
   assert.equal(supervisor.status().phase, 'SEALED');
   assert.equal(supervisor.status().runCount, 2);
@@ -198,7 +205,7 @@ test('trial capture I/O errors retain the failed stage and clean partially copie
   const { cwd, supervisor, taskRoot } = await configured(t);
   ok(await supervisor.draft(contract())); ok(await supervisor.approve());
   patch(t, 'copyFileSync', original => (source, destination, ...args) => {
-    if (destination.startsWith(taskRoot) && destination.includes('/runs/') && destination.endsWith('/candidate/feature.txt')) {
+    if (destination.endsWith('/candidate/feature.txt')) {
       throw Object.assign(new Error('Injected copy I/O failure'), { code: 'EIO' });
     }
     return original(source, destination, ...args);
@@ -263,4 +270,43 @@ test('log persistence failure keeps the process diagnostic and its inspectable e
   assert.equal(evidence.diagnostics.process.operation, 'prepare');
   assert.equal(evidence.diagnostics.logging.code, 'EIO');
   noWork(path.join(taskRoot, `environment-setup-${result.runId}`));
+});
+
+test('cancellation during physical setup scratch removal cannot record PASS or publish a warm environment', async t => {
+  const controller = new AbortController();
+  let scratch;
+  const { cwd, supervisor } = await configured(t, { signal: controller.signal, runner: async (...args) => {
+    scratch = args[1].runDirectory; return invoke(...args);
+  } });
+  patch(t, 'rmSync', original => (directory, ...args) => {
+    const result = original(directory, ...args);
+    if (directory === scratch) controller.abort();
+    return result;
+  });
+  const result = await supervisor.draft(contract());
+  assert.equal(result.code, 'CANCELLED'); assert.match(result.runId, /^E/);
+  assert.equal(result.stage, 'runtime-record'); assert.equal(inspected(supervisor).status, 'ERROR');
+  assert.ok(!fs.existsSync(scratch));
+  const root = path.join(cwd, DEFAULT_STORE_DIR, 'state', 'environments');
+  for (const environment of fs.readdirSync(root)) assert.ok(!fs.existsSync(path.join(root, environment, 'identity.json')));
+});
+
+test('cancellation during physical trial scratch removal keeps the observed assertions but records ERROR', async t => {
+  const { cwd, supervisor } = await configured(t); ok(await supervisor.draft(contract())); ok(await supervisor.approve());
+  fs.writeFileSync(path.join(cwd, 'feature.txt'), 'done\n');
+  const controller = new AbortController();
+  let scratch;
+  const cancelled = new ExitCode(cwd, { signal: controller.signal, runner: async (...args) => {
+    scratch = args[1].runDirectory; return invoke(...args);
+  } });
+  patch(t, 'rmSync', original => (directory, ...args) => {
+    const result = original(directory, ...args);
+    if (directory === scratch) controller.abort();
+    return result;
+  });
+  const result = await cancelled.evaluate(), run = inspected(cancelled);
+  assert.equal(result.code, 'CANCELLED'); assert.equal(run.status, 'ERROR');
+  assert.equal(run.results[0].status, 'ERROR');
+  assert.ok(run.results[0].assertions.every(assertion => assertion.status === 'PASS'));
+  assert.ok(!fs.existsSync(scratch)); assert.equal(cancelled.status().phase, 'SEALED');
 });

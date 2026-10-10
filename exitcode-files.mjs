@@ -1,5 +1,6 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import * as os from 'node:os';
 import { createHash, randomUUID } from 'node:crypto';
 
 export const FORMAT = 'exitcode-scenarios-1';
@@ -116,7 +117,7 @@ export function inventory(root, { candidate = false, storeDir = DEFAULT_STORE_DI
 
 export const treeDigest = (root, options) => digest(inventory(root, options));
 
-function captureMismatch(expected, actual, comparison, source, destination) {
+export function inventoryDifferences(expected, actual) {
   const left = new Map(expected.map(entry => [entry.path, entry])), right = new Map(actual.map(entry => [entry.path, entry]));
   const differences = [];
   let totalDifferences = 0;
@@ -127,8 +128,29 @@ function captureMismatch(expected, actual, comparison, source, destination) {
     totalDifferences++;
     if (differences.length < 8) differences.push({ path: name, fields, expected: before ?? null, actual: after ?? null });
   }
-  fail('CANDIDATE_CHANGED', `Files differ while capturing the candidate (${comparison}): ${differences.map(entry => `${JSON.stringify(entry.path)} [${entry.fields.join(', ')}]`).join('; ')}${totalDifferences > differences.length ? `; ${totalDifferences - differences.length} more paths` : ''}`,
-    { diagnostics: { capture: { comparison, source, destination, totalDifferences, differences } } });
+  return { totalDifferences, differences };
+}
+
+export const describeDifferences = ({ differences, totalDifferences }) => differences.map(entry => `${JSON.stringify(entry.path)} [${entry.fields.join(', ')}]`).join('; ')
+  + (totalDifferences > differences.length ? `; ${totalDifferences - differences.length} more paths` : '');
+
+function captureMismatch(expected, actual, comparison, source, destination) {
+  const changes = inventoryDifferences(expected, actual);
+  fail('CANDIDATE_CHANGED', `Files differ while capturing the candidate (${comparison}): ${describeDifferences(changes)}`,
+    { diagnostics: { capture: { comparison, source, destination, ...changes } } });
+}
+
+// Scratch must not inherit a product workspace or any parent repository's Git metadata.
+export function allocateScratch(cwd) {
+  const temporary = fs.realpathSync(os.tmpdir()), workspace = fs.realpathSync(cwd), rel = path.relative(workspace, temporary);
+  if (!rel || rel !== '..' && !rel.startsWith('..' + path.sep) && !path.isAbsolute(rel))
+    fail('UNSAFE_PATH', 'Execution scratch must be outside the product workspace; set TMPDIR to an external OS scratch directory');
+  for (let directory = temporary; ; directory = path.dirname(directory)) {
+    if (fs.existsSync(path.join(directory, '.git')))
+      fail('UNSAFE_PATH', 'Execution scratch must be outside Git ancestry; set TMPDIR to an external OS scratch directory');
+    if (path.dirname(directory) === directory) break;
+  }
+  return fs.mkdtempSync(path.join(temporary, 'exitcode-'));
 }
 
 export function copyTree(source, destination, { candidate = false, storeDir = DEFAULT_STORE_DIR, signal, maxBytes = defaultMaxBytes(candidate), treeKind } = {}) {

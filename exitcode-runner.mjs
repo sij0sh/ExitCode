@@ -40,9 +40,9 @@ function bubblewrap(manifest, request, env) {
 // A driver can wrap a container, remote environment, API, browser, or SDK itself.
 export async function invoke(manifest, request, { signal, timeoutSeconds = manifest.timeoutSeconds } = {}) {
   if (signal?.aborted) throw stopped(signal);
-  const home = path.join(request.runDirectory, 'home');
-  fs.mkdirSync(home, { recursive: true });
-  const env = { PATH: [path.dirname(resolveProgram('node')), '/usr/bin', '/bin'].join(path.delimiter), HOME: home, TMPDIR: home, LANG: 'C.UTF-8' };
+  const home = path.join(request.runDirectory, 'home'), work = path.join(request.runDirectory, 'work');
+  fs.mkdirSync(home, { recursive: true }); fs.mkdirSync(work, { recursive: true });
+  const env = { PATH: [path.dirname(resolveProgram('node')), '/usr/bin', '/bin'].join(path.delimiter), HOME: home, TMPDIR: work, LANG: 'C.UTF-8' };
   if (process.platform === 'win32') { env.SystemRoot = process.env.SystemRoot; env.PATH = process.env.PATH; }
   for (const key of manifest.environment) if (process.env[key] !== undefined) env[key] = process.env[key];
   let program = resolveProgram(manifest.command.program);

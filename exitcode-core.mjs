@@ -4,7 +4,7 @@ import * as os from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import { fileURLToPath } from 'node:url';
-import { FORMAT, DEFAULT_STORE_DIR, fail, digest, sha, fileSha, stable, confined, readJson, writeJson, inventory, treeDigest, copyTree, writeFiles, ensureStore, locked, resolveProgram } from './exitcode-files.mjs';
+import { FORMAT, DEFAULT_STORE_DIR, fail, digest, sha, fileSha, stable, confined, readJson, writeJson, inventory, inventoryDifferences, describeDifferences, treeDigest, copyTree, allocateScratch, writeFiles, ensureStore, locked, resolveProgram } from './exitcode-files.mjs';
 import { validateProject, validateContract, compare, MAX_HAPPY_PATH_CLAIMS } from './exitcode-spec.mjs';
 import { invoke } from './exitcode-runner.mjs';
 
@@ -27,14 +27,7 @@ const contextualIssue = (error, context, processResult) => {
   const { operation: _operation, ...details } = context;
   return Object.assign(error, { ...details, stage: error.stage ?? context.stage });
 };
-const removeWork = directory => {
-  let issue;
-  for (const name of ['candidate', 'project', 'home']) {
-    try { fs.rmSync(path.join(directory, name), { recursive: true, force: true }); }
-    catch (error) { issue ??= error; }
-  }
-  if (issue) throw issue;
-};
+const removeWork = directory => { if (directory) fs.rmSync(directory, { recursive: true, force: true }); };
 
 const candidateDigest = (cwd, storeDir) => treeDigest(cwd, { candidate: true, storeDir });
 const short = (text, max = 240) => typeof text === 'string' ? text.slice(0, max) : '';
@@ -83,11 +76,29 @@ export class ExitCode {
       }, this.storeDir);
     } catch (error) { return errorResult(error); }
   }
+  baselineFile(task, fingerprint = task.baselineDigest) {
+    if (!/^[a-f0-9]{64}$/.test(fingerprint)) fail('DAMAGED_STATE', 'Invalid baseline digest');
+    return confined(path.dirname(this.taskFile(task.id)), `baseline-${fingerprint}.json`);
+  }
+  adoptBaseline(task) {
+    const entries = inventory(this.cwd, { candidate: true, storeDir: this.storeDir, signal: this.signal }), fingerprint = digest(entries);
+    // Write a content-addressed manifest first, so a failed task save cannot overwrite its previous baseline.
+    writeJson(this.baselineFile(task, fingerprint), entries);
+    task.baselineDigest = fingerprint;
+  }
   unsealed(task) {
     if (!['DISCOVERY', 'READY'].includes(task.phase)) fail('SEALED', 'Acceptance and project definitions cannot change after approval. Start a new task to supersede them.');
-    if (candidateDigest(this.cwd, this.storeDir) !== task.baselineDigest) {
+    const current = inventory(this.cwd, { candidate: true, storeDir: this.storeDir, signal: this.signal }), currentDigest = digest(current);
+    if (currentDigest !== task.baselineDigest) {
+      const file = this.baselineFile(task), baseline = { comparison: 'baseline/current', baselineDigest: task.baselineDigest, currentDigest };
+      if (fs.existsSync(file)) {
+        const expected = readJson(file);
+        if (!Array.isArray(expected) || digest(expected) !== task.baselineDigest) fail('DAMAGED_STATE', 'Baseline inventory does not match its recorded digest');
+        Object.assign(baseline, inventoryDifferences(expected, current));
+      } else baseline.inventoryUnavailable = true; // Older tasks have only a digest. Never invent their historical inventory.
       task.phase = 'DISCOVERY'; delete task.prepared; this.save(task);
-      fail('CANDIDATE_CHANGED', 'Product changed before approval. Ignored files and build outputs participate in candidate identity. Edits are preserved. Exit or explicitly resume to accept the current workspace and rebuild preparation.', { stage: 'baseline-check' });
+      fail('CANDIDATE_CHANGED', `Product changed before approval (baseline/current): ${baseline.inventoryUnavailable ? 'historical inventory unavailable' : describeDifferences(baseline)}. Baseline ${task.baselineDigest}; current ${currentDigest}. Ignored files and build outputs participate in candidate identity. Edits are preserved. Exit or explicitly resume to adopt the current workspace and rebuild preparation.`,
+        { stage: 'baseline-check', diagnostics: { baseline } });
     }
   }
   project() {
@@ -104,15 +115,16 @@ export class ExitCode {
       if (typeof problem !== 'string' || !problem.trim() || problem.length > 8192) fail('INVALID_SPEC', 'Provide a problem within 8192 characters');
       if (store.index.active) { const previous = this.load(store.index.active); previous.detachedAt = timestamp(); this.save(previous); }
       const task = { format: FORMAT, id: `T${Date.now().toString(36)}-${randomUUID().slice(0, 8)}`, problem: problem.trim(),
-        phase: 'DISCOVERY', enteredAt: timestamp(), baselineDigest: candidateDigest(this.cwd, this.storeDir), runCount: 0 };
-      this.save(task); store.index.active = task.id; store.index.latest = task.id; writeJson(store.file, store.index);
-      return { ok: true, task: task.id, phase: task.phase, next: 'Inspect the project and configure or reuse its validation driver.' };
+        phase: 'DISCOVERY', enteredAt: timestamp(), runCount: 0 };
+      this.adoptBaseline(task); this.save(task); store.index.active = task.id; store.index.latest = task.id; writeJson(store.file, store.index);
+      return { ok: true, task: task.id, phase: task.phase, next: 'Inspect the project. Reuse the stored driver if sufficient and submit exitcode_contract; call exitcode_project only to create or replace the full driver definition.' };
     });
   }
   async configure(project, { refresh = false } = {}) {
     return this.operation('project', async () => {
+      const validated = validateProject(project);
       const task = this.owned(); this.unsealed(task);
-      const validated = validateProject(project), root = confined(this.store().base, 'project');
+      const root = confined(this.store().base, 'project');
       const staged = confined(this.store().base, `project-${randomUUID()}`);
       writeJson(path.join(staged, 'manifest.json'), validated.manifest); writeFiles(path.join(staged, 'files'), validated.files);
       if (fs.existsSync(root)) fs.rmSync(root, { recursive: true, force: true });
@@ -140,7 +152,7 @@ export class ExitCode {
     }
     if (stable(files) !== stable(project.files)) fail('EVALUATOR_CHANGED', 'Validation driver changed during execution');
   }
-  async call(project, request, timeoutSeconds, { cleanup = false } = {}) {
+  async call(project, request, timeoutSeconds, { cleanup = false, evidenceDirectory = request.runDirectory } = {}) {
     this.progress({ operation: request.operation, scenario: request.scenario?.id });
     let processResult;
     try {
@@ -148,8 +160,8 @@ export class ExitCode {
       processResult = result.processResult;
       if (!cleanup && this.signal?.aborted) fail('CANCELLED', 'Late driver response after cancellation is not evidence');
       if (processResult) {
-        fs.writeFileSync(path.join(request.runDirectory, `${request.operation}.stdout`), processResult.stdout);
-        fs.writeFileSync(path.join(request.runDirectory, `${request.operation}.stderr`), processResult.stderr);
+        fs.writeFileSync(path.join(evidenceDirectory, `${request.operation}.stdout`), processResult.stdout);
+        fs.writeFileSync(path.join(evidenceDirectory, `${request.operation}.stderr`), processResult.stderr);
       }
       this.verifyProjectCopy(project, request.projectDirectory);
       return result;
@@ -157,14 +169,14 @@ export class ExitCode {
       processResult = error.processResult ?? processResult;
       if (processResult) {
         error.diagnostics = { ...error.diagnostics, process: processDiagnostics(processResult, request.operation) };
-        try { for (const stream of ['stdout', 'stderr']) fs.writeFileSync(path.join(request.runDirectory, `${request.operation}.${stream}`), processResult[stream] ?? ''); }
+        try { for (const stream of ['stdout', 'stderr']) fs.writeFileSync(path.join(evidenceDirectory, `${request.operation}.${stream}`), processResult[stream] ?? ''); }
         catch (logging) { error.diagnostics.logging = { code: logging.code, message: logging.message }; }
       }
       throw error;
     }
   }
-  async dispose(project, request) {
-    const result = await this.call(project, { ...request, operation: 'dispose' }, Math.min(project.manifest.timeoutSeconds, 10), { cleanup: true });
+  async dispose(project, request, evidenceDirectory) {
+    const result = await this.call(project, { ...request, operation: 'dispose' }, Math.min(project.manifest.timeoutSeconds, 10), { cleanup: true, evidenceDirectory });
     if (result.report.status !== 'OK') fail('CLEANUP_FAILED', result.report.reason ?? 'Driver cleanup did not succeed',
       { diagnostics: result.processResult && { process: processDiagnostics(result.processResult, 'dispose') } });
   }
@@ -181,69 +193,81 @@ export class ExitCode {
       return { directory: runtime, digest: known.digest, runtimeIdentity: identity, warm: true };
     }
     const setupId = `E${randomUUID()}`, directory = confined(this.store().state, `tasks/${task.id}/environment-setup-${setupId}`);
-    const runtime = confined(root, `preparing-${setupId}`);
-    const request = { operation: 'prepare', projectDirectory: path.join(directory, 'project'), candidateDirectory: path.join(directory, 'candidate'),
-      runtimeDirectory: runtime, runDirectory: directory };
-    let issue, environment, processResult, driverStarted = false, stage = 'setup-create';
+    const staged = confined(root, `preparing-${setupId}`);
+    let request, scratch, issue, environment, processResult, artifacts = [], driverStarted = false, stage = 'setup-create';
     const context = () => ({ runId: setupId, stage, operation: 'prepare' });
     try {
+      fs.mkdirSync(directory, { recursive: true });
+      stage = 'scratch-create'; scratch = allocateScratch(this.cwd);
+      request = { operation: 'prepare', projectDirectory: path.join(scratch, 'project'), candidateDirectory: path.join(scratch, 'candidate'),
+        runtimeDirectory: path.join(scratch, 'runtime'), runDirectory: scratch };
       try {
-        fs.mkdirSync(directory, { recursive: true });
-        stage = 'runtime-create'; fs.mkdirSync(runtime, { recursive: true });
+        stage = 'runtime-create'; fs.mkdirSync(request.runtimeDirectory);
         stage = 'project-capture'; this.materializeProject(project, request.projectDirectory);
         stage = 'candidate-copy'; copyTree(this.cwd, request.candidateDirectory, { candidate: true, storeDir: this.storeDir, signal: this.signal });
         stage = 'prepare'; driverStarted = true;
-        const result = await this.call(project, request, project.manifest.timeoutSeconds);
+        const result = await this.call(project, request, project.manifest.timeoutSeconds, { evidenceDirectory: directory });
         processResult = result.processResult;
+        stage = 'artifacts'; artifacts = this.artifacts(result.report, scratch, directory);
+        stage = 'prepare';
         if (result.report.status !== 'OK') fail('ENVIRONMENT_UNAVAILABLE', result.report.reason ?? 'Driver could not prepare the environment');
       } catch (error) { issue = contextualIssue(error, context(), processResult); }
       finally {
         if (driverStarted) {
-          try { await this.dispose(project, request); }
+          try { await this.dispose(project, request, directory); }
           catch (error) { issue ??= contextualIssue(error, { ...context(), stage: 'dispose' }); }
         }
-        try { removeWork(directory); }
-        catch (error) { issue ??= contextualIssue(error, { ...context(), stage: 'work-cleanup' }); }
       }
       if (issue) throw issue;
       if (this.signal?.aborted) fail('CANCELLED', 'Cancellation before runtime capture invalidates preparation');
       stage = 'runtime-capture';
-      const fingerprint = treeDigest(runtime, runtimeOptions);
+      const fingerprint = treeDigest(request.runtimeDirectory, runtimeOptions);
       stage = 'runtime-finalize';
       const immutable = confined(root, `versions/${fingerprint}`);
       fs.mkdirSync(path.dirname(immutable), { recursive: true });
       if (fs.existsSync(immutable)) {
         if (treeDigest(immutable, runtimeOptions) !== fingerprint) fail('ENVIRONMENT_CHANGED', 'A stored immutable environment was changed');
-        fs.rmSync(runtime, { recursive: true, force: true });
-      } else fs.renameSync(runtime, immutable);
+      } else {
+        if (copyTree(request.runtimeDirectory, staged, runtimeOptions) !== fingerprint) fail('ENVIRONMENT_CHANGED', 'Prepared runtime changed during finalization');
+        fs.renameSync(staged, immutable);
+      }
       if (this.signal?.aborted) fail('CANCELLED', 'Cancellation before recording runtime identity invalidates preparation');
-      writeJson(metadata, { format: FORMAT, digest: fingerprint, runtimeIdentity: identity, createdAt: timestamp() });
       environment = { directory: immutable, digest: fingerprint, runtimeIdentity: identity, warm: false };
     } catch (error) { issue = contextualIssue(error, context(), processResult); }
-    if (issue) {
-      // Keep immutable versions referenced by other tasks. Remove only this unfinished setup.
-      try { fs.rmSync(runtime, { recursive: true, force: true }); }
-      catch (error) { issue.diagnostics = { ...issue.diagnostics, cleanup: { code: error.code, message: error.message } }; }
+    finally {
+      // Immutable versions referenced by other tasks survive. Only this setup's unfinished staging and scratch are removed.
+      for (const work of [scratch, staged]) {
+        try { removeWork(work); }
+        catch (error) { issue ??= contextualIssue(error, { ...context(), stage: 'work-cleanup' }); }
+      }
+    }
+    if (!issue) {
+      try {
+        stage = 'runtime-record';
+        if (this.signal?.aborted) fail('CANCELLED', 'Cancellation during setup cleanup invalidates preparation');
+        writeJson(metadata, { format: FORMAT, digest: environment.digest, runtimeIdentity: identity, createdAt: timestamp() });
+      } catch (error) { issue = contextualIssue(error, context(), processResult); }
     }
     try {
-      writeJson(path.join(directory, 'result.json'), { id: setupId, kind: 'environment', ...(issue ? errorResult(issue) : { ok: true, status: 'PASS' }), at: timestamp() });
+      writeJson(path.join(directory, 'result.json'), { id: setupId, kind: 'environment', artifacts, ...(issue ? errorResult(issue) : { ok: true, status: 'PASS' }), at: timestamp() });
       task.lastEvidenceId = setupId; this.save(task);
     } catch (error) { throw contextualIssue(error, { runId: setupId, stage: 'setup-record', operation: 'prepare' }, processResult); }
     if (issue) throw issue;
     return environment;
   }
-  artifacts(report, directory) {
+
+  artifacts(report, directory, evidenceDirectory = directory) {
     const artifacts = report.artifacts ?? [];
     if (!Array.isArray(artifacts) || artifacts.length > 32) fail('INVALID_REPORT', 'artifacts must contain at most 32 relative filenames');
     const result = [], seen = new Set();
     let bytes = 0;
     for (const name of artifacts) {
       const file = confined(directory, name);
-      if (seen.has(name) || ['candidate', 'project', 'home', 'evidence'].includes(name.split('/')[0])
+      if (seen.has(name) || ['candidate', 'project', 'home', 'runtime', 'evidence'].includes(name.split('/')[0])
         || !fs.existsSync(file) || !fs.lstatSync(file).isFile()) fail('INVALID_REPORT', `Invalid evidence artifact ${name}`);
       seen.add(name); bytes += fs.statSync(file).size;
       if (bytes > 16 * 1024 * 1024) fail('INVALID_REPORT', 'Artifacts exceed 16 MiB per trial');
-      const copy = confined(directory, `evidence/${name}`);
+      const copy = confined(evidenceDirectory, `evidence/${name}`);
       fs.mkdirSync(path.dirname(copy), { recursive: true }); fs.copyFileSync(file, copy);
       result.push({ path: `evidence/${name}`, bytes: fs.statSync(copy).size, sha: sha(fs.readFileSync(copy)) });
     }
@@ -251,22 +275,27 @@ export class ExitCode {
   }
   async trial(project, environment, task, scenario, runId, index, empty = false) {
     const directory = confined(this.store().state, `tasks/${task.id}/runs/${runId}/${scenario.id}-${empty ? 'wiring' : index}`);
-    const request = { operation: 'run', projectDirectory: path.join(directory, 'project'), candidateDirectory: path.join(directory, 'candidate'),
-      runtimeDirectory: environment.directory, runDirectory: directory,
-      scenario: { id: scenario.id, instructions: scenario.instructions, input: scenario.input }, trial: index };
-    let result, issue, processResult, driverStarted = false, stage = 'trial-create';
+    let request, scratch, result, issue, processResult, driverStarted = false, stage = 'trial-create';
     const context = () => ({ runId, stage, operation: 'run', scenario: scenario.id, trial: index });
     try {
       fs.mkdirSync(directory, { recursive: true });
+      stage = 'scratch-create'; scratch = allocateScratch(this.cwd);
+      request = { operation: 'run', projectDirectory: path.join(scratch, 'project'), candidateDirectory: path.join(scratch, 'candidate'),
+        runtimeDirectory: environment.directory, runDirectory: scratch,
+        scenario: { id: scenario.id, instructions: scenario.instructions, input: scenario.input }, trial: index };
       stage = 'project-capture'; this.materializeProject(project, request.projectDirectory);
       stage = 'candidate-copy';
       if (empty) fs.mkdirSync(request.candidateDirectory); else copyTree(this.cwd, request.candidateDirectory, { candidate: true, storeDir: this.storeDir, signal: this.signal });
       stage = 'run'; driverStarted = true;
-      const response = await this.call(project, request, scenario.timeoutSeconds);
+      const response = await this.call(project, request, scenario.timeoutSeconds, { evidenceDirectory: directory });
       const report = response.report; processResult = response.processResult;
+      if (report.status !== 'OK') {
+        stage = 'artifacts'; result = { scenario: scenario.id, trial: index, artifacts: this.artifacts(report, scratch, directory) };
+        stage = 'run';
+      }
       if (report.status === 'UNAVAILABLE') {
         if (!empty) fail('TARGET_UNAVAILABLE', report.reason);
-        result = { scenario: scenario.id, trial: index, status: 'UNAVAILABLE', reason: report.reason };
+        result = { ...result, status: 'UNAVAILABLE', reason: report.reason };
       } else {
         if (report.status !== 'OK') fail('RUNNER_ERROR', report.reason);
         stage = 'observations';
@@ -275,22 +304,22 @@ export class ExitCode {
         const observations = { ...report.observations, $run: { elapsedMs: processResult.elapsedMs, startedAt: processResult.startedAt, finishedAt: processResult.finishedAt } };
         const assertions = compare(observations, scenario.assertions);
         result = { scenario: scenario.id, trial: index, status: assertions.every(a => a.status === 'PASS') ? 'PASS' : 'FAIL', observations, assertions };
-        stage = 'artifacts'; result.artifacts = this.artifacts(report, directory);
+        stage = 'artifacts'; result.artifacts = this.artifacts(report, scratch, directory);
         if (empty && result.status === 'PASS') fail('WIRING_PASSED_EMPTY', `Scenario ${scenario.id} passes without the product`);
       }
     } catch (error) { issue = contextualIssue(error, context(), processResult); }
     finally {
       if (driverStarted) {
         // Dispose is bounded independently even when the main operation was cancelled.
-        try { await this.dispose(project, request); }
+        try { await this.dispose(project, request, directory); }
         catch (error) { issue ??= contextualIssue(error, { ...context(), stage: 'dispose' }); }
         try {
           if (treeDigest(environment.directory, { treeKind: 'prepared runtime' }) !== environment.digest) fail('ENVIRONMENT_CHANGED', 'Scenario or cleanup changed the frozen evaluator environment');
         } catch (error) { issue ??= contextualIssue(error, { ...context(), stage: 'runtime-check' }); }
       }
-      if (this.signal?.aborted) issue ??= contextualIssue(Object.assign(new Error('Cancellation during cleanup invalidates this run'), { code: 'CANCELLED' }), context());
-      try { removeWork(directory); }
+      try { removeWork(scratch); }
       catch (error) { issue ??= contextualIssue(error, { ...context(), stage: 'work-cleanup' }); }
+      if (this.signal?.aborted) issue ??= contextualIssue(Object.assign(new Error('Cancellation during cleanup invalidates this run'), { code: 'CANCELLED' }), context());
       result = issue ? { ...result, ...errorResult(issue), ...(empty ? { wiring: true } : {}) } : result;
       writeJson(path.join(directory, 'result.json'), result);
     }
@@ -456,10 +485,10 @@ export class ExitCode {
       if (!task || task.phase === 'PASS') fail('NOT_RESUMABLE', 'No unfinished task to resume');
       if (store.index.active && store.index.active !== task.id) { const previous = this.load(store.index.active); previous.detachedAt = timestamp(); this.save(previous); }
       if (task.phase === 'SEALED') this.sealed(task);
-      else { task.baselineDigest = candidateDigest(this.cwd, this.storeDir); task.phase = 'DISCOVERY'; delete task.prepared; }
+      else { this.adoptBaseline(task); task.phase = 'DISCOVERY'; delete task.prepared; delete task.lastIssue; }
       delete task.detachedAt; task.waitingFor = null; task.resumedAt = timestamp(); this.save(task);
       store.index.active = task.id; store.index.latest = task.id; writeJson(store.file, store.index);
-      return { ok: true, task: task.id, phase: task.phase, next: task.phase === 'SEALED' ? 'Continue on the current workspace; previous PASS observations are not completion.' : 'Inspect the current workspace and prepare fresh acceptance.' };
+      return { ok: true, task: task.id, phase: task.phase, next: task.phase === 'SEALED' ? 'Continue on the current workspace; previous PASS observations are not completion.' : 'Inspect the current workspace. Reuse the stored driver if sufficient and submit exitcode_contract; call exitcode_project only if the full driver definition must change.' };
     });
   }
   freshPass(id) {
