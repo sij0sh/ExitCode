@@ -6,8 +6,9 @@ import * as path from "node:path";
 import * as core from "./exitcode-core.mjs";
 import { DEFAULT_CONFIG, loadConfig } from "./exitcode-config.mjs";
 import { resolveStoreDir } from "./exitcode-files.mjs";
-import { MAX_HAPPY_PATH_CLAIMS, ASSERTION_PATH_PATTERN, MAX_ASSERTION_PATH_LENGTH } from "./exitcode-spec.mjs";
+import { MAX_HAPPY_PATH_CLAIMS, MAX_PROJECT_FILES, ASSERTION_PATH_PATTERN, MAX_ASSERTION_PATH_LENGTH } from "./exitcode-spec.mjs";
 
+const SHELL_PATH_BOUNDARY = "(?=$|[\\s/'\";()<>|&])";
 const Namespace = { name: "exitcode", description: "Reusable project validation and sealed scenario acceptance" };
 const Assertion = Type.Object({ path: Type.String({ pattern: ASSERTION_PATH_PATTERN, maxLength: MAX_ASSERTION_PATH_LENGTH, description: "JSON pointer relative to the contents of observations, e.g. /retrieval/found. Do not use dotted paths or prepend /observations." }), op: Type.Union(["eq", "lte", "gte", "contains", "present"].map(value => Type.Literal(value))), value: Type.Optional(Type.Unknown()) }, { additionalProperties: false });
 const HappyPathClaim = Type.Object({ id: Type.String(), claim: Type.String() }, { additionalProperties: false });
@@ -111,8 +112,8 @@ export default function (pi: ExtensionAPI) {
   const definitions = [
     {
       name: "exitcode_project", label: "ExitCode project",
-      description: "Bootstrap or refresh reusable project validation. Investigate with normal tools first. Supply infrastructure and driver files, never an implementation of the requested fix. Reuse existing definitions when sufficient. Protocol operations: prepare, run, dispose. Stdout must be one protocol: 1 JSON response with status OK, UNAVAILABLE or ERROR; run returns observations and artifacts, not PASS/FAIL. Registration returns public driver and format-reference paths. Workspace mode is a trusted host process; bubblewrap is offline and fails closed. This tool is available only before approval.",
-      parameters: Type.Object({ manifest: Manifest, files: Type.Record(Type.String(), Type.String(), { description: "UTF-8 driver files keyed relative to the stored project/files directory, not the product root. Use driver.mjs (or driver.py) and the matching command argument." }), refresh: Type.Optional(Type.Boolean({ description: "Refresh environment preparation only. This does not adopt changed product bytes; explicit user resume is required for that." })) }, { additionalProperties: false }),
+      description: `Bootstrap or refresh reusable project validation. Investigate with normal tools first. Supply infrastructure and driver files, never an implementation of the requested fix. Registration replaces the full driver definition and requires 1 to ${MAX_PROJECT_FILES} files. To reuse the stored driver unchanged, skip this tool and call exitcode_contract. Protocol operations: prepare, run, dispose. Stdout must be one protocol: 1 JSON response with status OK, UNAVAILABLE or ERROR; run returns observations and artifacts, not PASS/FAIL. Registration returns public driver and format-reference paths. Workspace mode is a trusted host process; bubblewrap is offline and fails closed. This tool is available only before approval.`,
+      parameters: Type.Object({ manifest: Manifest, files: Type.Record(Type.String(), Type.String(), { minProperties: 1, maxProperties: MAX_PROJECT_FILES, description: "UTF-8 driver files keyed relative to the stored project/files directory, not the product root. Use driver.mjs (or driver.py) and the matching command argument." }), refresh: Type.Optional(Type.Boolean({ description: "Refresh environment preparation only. This does not adopt changed product bytes; explicit user resume is required for that." })) }, { additionalProperties: false }),
       execute: async (_id: string, params: any, signal: AbortSignal, update: any, ctx: ExtensionContext) => execute(ctx, signal, update,
         supervisor => supervisor.configure({ manifest: params.manifest, files: params.files }, { refresh: params.refresh === true })),
     },
@@ -196,10 +197,10 @@ export default function (pi: ExtensionAPI) {
         let command = String(input.command ?? "");
         const roots = [base, storeDir()].sort((a, b) => b.length - a.length);
         const escape = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-        const mentionsStore = (value: string) => roots.some(root => new RegExp(`${escape(root)}(?=$|[\\s/'\";()<>])`).test(value));
+        const mentionsStore = (value: string) => roots.some(root => new RegExp(`${escape(root)}${SHELL_PATH_BOUNDARY}`).test(value));
         if (command.includes("..") && mentionsStore(command))
           return { block: true, reason: "Use explicit project paths without traversal; supervisor state is private." };
-        for (const root of roots) command = command.replace(new RegExp(`${escape(root)}/project(?=$|[\\s/'\"])`, "g"), "project");
+        for (const root of roots) command = command.replace(new RegExp(`${escape(root)}/project${SHELL_PATH_BOUNDARY}`, "g"), "project");
         if (mentionsStore(command)) return { block: true, reason: "Do not access supervisor state through shell commands. Use ExitCode tools or /exitcode status." };
       }
       const status = supervisor(ctx).status(taskId);

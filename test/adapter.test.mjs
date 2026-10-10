@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as core from '../exitcode-core.mjs';
-import { MAX_HAPPY_PATH_CLAIMS, ASSERTION_PATH_PATTERN, MAX_ASSERTION_PATH_LENGTH, validateContract } from '../exitcode-spec.mjs';
+import { MAX_HAPPY_PATH_CLAIMS, MAX_PROJECT_FILES, ASSERTION_PATH_PATTERN, MAX_ASSERTION_PATH_LENGTH, validateContract } from '../exitcode-spec.mjs';
 import { manifest, driver, contract } from './helpers.mjs';
 import { harness } from './adapter-helpers.mjs';
 
@@ -157,4 +157,43 @@ test('project registration returns readable public paths without executing prepa
   assert.match(invalid.content[0].text, /Rejected environment names: "PATH", "HOME"/);
   assert.ok(invalid.content[0].text.includes(core.AGENT_REFERENCES.recovery));
   assert.equal(invalid.isError, true);
+});
+
+test('project schema declares full nonempty replacement and resume points to unchanged reuse', async t => {
+  const h = await harness(t); await h.start(); await h.command('The feature is pending');
+  const tool = h.tools.get('exitcode_project'), files = tool.parameters.args[0].files.args[2];
+  assert.equal(files.minProperties, 1); assert.equal(files.maxProperties, MAX_PROJECT_FILES);
+  assert.match(tool.description, /replaces the full driver definition/);
+  assert.match(tool.description, /skip this tool and call exitcode_contract/);
+  const registered = await h.call('exitcode_project', { manifest, files: { 'driver.mjs': driver } });
+  assert.ok(registered.details.ok);
+  fs.writeFileSync(path.join(h.cwd, 'feature.txt'), 'changed baseline');
+  assert.equal((await h.call('exitcode_project', { manifest, files: {} })).details.code, 'INVALID_SPEC');
+  assert.equal(new core.ExitCode(h.cwd).status().phase, 'DISCOVERY');
+  assert.equal(fs.readFileSync(path.join(registered.details.projectDirectory, 'driver.mjs'), 'utf8'), driver);
+  assert.equal((await h.call('exitcode_contract', contract())).details.code, 'CANDIDATE_CHANGED');
+  await h.command('resume');
+  assert.match(h.messages.at(-1).content, /Reuse the stored driver/);
+  assert.match(h.messages.at(-1).content, /submit exitcode_contract/);
+  const prompt = { systemPromptOptions: { sections: {} } };
+  h.events.get('before_agent_start')(prompt, h.ctx);
+  assert.doesNotMatch(prompt.systemPromptOptions.sections.exitcode, /Issue: CANDIDATE_CHANGED/);
+  assert.ok((await h.call('exitcode_contract', contract())).details.ok, 'Reuse requires no project registration');
+});
+
+test('shell path boundaries allow public project separators and still reject private paths and traversal', async t => {
+  for (const storeDir of ['.agents/.exitcode', '.validation/exitcode']) {
+    const h = await harness(t, { project: { storeDir } }); await h.start(); await h.command('The feature is pending');
+    for (const root of [storeDir, path.join(h.cwd, storeDir)]) {
+      for (const delimiter of ['', ';', ' && true', '| head', ' ', '/manifest.json', '\"', "'", ')', '>', '<', '&']) {
+        assert.equal(h.guard('bash', { command: `ls ${root}/project${delimiter}` }), undefined, delimiter);
+        assert.equal(h.guard('bash', { command: `ls ${root}${delimiter}` }).block, true, delimiter);
+      }
+      for (const tail of ['/../state/index.json', '/../state;','; head ' + root + '/state/index.json']) {
+        assert.equal(h.guard('bash', { command: `ls ${root}/project${tail}` }).block, true, tail);
+      }
+      assert.equal(h.guard('bash', { command: `ls ${root}/project-sibling` }).block, true);
+      assert.equal(h.guard('bash', { command: `ls ${root}/state|head` }).block, true);
+    }
+  }
 });

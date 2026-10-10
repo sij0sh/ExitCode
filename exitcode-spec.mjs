@@ -2,6 +2,7 @@ import { fail, relative, stable } from './exitcode-files.mjs';
 
 export const OPS = ['eq', 'lte', 'gte', 'contains', 'present'];
 export const MAX_HAPPY_PATH_CLAIMS = 8;
+export const MAX_PROJECT_FILES = 64;
 export const ASSERTION_PATH_PATTERN = '^/(?:[^~]|~[01])*$';
 export const MAX_ASSERTION_PATH_LENGTH = 512;
 const assertionPath = new RegExp(ASSERTION_PATH_PATTERN);
@@ -41,7 +42,7 @@ export function validateProject(project) {
   const rejected = m.environment.filter(key => !safeEnvironmentName(key));
   if (rejected.length) fail('INVALID_SPEC', `Rejected environment names: ${rejected.map(key => JSON.stringify(key)?.slice(0, 128)).join(', ')}. PATH, HOME and TMPDIR are runner-owned; start with environment: [].`);
   keys(project.files, Object.keys(project.files ?? {}), 'project.files');
-  if (!Object.keys(project.files).length || Object.keys(project.files).length > 64) fail('INVALID_SPEC', 'Provide 1 to 64 project driver files');
+  if (!Object.keys(project.files).length || Object.keys(project.files).length > MAX_PROJECT_FILES) fail('INVALID_SPEC', `Provide 1 to ${MAX_PROJECT_FILES} project driver files`);
   let bytes = 0;
   for (const [name, content] of Object.entries(project.files)) {
     relative(name);
