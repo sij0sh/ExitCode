@@ -97,6 +97,13 @@ Only Git metadata and the selected ExitCode store are excluded.
 ExitCode hashes full content in fixed-size chunks.
 Copies use independent copy-on-write files where supported, with ordinary copying as the fallback.
 Large workspaces still require time and storage for disposable inputs.
+Baseline mismatches report both digests and up to eight differing paths.
+
+Setup and trials run in OS scratch outside the product and its Git ancestry.
+ExitCode removes scratch after copying requested artifacts and process logs into durable evidence.
+Put mutable build output under `runDirectory/work`, not inside `candidateDirectory`.
+Keep other extensions' databases and logs outside the product workspace.
+A disposable workspace is not an operating-system sandbox.
 
 ## Configuration
 

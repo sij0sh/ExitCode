@@ -8,7 +8,8 @@ Before approval, define observations; after approval, choose implementation.
 ## Start with the real boundary
 
 Read the executable [driver](../../examples/file-project/driver.mjs) and [contract](../../examples/file-project/contract.json).
-Reuse an existing project driver when it already observes the requested behavior.
+Project registration replaces the full driver definition and requires 1 to 64 files.
+To reuse the stored driver unchanged, skip `exitcode_project` and submit `exitcode_contract`.
 Run build and test experiments on disposable product copies before approval.
 Ignored build outputs participate in ExitCode's candidate identity.
 A clean Git diff does not mean the candidate is unchanged.
@@ -31,7 +32,14 @@ Use the request's directories:
 | `projectDirectory` | Read-only driver definitions during execution. |
 | `candidateDirectory` | Disposable product copy to build and observe. |
 | `runtimeDirectory` | Prepared evaluator dependencies; unchanged during trials. |
-| `runDirectory` | Writable trial work and retained artifacts. |
+| `runDirectory` | External disposable scratch for work and requested artifacts. |
+
+Setup and trials use OS scratch outside the product and its Git ancestry.
+Put fixtures, build output, and temporary state under `runDirectory/work`.
+For Cargo, set `CARGO_TARGET_DIR` to a fresh directory there.
+Do not reuse the copied candidate's build cache.
+ExitCode copies requested artifacts and process logs into durable evidence before deleting scratch.
+Keep unrelated extension databases and logs outside the product workspace too.
 
 `prepare` creates reusable runtime dependencies.
 `run` observes the candidate using `scenario.input`.
@@ -101,12 +109,14 @@ Read supervisor evidence through ExitCode tools, not private state files.
 | `INVALID_REPORT` | Check response status, unknown keys, exit status, and stdout format. |
 | `INVALID_OBSERVATION` | Supply the required measurement or correct its path. |
 | `TREE_TOO_LARGE` | Identify the affected tree; keep prepared runtime bytes within the evaluator budget. |
-| `CANDIDATE_CHANGED` before preparation | Stop live workspace writes and ask the user for explicit `/exitcode resume`. |
+| `CANDIDATE_CHANGED` before preparation | Check the baseline/current path differences, stop live workspace writes, and ask the user for explicit `/exitcode resume`. |
 | `CANDIDATE_CHANGED` during capture | Inspect the stage and differing paths; source/copy mismatch alone does not identify the cause. |
 | Isolation or compiler error | Repair the execution environment without weakening acceptance. |
 
 Product snapshots have no default byte cap; prepared evaluator trees currently have a 512 MiB cap.
 `exitcode_project(refresh: true)` refreshes environment preparation, not the product baseline.
+Successful unsealed resume clears the current issue and preserves historical evidence.
+A digest-only older task has no historical inventory until explicit resume captures one.
 Do not edit private state, auto-resume, or auto-approve.
 If capture diagnostics are missing, report that infrastructure gap instead of repeating a full contract blindly.
 Stop at `READY` and wait for user approval.
