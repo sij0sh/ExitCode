@@ -151,6 +151,13 @@ npm run check
 ```
 
 The tests exercise local drivers and Pi host/SDK fixtures.
+Offline lifecycle regressions also use the installed Pi SDK, without model network calls.
+Set `EXITCODE_PI_SDK` to its package directory if it is not installed locally or beside Node.
+Those regressions report a skip when the peer dependency is unavailable.
+
+For driver setup or failure recovery, read the short
+[agent reference](./.agents/artifacts/exitcode-agent-recovery.md).
+Project registration and setup failures return its installed absolute path.
 
 ## License
 

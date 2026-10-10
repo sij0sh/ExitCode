@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as core from '../exitcode-core.mjs';
-import { MAX_HAPPY_PATH_CLAIMS } from '../exitcode-spec.mjs';
+import { MAX_HAPPY_PATH_CLAIMS, ASSERTION_PATH_PATTERN, MAX_ASSERTION_PATH_LENGTH, validateContract } from '../exitcode-spec.mjs';
 import { manifest, driver, contract } from './helpers.mjs';
 import { harness } from './adapter-helpers.mjs';
 
@@ -63,7 +63,10 @@ test('review waits, user command approves, failed observations reach the agent, 
   h.setIdle(false); await h.command('approve');
   assert.match(h.notices.at(-1).text, /Finish or cancel/);
   h.setIdle(true); await h.command('approve');
-  assert.equal(h.messages.at(-1).triggerTurn, true);
+  assert.equal(h.messages.at(-2).customType, 'exitcode-approval');
+  assert.equal(h.messages.at(-2).triggerTurn, false);
+  assert.match(h.messages.at(-1).content, /Follow project instructions and solve the problem/);
+  assert.equal(h.messages.at(-1).customType, undefined);
   const failed = await h.call('exitcode_evaluate');
   assert.equal(failed.details.status, 'FAIL');
   assert.match(failed.content[0].text, /observed "pending/);
@@ -115,4 +118,43 @@ test('continuation is bounded and does not introduce a decomposition or scheduli
   assert.equal(await h.events.get('agent_before_settle')({}, h.ctx), undefined);
   assert.ok(!h.tools.has('exitcode_child'));
   assert.ok(!h.tools.has('exitcode_seal'));
+});
+
+test('tool schemas expose the tested assertion root and environment restrictions', async t => {
+  const h = await harness(t);
+  const fields = h.tools.get('exitcode_contract').parameters.args[0];
+  const pointer = fields.scenarios.args[0].args[0].assertions.args[0].args[0].path.args[0];
+  assert.equal(pointer.pattern, ASSERTION_PATH_PATTERN);
+  assert.equal(pointer.maxLength, MAX_ASSERTION_PATH_LENGTH);
+  assert.match(pointer.description, /contents of observations/);
+  const spec = contract(); validateContract(spec);
+  assert.ok(new RegExp(pointer.pattern).test(spec.scenarios[0].assertions[0].path));
+  const project = h.tools.get('exitcode_project'), manifestFields = project.parameters.args[0].manifest.args[0];
+  const environment = manifestFields.environment;
+  assert.equal(environment.args[0].name, 'String');
+  assert.equal(environment.args[1].maxItems, 32);
+  assert.match(environment.args[1].description, /Start with \[\]/);
+  assert.match(environment.args[1].description, /runner-owned/);
+  assert.match(manifestFields.command.args[0].args.args[1].description, /projectDirectory/);
+  assert.match(project.parameters.args[0].files.args[2].description, /not the product root/);
+  assert.match(project.parameters.args[0].refresh.args[0].args[0].description, /does not adopt changed product/);
+});
+
+test('project registration returns readable public paths without executing preparation; failures point to recovery', async t => {
+  const h = await harness(t); await h.start(); await h.command('The feature is pending');
+  const registered = await h.call('exitcode_project', { manifest, files: { 'driver.mjs': driver } });
+  assert.ok(registered.details.ok);
+  assert.equal(registered.details.projectDirectory, path.join(h.cwd, '.agents/.exitcode/project/files'));
+  assert.equal(fs.readFileSync(path.join(registered.details.projectDirectory, 'driver.mjs'), 'utf8'), driver);
+  assert.equal(h.guard('read', { path: path.join(registered.details.projectDirectory, 'driver.mjs') }), undefined);
+  assert.ok(!fs.existsSync(path.join(h.cwd, '.agents/.exitcode/state/environments')));
+  for (const file of Object.values(registered.details.references)) {
+    assert.ok(path.isAbsolute(file)); assert.ok(fs.existsSync(file), file);
+    assert.ok(registered.content[0].text.includes(file));
+  }
+  const invalid = await h.call('exitcode_project', { manifest: { ...manifest, environment: ['PATH', 'HOME'] }, files: { 'driver.mjs': driver } });
+  assert.equal(invalid.details.code, 'INVALID_SPEC');
+  assert.match(invalid.content[0].text, /Rejected environment names: "PATH", "HOME"/);
+  assert.ok(invalid.content[0].text.includes(core.AGENT_REFERENCES.recovery));
+  assert.equal(invalid.isError, true);
 });

@@ -6,3 +6,8 @@ node_modules/
 !.agents/.exitcode/
 .agents/.exitcode/*
 !.agents/.exitcode/project/
+
+# Ship the on-demand recovery reference without publishing other investigation artifacts.
+!.agents/artifacts/
+.agents/artifacts/*
+!.agents/artifacts/exitcode-agent-recovery.md

@@ -55,3 +55,16 @@ test('assertions distinguish a measured failure from missing or malformed measur
   const value = contract(); value.scenarios[0].assertions[0].path = '/broken~2pointer';
   assert.throws(() => validateContract(value), error => error.code === 'INVALID_SPEC');
 });
+
+test('invalid protocol replies name valid statuses and unknown keys without accepting alternate syntax', async t => {
+  for (const report of [null, [], 'ready', { protocol: 1, status: 'ready', ok: true }, { protocol: 2, status: 'OK' }]) {
+    const source = `console.log(${JSON.stringify(JSON.stringify(report))});`;
+    await assert.rejects(invoke(manifest, request(t, source)), error => {
+      assert.equal(error.code, 'INVALID_REPORT');
+      assert.match(error.message, /protocol: 1/); assert.match(error.message, /OK, UNAVAILABLE, ERROR/);
+      if (report?.ok) assert.match(error.message, /Unknown keys: "ok"/);
+      assert.equal(error.processResult.exit, 0);
+      return true;
+    });
+  }
+});

@@ -6,10 +6,10 @@ import * as path from "node:path";
 import * as core from "./exitcode-core.mjs";
 import { DEFAULT_CONFIG, loadConfig } from "./exitcode-config.mjs";
 import { resolveStoreDir } from "./exitcode-files.mjs";
-import { MAX_HAPPY_PATH_CLAIMS } from "./exitcode-spec.mjs";
+import { MAX_HAPPY_PATH_CLAIMS, ASSERTION_PATH_PATTERN, MAX_ASSERTION_PATH_LENGTH } from "./exitcode-spec.mjs";
 
 const Namespace = { name: "exitcode", description: "Reusable project validation and sealed scenario acceptance" };
-const Assertion = Type.Object({ path: Type.String(), op: Type.Union(["eq", "lte", "gte", "contains", "present"].map(value => Type.Literal(value))), value: Type.Optional(Type.Unknown()) }, { additionalProperties: false });
+const Assertion = Type.Object({ path: Type.String({ pattern: ASSERTION_PATH_PATTERN, maxLength: MAX_ASSERTION_PATH_LENGTH, description: "JSON pointer relative to the contents of observations, e.g. /retrieval/found. Do not use dotted paths or prepend /observations." }), op: Type.Union(["eq", "lte", "gte", "contains", "present"].map(value => Type.Literal(value))), value: Type.Optional(Type.Unknown()) }, { additionalProperties: false });
 const HappyPathClaim = Type.Object({ id: Type.String(), claim: Type.String() }, { additionalProperties: false });
 const Scenario = Type.Object({
   id: Type.String(), covers: Type.Array(Type.String(), { maxItems: MAX_HAPPY_PATH_CLAIMS }),
@@ -18,17 +18,24 @@ const Scenario = Type.Object({
   timeoutSeconds: Type.Number({ exclusiveMinimum: 0, maximum: 86400 }), assertions: Type.Array(Assertion, { minItems: 1, maxItems: 32 }),
 }, { additionalProperties: false });
 const Manifest = Type.Object({
-  protocol: Type.Literal(1), name: Type.String(), command: Type.Object({ program: Type.String(), args: Type.Array(Type.String()) }, { additionalProperties: false }),
-  timeoutSeconds: Type.Number({ exclusiveMinimum: 0, maximum: 86400 }), environment: Type.Array(Type.String()),
+  protocol: Type.Literal(1), name: Type.String(), command: Type.Object({ program: Type.String(), args: Type.Array(Type.String(), { description: "Relative command arguments resolve under projectDirectory (the stored driver files), not the product root." }) }, { additionalProperties: false }),
+  timeoutSeconds: Type.Number({ exclusiveMinimum: 0, maximum: 86400 }), environment: Type.Array(Type.String(), { maxItems: 32, description: "Additional safe environment variable names. Start with []. PATH, HOME and TMPDIR are runner-owned; process-control variables are forbidden." }),
   isolation: Type.Union([Type.Literal("workspace"), Type.Literal("bubblewrap")]),
 }, { additionalProperties: false });
 
+const recoveryErrors = new Set(["INVALID_SPEC", "INVALID_REPORT", "INVALID_OBSERVATION", "TREE_TOO_LARGE", "CANDIDATE_CHANGED",
+  "TARGET_UNAVAILABLE", "RUNNER_ERROR", "DRIVER_TIMEOUT", "ENVIRONMENT_UNAVAILABLE", "ENVIRONMENT_CHANGED", "EVALUATOR_CHANGED", "CLEANUP_FAILED", "ISOLATION_UNAVAILABLE"]);
 function result(value: any) {
   const failures = value.run?.results?.flatMap((trial: any) => trial.assertions?.filter((assertion: any) => assertion.status === "FAIL")
     .map((assertion: any) => `${trial.scenario} trial ${trial.trial}: ${assertion.path} ${assertion.op} ${JSON.stringify(assertion.value)?.slice(0, 300) ?? ""}; observed ${JSON.stringify(assertion.actual)?.slice(0, 500)}`) ?? []) ?? [];
-  const text = value.inspection ? `Read-only ${value.inspection.kind} evidence. This does not run acceptance or complete the task.\n${value.inspection.text}\n${value.inspection.nextOffset === null ? "End of evidence." : `Continue inspection at offset ${value.inspection.nextOffset}.`}`
+  const text = value.inspection ? `Read-only ${value.inspection.kind} evidence${value.inspection.runId ? ` (${value.inspection.runId})` : ""}. This does not run acceptance or complete the task.\n${value.inspection.text}\n${value.inspection.nextOffset === null ? "End of evidence." : `Continue inspection at offset ${value.inspection.nextOffset}.`}`
     : value.review ?? (value.ok ? [value.status ?? value.phase ?? "OK", value.run && `Evidence ${value.run.id}`, ...failures.slice(0, 16),
-    failures.length > 16 && `${failures.length - 16} more failed assertions are retained in the run record.`, value.next].filter(Boolean).join("\n") : `${value.code}: ${value.message}${value.runId ? `\nEvidence ${value.runId}` : ""}`);
+    failures.length > 16 && `${failures.length - 16} more failed assertions are retained in the run record.`,
+    value.projectDirectory && `Project files: ${value.projectDirectory}`,
+    value.references && `Format examples: ${value.references.driver} and ${value.references.contract}\nRecovery reference: ${value.references.recovery}`, value.next].filter(Boolean).join("\n")
+    : [`${value.code}: ${value.message}`, value.stage && `Stage: ${value.stage}${value.scenario ? `; scenario ${value.scenario}, trial ${value.trial}` : ""}`,
+      value.runId && `Evidence ${value.runId}; read with exitcode_evaluate({inspect:"run",runId:"${value.runId}"}).`,
+      recoveryErrors.has(value.code) && `Read the recovery reference: ${core.AGENT_REFERENCES.recovery}`].filter(Boolean).join("\n"));
   return { content: [{ type: "text" as const, text }], details: value, ...(value.ok ? {} : { isError: true }) };
 }
 
@@ -73,6 +80,12 @@ export default function (pi: ExtensionAPI) {
       dispose() { parent?.removeEventListener("abort", abort); operations.delete(cancellation); finish(); },
     };
   };
+  // Custom-message wakeups bypass before_agent_start in Pi. Keep the acknowledgement,
+  // then use the native prompt entry so per-run sections survive subsequent tool rounds.
+  const continueTask = (customType: string, content: string, value: any) => {
+    pi.sendMessage({ customType, content, display: true, details: value }, { triggerTurn: false });
+    pi.sendUserMessage(value.next);
+  };
   const persist = () => pi.appendEntry(core.MODE_ENTRY, { enabled, taskId, storeDir: taskStoreDir });
   const exposure = () => {
     for (const definition of definitions) pi.registerTool({ ...definition, exposure: enabled ? "direct" : "hidden", namespace: Namespace } as any);
@@ -98,8 +111,8 @@ export default function (pi: ExtensionAPI) {
   const definitions = [
     {
       name: "exitcode_project", label: "ExitCode project",
-      description: "Bootstrap or refresh reusable project validation. Investigate with normal tools first. Supply infrastructure and driver files, never an implementation of the requested fix. Reuse existing definitions when sufficient. Protocol operations: prepare, run, dispose; run returns observations and artifacts. Workspace mode is a trusted host process; bubblewrap is offline and fails closed. This tool is available only before approval.",
-      parameters: Type.Object({ manifest: Manifest, files: Type.Record(Type.String(), Type.String()), refresh: Type.Optional(Type.Boolean()) }, { additionalProperties: false }),
+      description: "Bootstrap or refresh reusable project validation. Investigate with normal tools first. Supply infrastructure and driver files, never an implementation of the requested fix. Reuse existing definitions when sufficient. Protocol operations: prepare, run, dispose. Stdout must be one protocol: 1 JSON response with status OK, UNAVAILABLE or ERROR; run returns observations and artifacts, not PASS/FAIL. Registration returns public driver and format-reference paths. Workspace mode is a trusted host process; bubblewrap is offline and fails closed. This tool is available only before approval.",
+      parameters: Type.Object({ manifest: Manifest, files: Type.Record(Type.String(), Type.String(), { description: "UTF-8 driver files keyed relative to the stored project/files directory, not the product root. Use driver.mjs (or driver.py) and the matching command argument." }), refresh: Type.Optional(Type.Boolean({ description: "Refresh environment preparation only. This does not adopt changed product bytes; explicit user resume is required for that." })) }, { additionalProperties: false }),
       execute: async (_id: string, params: any, signal: AbortSignal, update: any, ctx: ExtensionContext) => execute(ctx, signal, update,
         supervisor => supervisor.configure({ manifest: params.manifest, files: params.files }, { refresh: params.refresh === true })),
     },
@@ -112,7 +125,7 @@ export default function (pi: ExtensionAPI) {
     },
     {
       name: "exitcode_evaluate", label: "ExitCode evaluate",
-      description: "With no arguments, run sealed acceptance fresh against the current product in disposable copies. Use when a candidate is plausibly ready. Only fresh PASS completes the task. Supply inspect to read the fixed contract, full run observations, or work notes without rerunning anything; runId selects an older run and offset paginates long evidence. Historical evidence never completes the task.",
+      description: "With no arguments, run sealed acceptance fresh against the current product in disposable copies. Use when a candidate is plausibly ready. Only fresh PASS completes the task. Supply inspect to read the fixed contract, full run observations, or work notes without rerunning anything; runId selects any returned setup/run ID and offset paginates long evidence. Without an ID, inspect reads the latest retained evidence, including errors. Historical evidence never completes the task.",
       parameters: Type.Object({ inspect: Type.Optional(Type.Union(["contract", "run", "notes"].map(value => Type.Literal(value)))), runId: Type.Optional(Type.String()),
         offset: Type.Optional(Type.Integer({ minimum: 0 })) }, { additionalProperties: false }),
       execute: async (_id: string, params: any, signal: AbortSignal, update: any, ctx: ExtensionContext) => execute(ctx, signal, update, async supervisor => params.inspect
@@ -251,14 +264,14 @@ export default function (pi: ExtensionAPI) {
           const value = (await execute(ctx, undefined, undefined, supervisor => supervisor.approve())).details;
           if (!value.ok) { notify(ctx, `${value.code}: ${value.message}`, "warning"); return; }
           resetNudges();
-          pi.sendMessage({ customType: "exitcode-approval", content: `User approved task ${value.task}. ${value.next}`, display: true, details: value }, { triggerTurn: true }); return;
+          continueTask("exitcode-approval", `User approved task ${value.task}.`, value); return;
         }
         if (command === "resume") {
           if (extra) { notify(ctx, usage, "warning"); return; }
           const directory = storeDir(), value = await supervisor(ctx).resume(argument);
           if (!value.ok) { notify(ctx, `${value.code}: ${value.message}`, "warning"); return; }
           enable(value.task, directory, ctx);
-          pi.sendMessage({ customType: "exitcode-resume", content: value.next, display: true, details: value }, { triggerTurn: true }); return;
+          continueTask("exitcode-resume", `User resumed task ${value.task}.`, value); return;
         }
         if (["exit", "help"].includes(command)) { notify(ctx, usage, "warning"); return; }
         const directory = storeDir(), value = await supervisor(ctx).start(text);

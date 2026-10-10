@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { MAX_HAPPY_PATH_CLAIMS, validateContract } from '../exitcode-spec.mjs';
-import { contract } from './helpers.mjs';
+import { MAX_HAPPY_PATH_CLAIMS, ASSERTION_PATH_PATTERN, MAX_ASSERTION_PATH_LENGTH, validateContract, validateProject, compare } from '../exitcode-spec.mjs';
+import { contract, manifest, driver } from './helpers.mjs';
 
 const claim = index => ({ id: `H${index}`, claim: `Observable user outcome ${index}` });
 const invalid = value => assert.throws(() => validateContract(value), error => error.code === 'INVALID_SPEC');
@@ -59,4 +59,30 @@ test('coverage supports many-to-many mappings and unmapped guardrails without ba
   value.scenarios.push({ ...structuredClone(scenario), id: 'existing-outcome', baseline: 'PASS', covers: ['H2', 'H3'] },
     { ...structuredClone(scenario), id: 'guardrail', baseline: 'PASS', covers: [] });
   assert.deepEqual(validateContract(value), value);
+});
+
+test('assertion schema and validator share pointer syntax without rewriting the observation root', () => {
+  const pattern = new RegExp(ASSERTION_PATH_PATTERN);
+  for (const pointer of ['/content', '/a~1b/~0key', '/', '/observations/content', '/line\nkey']) {
+    const value = contract(); value.scenarios[0].assertions[0].path = pointer;
+    assert.ok(pattern.test(pointer), pointer); validateContract(value);
+  }
+  for (const pointer of ['', 'observations.content', '/broken~2pointer', '/trailing~']) {
+    const value = contract(); value.scenarios[0].assertions[0].path = pointer;
+    assert.ok(!pattern.test(pointer), pointer); invalid(value);
+  }
+  const long = contract(); long.scenarios[0].assertions[0].path = '/' + 'x'.repeat(MAX_ASSERTION_PATH_LENGTH);
+  invalid(long);
+  assert.equal(compare({ retrieval: { found: false } }, [{ path: '/retrieval/found', op: 'eq', value: true }])[0].status, 'FAIL');
+  assert.throws(() => compare({ retrieval: { found: false } }, [{ path: '/observations/retrieval/found', op: 'eq', value: true }]), /relative to the contents of observations/);
+});
+
+test('environment names reject runner-owned and process-control variables with named diagnostics', () => {
+  const project = environment => ({ manifest: { ...manifest, environment }, files: { 'driver.mjs': driver } });
+  for (const key of ['PATH', 'HOME', 'TMPDIR', 'TEMP', 'TMP', 'NODE_OPTIONS', 'LD_PRELOAD', 'DYLD_LIBRARY_PATH', 'BASH_ENV', 'ENV', 'SHELLOPTS', '', 'lowercase', 'VALID\n', 'WITH-DASH', null, {}]) {
+    assert.throws(() => validateProject(project([key])), error => error.code === 'INVALID_SPEC' && error.message.includes(JSON.stringify(key)));
+  }
+  for (const environment of [[], ['RUSTUP_HOME', 'EXITCODE_TEST_SECRET', 'CI']]) {
+    assert.deepEqual(validateProject(project(environment)), project(environment));
+  }
 });

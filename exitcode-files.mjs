@@ -8,7 +8,7 @@ export const DEFAULT_STORE_DIR = '.agents/.exitcode';
 export const MAX_TREE_BYTES = 512 * 1024 * 1024;
 const defaultMaxBytes = candidate => candidate ? Infinity : MAX_TREE_BYTES;
 const HASH_CHUNK_BYTES = 1024 * 1024;
-export const fail = (code, message) => { throw Object.assign(new Error(message), { code }); };
+export const fail = (code, message, details = {}) => { throw Object.assign(new Error(message), { code, ...details }); };
 export const sha = value => createHash('sha256').update(value).digest('hex');
 export const stable = value => JSON.stringify(value, (_key, item) => item && !Array.isArray(item) && typeof item === 'object'
   ? Object.fromEntries(Object.keys(item).sort().map(key => [key, item[key]])) : item);
@@ -82,7 +82,7 @@ export function writeJson(file, value) {
 }
 
 // No Git index, ignore rules, or live-file aliases. Modes and link targets participate.
-export function inventory(root, { candidate = false, storeDir = DEFAULT_STORE_DIR, signal, maxBytes = defaultMaxBytes(candidate) } = {}) {
+export function inventory(root, { candidate = false, storeDir = DEFAULT_STORE_DIR, signal, maxBytes = defaultMaxBytes(candidate), treeKind = candidate ? 'candidate' : 'evaluator tree' } = {}) {
   if (candidate) resolveStoreDir(root, storeDir);
   const excluded = candidate ? ['.git', storeDir] : [];
   const excludes = name => excluded.some(directory => name === directory || name.startsWith(directory + '/'));
@@ -101,7 +101,8 @@ export function inventory(root, { candidate = false, storeDir = DEFAULT_STORE_DI
         entries.push({ path: rel, kind: 'link', target: path.relative(path.dirname(full), resolved).split(path.sep).join('/') });
       } else if (stat.isFile()) {
         bytes += stat.size;
-        if (bytes > maxBytes) fail('TREE_TOO_LARGE', `Snapshot exceeds ${maxBytes} bytes; use a focused project workspace`);
+        if (bytes > maxBytes) fail('TREE_TOO_LARGE', `${treeKind} at ${root} exceeds ${maxBytes} bytes (${bytes} observed at ${JSON.stringify(rel)})`,
+          { diagnostics: { tree: { kind: treeKind, directory: root, path: rel, observedBytes: bytes, maxBytes } } });
         entries.push({ path: rel, kind: 'file', mode: stat.mode & 0o777, bytes: stat.size });
       } else fail('UNSAFE_PATH', `Unsupported filesystem object: ${rel}`);
     }
@@ -115,8 +116,23 @@ export function inventory(root, { candidate = false, storeDir = DEFAULT_STORE_DI
 
 export const treeDigest = (root, options) => digest(inventory(root, options));
 
-export function copyTree(source, destination, { candidate = false, storeDir = DEFAULT_STORE_DIR, signal, maxBytes = defaultMaxBytes(candidate) } = {}) {
-  const options = { candidate, storeDir, signal, maxBytes }, before = inventory(source, options);
+function captureMismatch(expected, actual, comparison, source, destination) {
+  const left = new Map(expected.map(entry => [entry.path, entry])), right = new Map(actual.map(entry => [entry.path, entry]));
+  const differences = [];
+  let totalDifferences = 0;
+  for (const name of [...new Set([...left.keys(), ...right.keys()])].sort()) {
+    const before = left.get(name), after = right.get(name);
+    const fields = ['kind', 'mode', 'bytes', 'sha', 'target'].filter(field => before?.[field] !== after?.[field]);
+    if (!fields.length) continue;
+    totalDifferences++;
+    if (differences.length < 8) differences.push({ path: name, fields, expected: before ?? null, actual: after ?? null });
+  }
+  fail('CANDIDATE_CHANGED', `Files differ while capturing the candidate (${comparison}): ${differences.map(entry => `${JSON.stringify(entry.path)} [${entry.fields.join(', ')}]`).join('; ')}${totalDifferences > differences.length ? `; ${totalDifferences - differences.length} more paths` : ''}`,
+    { diagnostics: { capture: { comparison, source, destination, totalDifferences, differences } } });
+}
+
+export function copyTree(source, destination, { candidate = false, storeDir = DEFAULT_STORE_DIR, signal, maxBytes = defaultMaxBytes(candidate), treeKind } = {}) {
+  const options = { candidate, storeDir, signal, maxBytes, treeKind }, before = inventory(source, options), fingerprint = digest(before);
   fs.mkdirSync(destination, { recursive: true });
   for (const entry of before) {
     if (signal?.aborted) fail('CANCELLED', 'Operation cancelled');
@@ -126,9 +142,11 @@ export function copyTree(source, destination, { candidate = false, storeDir = DE
     else { fs.copyFileSync(path.join(source, entry.path), target, fs.constants.COPYFILE_FICLONE); fs.chmodSync(target, entry.mode); }
   }
   for (const entry of [...before].reverse()) if (entry.kind === 'directory') fs.chmodSync(path.join(destination, entry.path), entry.mode);
-  if (digest(inventory(source, options)) !== digest(before) || treeDigest(destination, { signal, maxBytes }) !== digest(before))
-    fail('CANDIDATE_CHANGED', 'Files changed while capturing the candidate');
-  return digest(before);
+  const after = inventory(source, options);
+  if (digest(after) !== fingerprint) captureMismatch(before, after, 'source-before/source-after', source, destination);
+  const captured = inventory(destination, { signal, maxBytes, treeKind });
+  if (digest(captured) !== fingerprint) captureMismatch(before, captured, 'source/copy', source, destination);
+  return fingerprint;
 }
 
 export function writeFiles(root, files) {

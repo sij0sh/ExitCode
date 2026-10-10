@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { spawnSync } from 'node:child_process';
+import fsDefault from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { fileSha, sha, inventory, copyTree, treeDigest, MAX_TREE_BYTES } from '../exitcode-files.mjs';
 import { workspace } from './helpers.mjs';
 
@@ -126,4 +128,30 @@ test('hashing checks cancellation between chunks and closes its file descriptor'
   const controller = new AbortController(); controller.abort();
   assert.throws(() => fileSha(path.join(root, 'absent'), { signal: controller.signal }), cancelled);
   assert.throws(() => inventory(root, { signal: controller.signal }), cancelled);
+});
+
+test('capture diagnostics distinguish source drift from copy mismatch and bound differing paths', t => {
+  const original = fsDefault.copyFileSync;
+  t.after(() => { fsDefault.copyFileSync = original; syncBuiltinESMExports(); });
+  for (const comparison of ['source-before/source-after', 'source/copy']) {
+    const root = workspace(t), destination = workspace(t);
+    fs.rmSync(path.join(destination, 'feature.txt'));
+    for (let index = 0; index < 12; index++) fs.writeFileSync(path.join(root, `file-${String(index).padStart(2, '0')}`), 'before');
+    fsDefault.copyFileSync = (source, target, flags) => {
+      original(source, target, flags);
+      fsDefault.writeFileSync(comparison === 'source/copy' ? target : source, 'after!');
+    };
+    syncBuiltinESMExports();
+    assert.throws(() => copyTree(root, destination, { candidate: true }), error => {
+      assert.equal(error.code, 'CANDIDATE_CHANGED');
+      const capture = error.diagnostics.capture;
+      assert.equal(capture.comparison, comparison);
+      assert.equal(capture.totalDifferences, 13);
+      assert.equal(capture.differences.length, 8);
+      assert.equal(capture.differences[0].path, 'feature.txt');
+      assert.ok(capture.differences.every(entry => entry.fields.includes('sha')));
+      return true;
+    });
+    fsDefault.copyFileSync = original; syncBuiltinESMExports();
+  }
 });

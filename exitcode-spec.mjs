@@ -2,6 +2,11 @@ import { fail, relative, stable } from './exitcode-files.mjs';
 
 export const OPS = ['eq', 'lte', 'gte', 'contains', 'present'];
 export const MAX_HAPPY_PATH_CLAIMS = 8;
+export const ASSERTION_PATH_PATTERN = '^/(?:[^~]|~[01])*$';
+export const MAX_ASSERTION_PATH_LENGTH = 512;
+const assertionPath = new RegExp(ASSERTION_PATH_PATTERN);
+const safeEnvironmentName = key => typeof key === 'string' && key === key.trim() && /^[A-Z][A-Z0-9_]*$/.test(key)
+  && !/^(PATH|HOME|TMPDIR|TEMP|TMP|NODE_OPTIONS|LD_.*|DYLD_.*|BASH_ENV|ENV|SHELLOPTS)$/.test(key);
 const record = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const text = (value, label, max = 8192) => {
   if (typeof value !== 'string' || !value.trim() || value.length > max) fail('INVALID_SPEC', `${label} must be nonempty text, at most ${max} characters`);
@@ -32,8 +37,9 @@ export function validateProject(project) {
   if (!Array.isArray(m.command.args) || m.command.args.length > 32 || m.command.args.some(arg => typeof arg !== 'string' || arg.length > 4096)) fail('INVALID_SPEC', 'command.args must be at most 32 strings');
   seconds(m.timeoutSeconds, 'timeoutSeconds');
   if (!['workspace', 'bubblewrap'].includes(m.isolation)) fail('INVALID_SPEC', 'Choose workspace or bubblewrap isolation explicitly; there is no fallback');
-  if (!Array.isArray(m.environment) || m.environment.length > 32 || m.environment.some(key => !/^[A-Z][A-Z0-9_]*$/.test(key)
-    || /^(PATH|HOME|TMPDIR|TEMP|TMP|NODE_OPTIONS|LD_.*|DYLD_.*|BASH_ENV|ENV|SHELLOPTS)$/.test(key))) fail('INVALID_SPEC', 'environment must contain explicit safe environment variable names');
+  if (!Array.isArray(m.environment) || m.environment.length > 32) fail('INVALID_SPEC', 'environment must contain at most 32 additional safe variable names; start with environment: []');
+  const rejected = m.environment.filter(key => !safeEnvironmentName(key));
+  if (rejected.length) fail('INVALID_SPEC', `Rejected environment names: ${rejected.map(key => JSON.stringify(key)?.slice(0, 128)).join(', ')}. PATH, HOME and TMPDIR are runner-owned; start with environment: [].`);
   keys(project.files, Object.keys(project.files ?? {}), 'project.files');
   if (!Object.keys(project.files).length || Object.keys(project.files).length > 64) fail('INVALID_SPEC', 'Provide 1 to 64 project driver files');
   let bytes = 0;
@@ -80,8 +86,8 @@ export function validateContract(contract) {
     if (!Array.isArray(scenario.assertions) || !scenario.assertions.length || scenario.assertions.length > 32) fail('INVALID_SPEC', 'Provide 1 to 32 assertions per scenario');
     for (const assertion of scenario.assertions) {
       keys(assertion, ['path', 'op', 'value'], 'assertion');
-      if (typeof assertion.path !== 'string' || !assertion.path.startsWith('/') || assertion.path.length > 512
-        || /~(?![01])/.test(assertion.path)) fail('INVALID_SPEC', 'assertion.path must be a nonempty JSON pointer');
+      if (typeof assertion.path !== 'string' || !assertionPath.test(assertion.path) || assertion.path.length > MAX_ASSERTION_PATH_LENGTH)
+        fail('INVALID_SPEC', `assertion.path must be a JSON pointer within ${MAX_ASSERTION_PATH_LENGTH} characters, relative to the contents of observations (e.g. /retrieval/found)`);
       if (!OPS.includes(assertion.op)) fail('INVALID_SPEC', `Unsupported assertion operator ${assertion.op}`);
       if (assertion.op === 'present') { if (Object.hasOwn(assertion, 'value')) fail('INVALID_SPEC', 'present has no value'); }
       else json(assertion.value, 'assertion value');
@@ -103,7 +109,7 @@ export function compare(observations, assertions) {
       actual = actual[part];
     }
     // Missing required measurements and type mismatches are inconclusive, never successful failures.
-    if (!found && assertion.op !== 'present') fail('INVALID_OBSERVATION', `Missing observation ${assertion.path}`);
+    if (!found && assertion.op !== 'present') fail('INVALID_OBSERVATION', `Missing observation ${assertion.path}; assertion pointers are relative to the contents of observations`);
     if (['lte', 'gte'].includes(assertion.op) && !Number.isFinite(actual)) fail('INVALID_OBSERVATION', `Expected a finite number at ${assertion.path}`);
     if (assertion.op === 'contains' && typeof actual !== 'string') fail('INVALID_OBSERVATION', `Expected text at ${assertion.path}`);
     const pass = assertion.op === 'present' ? found : assertion.op === 'eq' ? stable(actual) === stable(assertion.value)

@@ -5,6 +5,8 @@ import { performance } from 'node:perf_hooks';
 import { fail, resolveProgram } from './exitcode-files.mjs';
 
 const OUTPUT_LIMIT = 1024 * 1024;
+const REPORT_STATUSES = ['OK', 'UNAVAILABLE', 'ERROR'];
+const REPORT_KEYS = ['protocol', 'status', 'observations', 'artifacts', 'reason'];
 const stopped = signal => Object.assign(new Error('Operation cancelled'), { code: 'CANCELLED', cause: signal?.reason });
 
 function bubblewrap(manifest, request, env) {
@@ -83,9 +85,11 @@ export async function invoke(manifest, request, { signal, timeoutSeconds = manif
   let report;
   try { report = JSON.parse(processResult.stdout); }
   catch { throw Object.assign(new Error('Driver stdout must contain one JSON response, without prose or fences'), { code: 'INVALID_REPORT', processResult }); }
-  if (!report || report.protocol !== 1 || !['OK', 'UNAVAILABLE', 'ERROR'].includes(report.status)
-    || Object.keys(report).some(key => !['protocol', 'status', 'observations', 'artifacts', 'reason'].includes(key)))
-    throw Object.assign(new Error('Invalid driver protocol 1 response'), { code: 'INVALID_REPORT', processResult });
+  const object = report !== null && typeof report === 'object' && !Array.isArray(report);
+  const unknown = object ? Object.keys(report).filter(key => !REPORT_KEYS.includes(key)) : [];
+  if (!object || report.protocol !== 1 || !REPORT_STATUSES.includes(report.status) || unknown.length)
+    throw Object.assign(new Error(`Invalid driver protocol 1 response: require an object with protocol: 1 and status: ${REPORT_STATUSES.join(', ')}.${unknown.length ? ` Unknown keys: ${unknown.slice(0, 8).map(key => JSON.stringify(key).slice(0, 128)).join(', ')}${unknown.length > 8 ? `; ${unknown.length - 8} more` : ''}.` : ''}`),
+      { code: 'INVALID_REPORT', processResult });
   if (report.status !== 'OK' && (typeof report.reason !== 'string' || !report.reason.trim()))
     throw Object.assign(new Error('UNAVAILABLE and ERROR require a reason'), { code: 'INVALID_REPORT', processResult });
   return { report, processResult };
